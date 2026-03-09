@@ -21,3 +21,4 @@ rustls-pemfile = { workspace = true }
 zeroize = { workspace = true }
 rcgen = "0.13"
 sha2 = { workspace = true }
+hmac = "0.12"

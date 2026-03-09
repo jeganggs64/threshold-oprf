@@ -2490,6 +2490,7 @@ dependencies = [
  "axum",
  "axum-server",
  "hex",
+ "hmac",
  "k256",
  "rcgen",
  "reqwest",

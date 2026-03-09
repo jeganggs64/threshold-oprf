@@ -32,17 +32,26 @@
 //!
 //! Usage:
 //!   toprf-node --port 3001 --key-file /path/to/share.json
-//!   toprf-node --init-seal --upload-url https://storage.blob.core.windows.net/...
+//!   toprf-node --init-seal --upload-url gs://bucket/sealed.bin
+//!
+//! Supported storage URLs (--upload-url and SEALED_KEY_URL):
+//!   gs://bucket/object             — GCP Cloud Storage (VM service account)
+//!   s3://bucket/key                — AWS S3 (instance profile IAM role)
+//!   https://<acct>.blob.../c/b     — Azure Blob Storage (managed identity)
+//!   https://...                    — plain HTTPS (presigned URL, etc.)
+//!   file:///path                   — local file (dev/testing only)
 //!
 //! Environment variables:
 //!   PORT                       — HTTP listen port (default: 3001)
-//!   SEALED_KEY_URL             — HTTPS or file:// URL to a sealed key blob
+//!   SEALED_KEY_URL             — URL to a sealed key blob (see schemes above)
 //!   EXPECTED_VERIFICATION_SHARE — hex-encoded k_i * G for key verification
 //!   SNP_PROVIDER               — attestation provider: "gcp" or "raw" (default: "raw")
 
+mod cloud_storage;
+
 use std::env;
 use std::io::BufReader;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
@@ -187,100 +196,7 @@ async fn eval(
 }
 
 // -- Auto-unseal helpers --
-
-/// Returns `true` if the IP is loopback, private, link-local, or otherwise
-/// not a globally routable address. Used to block SSRF via DNS rebinding.
-fn is_non_global_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()          // 127.0.0.0/8
-            || v4.is_private()        // 10/8, 172.16/12, 192.168/16
-            || v4.is_link_local()     // 169.254/16
-            || v4.is_broadcast()      // 255.255.255.255
-            || v4.is_unspecified()    // 0.0.0.0
-            || v4.is_documentation()  // 192.0.2/24, 198.51.100/24, 203.0.113/24
-            // Shared address space (RFC 6598) — used by carrier-grade NAT
-            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // 100.64/10
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()          // ::1
-            || v6.is_unspecified()    // ::
-            // IPv4-mapped (::ffff:0:0/96) — check the embedded v4
-            || match v6.to_ipv4_mapped() {
-                Some(v4) => is_non_global_ip(&IpAddr::V4(v4)),
-                None => false,
-            }
-            // Unique local (fc00::/7) and link-local (fe80::/10)
-            || (v6.segments()[0] & 0xfe00) == 0xfc00
-            || (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
-
-async fn fetch_sealed_blob(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if url.starts_with("file://") {
-        tracing::warn!("using file:// URL for sealed blob — not recommended for production");
-        let path = &url[7..];
-        let bytes = tokio::fs::read(path).await?;
-        if bytes.len() > 1024 * 1024 {
-            return Err("sealed blob too large (>1MB)".into());
-        }
-        return Ok(bytes);
-    }
-
-    if !url.starts_with("https://") {
-        return Err("SEALED_KEY_URL must use https:// (or file:// for local testing)".into());
-    }
-
-    // Block private/loopback/link-local addresses to prevent SSRF.
-    // We resolve the hostname to IPs and reject any non-global address.
-    // This defeats DNS rebinding attacks where a hostname initially resolves
-    // to a public IP but later re-resolves to an internal one.
-    let authority = url.strip_prefix("https://").unwrap_or(url);
-    let authority = authority.split('/').next().unwrap_or("");
-    let host_for_resolve = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{authority}:443")
-    };
-    let addrs: Vec<SocketAddr> = host_for_resolve
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve SEALED_KEY_URL host: {e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err("SEALED_KEY_URL host resolved to no addresses".into());
-    }
-    for addr in &addrs {
-        if is_non_global_ip(&addr.ip()) {
-            return Err(format!(
-                "SEALED_KEY_URL resolved to non-public address {} — SSRF blocked",
-                addr.ip()
-            )
-            .into());
-        }
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-    let resp = client.get(url).send().await?;
-    if !resp.status().is_success() {
-        return Err(format!("failed to fetch sealed blob: HTTP {}", resp.status()).into());
-    }
-    // Check Content-Length before downloading the full body to avoid
-    // reading an unexpectedly large response into memory.
-    if let Some(len) = resp.content_length() {
-        if len > 1024 * 1024 {
-            return Err("sealed blob too large (Content-Length > 1MB)".into());
-        }
-    }
-    let bytes = resp.bytes().await?;
-    if bytes.len() > 1024 * 1024 {
-        return Err("sealed blob too large (>1MB)".into());
-    }
-    Ok(bytes.to_vec())
-}
+// Cloud storage download/upload is in the `cloud_storage` module.
 
 // -- Init-seal mode --
 
@@ -349,41 +265,14 @@ async fn init_key_handler(
 
     // Step 3: Upload the sealed blob
     let upload_url = &state.upload_url;
-    info!(url = %upload_url.split('?').next().unwrap_or(upload_url), "init-seal: uploading sealed blob");
+    info!(url = %cloud_storage::display_url(upload_url), "init-seal: uploading sealed blob");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| {
-            error!("init-seal: failed to build HTTP client: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build HTTP client: {e}"))
-        })?;
-
-    let resp = client
-        .put(upload_url)
-        .header("x-ms-blob-type", "BlockBlob")
-        .header("content-type", "application/octet-stream")
-        .body(sealed_blob)
-        .send()
+    cloud_storage::upload_blob(upload_url, sealed_blob)
         .await
         .map_err(|e| {
-            error!("init-seal: upload request failed: {e}");
+            error!("init-seal: upload failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}"))
         })?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        error!(
-            http_status = %status,
-            body = %body_text,
-            "init-seal: upload returned non-success status"
-        );
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("upload failed: HTTP {status}"),
-        ));
-    }
 
     info!("init-seal: sealed blob uploaded successfully");
     info!("init-seal: initialization complete — shutting down");
@@ -401,13 +290,13 @@ async fn run_init_seal(port: &str, upload_url: String) {
 
     info!("init-seal: starting initial deployment mode");
 
-    // Validate upload URL uses HTTPS
-    if !upload_url.starts_with("https://") {
-        eprintln!("Error: --upload-url must use https://");
+    // Validate upload URL scheme
+    if !cloud_storage::is_valid_storage_url(&upload_url) {
+        eprintln!("Error: --upload-url must use https://, gs://, s3://, or file://");
         std::process::exit(1);
     }
     info!(
-        url = %upload_url.split('?').next().unwrap_or(&upload_url),
+        url = %cloud_storage::display_url(&upload_url),
         "init-seal: upload URL validated"
     );
 
@@ -621,7 +510,7 @@ async fn main() {
                 eprintln!("Options:");
                 eprintln!("  -p, --port <PORT>         Listen port (default: 3001)");
                 eprintln!("      --init-seal           Run initial deployment (seal + upload) mode");
-                eprintln!("      --upload-url <URL>    HTTPS URL to upload sealed blob (init-seal only)");
+                eprintln!("      --upload-url <URL>    Storage URL for sealed blob (gs://, s3://, https://, file://)");
                 eprintln!("      --key-file <PATH>     Load key share from JSON file at boot");
                 eprintln!("      --tls-cert <PATH>     TLS server certificate (PEM)");
                 eprintln!("      --tls-key <PATH>      TLS server private key (PEM)");
@@ -630,7 +519,7 @@ async fn main() {
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PORT                        Listen port (default: 3001)");
-                eprintln!("  SEALED_KEY_URL              HTTPS or file:// URL to sealed key blob");
+                eprintln!("  SEALED_KEY_URL              URL to sealed key blob (gs://, s3://, https://, file://)");
                 eprintln!("  EXPECTED_VERIFICATION_SHARE Hex-encoded k_i * G for key verification");
                 eprintln!("  SNP_PROVIDER                Attestation provider: \"gcp\" or \"raw\" (default: \"raw\")");
                 eprintln!();
@@ -728,13 +617,12 @@ async fn main() {
 
     // -- Auto-unseal from object storage (if configured) --
     if let Ok(sealed_url) = env::var("SEALED_KEY_URL") {
-        let display_url = sealed_url.split('?').next().unwrap_or(&sealed_url);
-        info!("auto-unseal: fetching sealed key from {display_url}");
+        info!("auto-unseal: fetching sealed key from {}", cloud_storage::display_url(&sealed_url));
 
         let expected_vs = env::var("EXPECTED_VERIFICATION_SHARE")
             .expect("EXPECTED_VERIFICATION_SHARE required when SEALED_KEY_URL is set");
 
-        let sealed_blob = fetch_sealed_blob(&sealed_url)
+        let sealed_blob = cloud_storage::download_blob(&sealed_url)
             .await
             .expect("failed to fetch sealed blob from object storage");
 
