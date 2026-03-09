@@ -36,17 +36,15 @@ Nodes are spread across three cloud providers in different geographic jurisdicti
 
 These are the smallest SEV-SNP capable instances on each provider. Scaling to larger instances (e.g., 4 vCPUs) changes the SEV-SNP measurement (vCPU count affects the VMSA blob in the launch digest), so resealing is required after any instance size change.
 
-### Cross-provider sealed blob storage
+### Sealed blob storage
 
-To prevent a single cloud provider from having both the VM and the sealed blob (which together could allow unsealing), store each node's sealed blob on a **different** provider:
+Each node's sealed blob is stored on the **same provider** where the VM runs. The blob is encrypted with a key derived from the specific physical AMD chip via MSG_KEY_REQ — even the cloud provider cannot decrypt it (this is the SEV-SNP guarantee). Each VM uses its native IAM role / service account / instance profile to access its own storage, so no cross-provider credentials are needed.
 
-| Node | VM runs on | Sealed blob stored on |
-|------|-----------|----------------------|
-| Node 1 | GCP Singapore | Azure Blob Storage |
-| Node 2 | Azure US | AWS S3 |
-| Node 3 | AWS EU | GCP Cloud Storage |
-
-This way, compromising a single provider only gives access to either the VM or the blob, never both.
+| Node | VM + Storage |
+|------|-------------|
+| Node 1 | GCP Singapore (Cloud Storage) |
+| Node 2 | Azure US East (Blob Storage) |
+| Node 3 | AWS EU Ireland (S3) |
 
 ---
 
@@ -191,42 +189,76 @@ Fields explicitly **NOT** included:
 - FAMILY_ID (bit 2) — operator-set, may vary between deployments
 - GUEST_SVN (bit 4) — changes with guest software version updates
 
-### Set up cross-provider blob storage
+### Set up blob storage
 
-Before running init-seal, create the storage buckets on the cross-provider storage. Each node's blob is stored on a **different** provider than where the VM runs:
+Create a storage bucket on each provider for that node's sealed blob. Grant the VM's identity read/write access.
 
-| Node | VM runs on | Sealed blob stored on |
-|------|-----------|----------------------|
-| Node 1 | GCP Singapore | Azure Blob Storage |
-| Node 2 | Azure US | AWS S3 |
-| Node 3 | AWS EU | GCP Cloud Storage |
-
-#### Azure Blob Storage (for Node 1's blob)
+#### GCP Cloud Storage (Node 1)
 
 ```bash
+# Create bucket
+gcloud storage buckets create gs://ruonid-sealed-node1 --location=asia-southeast1
+
+# Grant the VM's service account access
+gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-node1 \
+  --member="serviceAccount:$(gcloud compute instances describe toprf-node-1 \
+    --zone=asia-southeast1-b --format='get(serviceAccounts[0].email)')" \
+  --role="roles/storage.objectAdmin"
+```
+
+#### Azure Blob Storage (Node 2)
+
+```bash
+# Create storage account + container
 az storage account create \
-  --name ruonidsealedkeys \
+  --name ruonidsealednode2 \
   --resource-group ruonid-rg \
   --location eastus \
   --sku Standard_LRS
 
 az storage container create \
   --name sealed-blobs \
-  --account-name ruonidsealedkeys \
+  --account-name ruonidsealednode2 \
   --public-access off
+
+# Assign the VM's managed identity read/write access
+VM_IDENTITY=$(az vm show --resource-group ruonid-rg --name toprf-node-2 \
+  --query identity.principalId -o tsv)
+
+az role assignment create \
+  --assignee "$VM_IDENTITY" \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/<sub-id>/resourceGroups/ruonid-rg/providers/Microsoft.Storage/storageAccounts/ruonidsealednode2"
 ```
 
-#### AWS S3 (for Node 2's blob)
+**Note:** Enable a system-assigned managed identity on the VM if not already enabled:
+```bash
+az vm identity assign --resource-group ruonid-rg --name toprf-node-2
+```
+
+#### AWS S3 (Node 3)
 
 ```bash
-aws s3 mb s3://ruonid-sealed-keys-eu --region eu-west-1
+# Create bucket
+aws s3 mb s3://ruonid-sealed-node3 --region eu-west-1
+
+# Create an IAM policy for the bucket
+aws iam create-policy --policy-name toprf-node3-sealed-blob --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["s3:GetObject", "s3:PutObject"],
+    "Resource": "arn:aws:s3:::ruonid-sealed-node3/node-3-sealed.bin"
+  }]
+}'
+
+# Attach to the instance's IAM role
+aws iam attach-role-policy \
+  --role-name toprf-node3-role \
+  --policy-arn arn:aws:iam::<account-id>:policy/toprf-node3-sealed-blob
 ```
 
-#### GCP Cloud Storage (for Node 3's blob)
-
-```bash
-gcloud storage buckets create gs://ruonid-sealed-keys --location=asia-southeast1
-```
+**Note:** Create an IAM role and attach it to the EC2 instance as an instance profile if not already done.
 
 ### Run init-seal on each node
 
@@ -239,7 +271,7 @@ SNP_PROVIDER=gcp \
 EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
 toprf-node \
   --init-seal \
-  --upload-url "https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin" \
+  --upload-url "gs://ruonid-sealed-node1/node-1-sealed.bin" \
   --port 3001
 ```
 
@@ -278,9 +310,11 @@ SNP_PROVIDER=raw \
 EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
 toprf-node \
   --init-seal \
-  --upload-url "https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin" \
+  --upload-url "https://ruonidsealednode2.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
   --port 3001
 ```
+
+The node uses the VM's managed identity to authenticate the upload — no credentials needed.
 
 #### Node 3 (AWS EU Ireland)
 
@@ -289,16 +323,18 @@ SNP_PROVIDER=raw \
 EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
 toprf-node \
   --init-seal \
-  --upload-url "https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin" \
+  --upload-url "s3://ruonid-sealed-node3/node-3-sealed.bin" \
   --port 3001
 ```
+
+The node uses the instance profile's IAM role to authenticate — no credentials needed.
 
 ### Security properties of init-seal
 
 - **Attested TLS** — the TLS public key hash is embedded in the AMD-signed attestation report. The operator verifies this before sending the key share, ensuring they're talking to the genuine TEE (not an impersonator).
 - **MSG_KEY_REQ** — the sealing key is derived by the AMD Secure Processor from the chip's unique root key (VCEK). It never exists outside the CPU. A different chip produces a completely different key.
 - **Field selector** — explicitly set to `MEASUREMENT | TCB_VERSION` only. No per-boot-random fields are included.
-- **Cross-provider storage** — the blob is uploaded to a different provider than where the VM runs. A single provider compromise cannot access both the VM and the blob.
+- **MSG_KEY_REQ sealing** — even though the blob is stored on the same provider as the VM, the blob is AES-256-GCM encrypted with a key derived from the specific physical AMD chip. The provider cannot decrypt it — this is the core SEV-SNP guarantee.
 - **One-time endpoint** — `/init-key` accepts exactly one call, then the node exits. There is no persistent key injection endpoint.
 
 ---
@@ -307,19 +343,12 @@ toprf-node \
 
 After init-seal completes, restart each node in normal mode. The node fetches its sealed blob, calls MSG_KEY_REQ to derive the same chip-specific key, and unseals.
 
+Each node uses its native cloud identity to fetch the sealed blob — no expiring URLs or credentials to manage.
+
 ### Node 1 (GCP Singapore)
 
 ```bash
-# Generate a read-only SAS URL for the sealed blob
-BLOB_URL=$(az storage blob generate-sas \
-  --account-name ruonidsealedkeys \
-  --container-name sealed-blobs \
-  --name node-1-sealed.bin \
-  --permissions r \
-  --expiry $(date -u -v+1y '+%Y-%m-%dT%H:%MZ') \
-  --full-uri -o tsv)
-
-SEALED_KEY_URL="$BLOB_URL" \
+SEALED_KEY_URL="gs://ruonid-sealed-node1/node-1-sealed.bin" \
 EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
 SNP_PROVIDER=gcp \
 toprf-node \
@@ -339,7 +368,7 @@ On boot, the node:
 ### Node 2 (Azure US East)
 
 ```bash
-SEALED_KEY_URL="https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin" \
+SEALED_KEY_URL="https://ruonidsealednode2.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
 EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
 SNP_PROVIDER=raw \
 toprf-node \
@@ -349,10 +378,12 @@ toprf-node \
   --client-ca /etc/toprf/certs/ca.pem
 ```
 
+The node uses the VM's managed identity to authenticate the download.
+
 ### Node 3 (AWS EU Ireland)
 
 ```bash
-SEALED_KEY_URL="https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin" \
+SEALED_KEY_URL="s3://ruonid-sealed-node3/node-3-sealed.bin" \
 EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
 SNP_PROVIDER=raw \
 toprf-node \
@@ -361,6 +392,8 @@ toprf-node \
   --tls-key /etc/toprf/certs/node3.key \
   --client-ca /etc/toprf/certs/ca.pem
 ```
+
+The node uses the instance profile's IAM role to authenticate the download.
 
 ### Backwards compatibility
 
@@ -484,7 +517,7 @@ curl --cacert certs/ca/ca.pem \
 - [ ] Store admin recovery shares in separate secure locations (different physical locations)
 - [ ] Set up monitoring for all 3 nodes
 - [ ] Verify mTLS: nodes reject connections without the proxy client cert
-- [ ] Verify sealed blob storage is private (no public access)
+- [ ] Verify sealed blob storage is private (no public access, VM identity only)
 - [ ] Set `AMD_ARK_FINGERPRINT` env var on the proxy for AMD root cert pinning
 
 ---
@@ -506,12 +539,12 @@ With MSG_KEY_REQ sealing (v2), the sealed blob is bound to the specific physical
    EXPECTED_VERIFICATION_SHARE=<node-N-verification-share> \
    toprf-node \
      --init-seal \
-     --upload-url <cross-provider-upload-url> \
+     --upload-url "<same storage URL as initial deployment>" \
      --port 3001
    ```
-   Then send the key share to `/init-key` as in the initial deployment.
+   Then send the key share to `/init-key` as in the initial deployment. The new blob overwrites the old one at the same URL.
 
-3. **Restart in normal mode** with `SEALED_KEY_URL` pointing to the new blob.
+3. **Restart in normal mode** — `SEALED_KEY_URL` stays the same since the blob path hasn't changed.
 
 **If you no longer have the plaintext key shares** (deleted after initial sealing), use the admin recovery shares to reconstruct and re-split:
 
