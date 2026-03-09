@@ -192,10 +192,9 @@ async fn get_report_gcp_metadata(report_data: Option<&[u8; 64]>) -> Result<SnpRe
     // (some providers embed it, others require a separate request parameter)
     if let Some(data) = report_data {
         if report.report_data != *data {
-            tracing::warn!(
-                "GCP report_data does not match requested data — \
-                 GCP may not support custom report_data via this endpoint"
-            );
+            return Err(SealError::AttestationFailed(
+                "report_data mismatch: GCP report does not contain expected data".into(),
+            ));
         }
     }
 

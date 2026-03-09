@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+/// Maximum number of registered devices. Prevents unbounded memory growth
+/// if an attacker manages to register many device keys.
+const MAX_DEVICES: usize = 1_000_000;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DeviceKeyEntry {
     pub key_id: String,
@@ -90,6 +94,11 @@ impl DeviceKeyStore {
     }
 
     pub fn save_key(&mut self, key_id: &str, public_key_pem: &str, counter: u32) -> Result<(), String> {
+        if self.store.len() >= MAX_DEVICES {
+            warn!(max = MAX_DEVICES, "device key store is full, rejecting registration");
+            return Err("device key store capacity exceeded".to_string());
+        }
+
         if self.store.contains_key(key_id) {
             warn!(key_id = %key_id, "attempted to re-register existing device key");
             return Err(format!("device key already registered: {key_id}"));

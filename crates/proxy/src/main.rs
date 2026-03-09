@@ -24,11 +24,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router};
+use subtle::ConstantTimeEq;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -112,6 +113,8 @@ struct ProxyState {
     total_evaluations: AtomicU64,
     /// Instant the server was started (for uptime calculation).
     started_at: Instant,
+    /// Optional bearer token for /metrics endpoint (from METRICS_TOKEN env var).
+    metrics_token: Option<String>,
 }
 
 // -- Request/response types --
@@ -256,18 +259,38 @@ async fn health(State(state): State<Arc<ProxyState>>) -> Json<HealthResponse> {
 }
 
 /// Operational metrics snapshot.
-async fn metrics(State(state): State<Arc<ProxyState>>) -> Json<MetricsResponse> {
+///
+/// When the `METRICS_TOKEN` environment variable is set, this endpoint requires
+/// an `Authorization: Bearer <token>` header. When not set, access is unrestricted
+/// (backwards compatible).
+async fn metrics(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+) -> Result<Json<MetricsResponse>, StatusCode> {
+    // If METRICS_TOKEN is configured, require Bearer auth with constant-time comparison
+    if let Some(expected) = &state.metrics_token {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+
+        match provided {
+            Some(token) if expected.as_bytes().ct_eq(token.as_bytes()).into() => {}
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
+
     let uptime_seconds = state.started_at.elapsed().as_secs();
     let total_evaluations = state.total_evaluations.load(Ordering::Relaxed);
     let active_devices = state.rate_limiter.read().await.device_count();
 
-    Json(MetricsResponse {
+    Ok(Json(MetricsResponse {
         uptime_seconds,
         total_evaluations,
         active_devices,
         nodes_configured: state.config.nodes.len(),
         threshold: state.config.threshold,
-    })
+    }))
 }
 
 async fn public_key(State(state): State<Arc<ProxyState>>) -> Json<PublicKeyResponse> {
@@ -314,6 +337,8 @@ async fn attest(
 /// Main OPRF evaluation endpoint.
 async fn evaluate(
     State(state): State<Arc<ProxyState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<EvalRequest>,
 ) -> Result<Json<EvalResponse>, (StatusCode, String)> {
     // -- 1. Attestation + nonce validation --
@@ -351,7 +376,15 @@ async fn evaluate(
             (StatusCode::FORBIDDEN, "attestation failed".to_string())
         })?
     } else {
-        "anonymous".to_string()
+        // When attestation is disabled, use client IP as rate-limit key
+        // instead of a fixed string (which would make the rate limiter trivially bypassable).
+        let client_ip = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| peer_addr.ip().to_string());
+        format!("anon:{client_ip}")
     };
 
     // -- 2. Rate limiting --
@@ -602,6 +635,18 @@ async fn main() {
         }
     }
 
+    // Defense-in-depth: validate that all node endpoints use HTTPS.
+    // This prevents accidental deployment with plain HTTP node connections,
+    // which would expose OPRF traffic to network-level attackers.
+    for node in &config.nodes {
+        if !node.endpoint.starts_with("https://") {
+            panic!(
+                "node {} endpoint must use https:// (got: {})",
+                node.node_id, node.endpoint
+            );
+        }
+    }
+
     info!(
         threshold = config.threshold,
         nodes = config.nodes.len(),
@@ -670,6 +715,11 @@ async fn main() {
         None => DeviceKeyStore::new(),
     };
 
+    let metrics_token = env::var("METRICS_TOKEN").ok();
+    if metrics_token.is_some() {
+        info!("METRICS_TOKEN is set — /metrics endpoint requires Bearer auth");
+    }
+
     let state = Arc::new(ProxyState {
         config,
         http_client,
@@ -678,6 +728,7 @@ async fn main() {
         device_keys: RwLock::new(device_keys),
         total_evaluations: AtomicU64::new(0),
         started_at: Instant::now(),
+        metrics_token,
     });
 
     let app = Router::new()
@@ -734,7 +785,7 @@ async fn main() {
 
             axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
-                .serve(app.into_make_service())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .unwrap_or_else(|e| error!("server error: {e}"));
         }

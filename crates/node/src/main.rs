@@ -256,6 +256,13 @@ async fn fetch_sealed_blob(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
     if !resp.status().is_success() {
         return Err(format!("failed to fetch sealed blob: HTTP {}", resp.status()).into());
     }
+    // Check Content-Length before downloading the full body to avoid
+    // reading an unexpectedly large response into memory.
+    if let Some(len) = resp.content_length() {
+        if len > 1024 * 1024 {
+            return Err("sealed blob too large (Content-Length > 1MB)".into());
+        }
+    }
     let bytes = resp.bytes().await?;
     if bytes.len() > 1024 * 1024 {
         return Err("sealed blob too large (>1MB)".into());
@@ -412,7 +419,8 @@ async fn main() {
 
     // -- Auto-unseal from object storage (if configured) --
     if let Ok(sealed_url) = env::var("SEALED_KEY_URL") {
-        info!("auto-unseal: fetching sealed key from {sealed_url}");
+        let display_url = sealed_url.split('?').next().unwrap_or(&sealed_url);
+        info!("auto-unseal: fetching sealed key from {display_url}");
 
         let expected_vs = env::var("EXPECTED_VERIFICATION_SHARE")
             .expect("EXPECTED_VERIFICATION_SHARE required when SEALED_KEY_URL is set");
