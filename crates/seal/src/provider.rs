@@ -1,13 +1,46 @@
-//! Hardware attestation report retrieval.
+//! Hardware attestation report retrieval and key derivation.
 //!
 //! Supports two provider backends:
 //! - `/dev/sev-guest` ioctl (bare-metal SEV-SNP hosts: OVHcloud, Hetzner, etc.)
 //! - GCP Confidential VM metadata endpoint
+//!
+//! Also provides `get_derived_key()` for MSG_KEY_REQ (SNP_GET_DERIVED_KEY),
+//! which requests a hardware-derived key from the AMD Secure Processor.
 
 use crate::snp_report::SnpReport;
 #[cfg(target_os = "linux")]
 use crate::snp_report::REPORT_TOTAL_SIZE;
 use crate::SealError;
+use zeroize::Zeroizing;
+
+// ---------------------------------------------------------------------------
+// MSG_KEY_REQ field selector constants (GUEST_FIELD_SELECT bitmask)
+// ---------------------------------------------------------------------------
+
+/// Fields that can be mixed into MSG_KEY_REQ key derivation.
+/// AMD SEV-SNP Firmware ABI, Table 19 (GUEST_FIELD_SELECT).
+///
+/// IMPORTANT: Only MEASUREMENT and TCB_VERSION are safe to use.
+/// Other fields (GUEST_POLICY, IMAGE_ID, FAMILY_ID, GUEST_SVN)
+/// may change between boots or deployments, causing the derived
+/// key to change and sealed blobs to become undecryptable.
+pub const FIELD_GUEST_POLICY: u64  = 1 << 0;
+pub const FIELD_IMAGE_ID: u64      = 1 << 1;
+pub const FIELD_FAMILY_ID: u64     = 1 << 2;
+pub const FIELD_MEASUREMENT: u64   = 1 << 3;
+pub const FIELD_GUEST_SVN: u64     = 1 << 4;
+pub const FIELD_TCB_VERSION: u64   = 1 << 5;
+
+/// Safe field selector for sealing: MEASUREMENT + TCB_VERSION only.
+/// These are stable across reboots on the same chip with the same image.
+/// - MEASUREMENT: SHA-384 of firmware + kernel + initrd + VMSAs
+/// - TCB_VERSION: firmware and microcode security versions
+///
+/// DO NOT add other fields without understanding the consequences:
+/// - GUEST_POLICY: changes if VM policy is reconfigured
+/// - IMAGE_ID / FAMILY_ID: operator-set, may vary between deployments
+/// - GUEST_SVN: changes with guest software version updates
+pub const SAFE_FIELD_SELECT: u64 = FIELD_MEASUREMENT | FIELD_TCB_VERSION;
 
 #[derive(Debug, Clone, Copy)]
 pub enum SnpProvider {
@@ -28,6 +61,108 @@ pub async fn get_attestation_report(
         SnpProvider::DevSevGuest => get_report_dev_sev_guest(report_data),
         SnpProvider::GcpMetadata => get_report_gcp_metadata(report_data).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// MSG_KEY_REQ / SNP_GET_DERIVED_KEY (Linux only)
+// ---------------------------------------------------------------------------
+
+/// Request a hardware-derived key from the AMD Secure Processor via MSG_KEY_REQ.
+///
+/// The derived key is unique to this specific physical CPU chip AND the selected
+/// guest fields (measurement, TCB version). A different chip or different
+/// measurement will produce a completely different key.
+///
+/// Uses VCEK (Versioned Chip Endorsement Key) as the root key, which is
+/// unique per physical CPU die and cannot be extracted.
+///
+/// `field_select` controls which guest fields are mixed into the derivation.
+/// Use `SAFE_FIELD_SELECT` (MEASUREMENT | TCB_VERSION) for sealing.
+#[cfg(target_os = "linux")]
+pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    /// SNP_GET_DERIVED_KEY ioctl number.
+    /// Computed as _IOWR('S', 0x01, struct snp_user_key_req)
+    /// where 'S' = 0x53, nr = 0x01, size = 88 bytes = 0x58.
+    const SNP_GET_DERIVED_KEY_IOCTL: libc::c_ulong = 0xC058_5301;
+
+    #[repr(C)]
+    struct SnpDerivedKeyReq {
+        root_key_select: u32,    // 0 = VCEK (chip-specific), 1 = VMRK
+        reserved: u32,
+        guest_field_select: u64, // Bitmask of fields to mix into key derivation
+    }
+
+    #[repr(C)]
+    struct SnpDerivedKeyResp {
+        data: [u8; 64],          // Derived key (we use first 32 bytes for AES-256)
+    }
+
+    #[repr(C)]
+    struct SnpUserKeyReq {
+        req: SnpDerivedKeyReq,   // 16 bytes
+        resp: SnpDerivedKeyResp, // 64 bytes
+        fw_err: u64,             // 8 bytes
+    }
+    // Total: 88 bytes
+
+    let fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/sev-guest")
+        .map_err(|e| SealError::ProviderError(format!("failed to open /dev/sev-guest: {e}")))?;
+
+    let mut user_req = SnpUserKeyReq {
+        req: SnpDerivedKeyReq {
+            root_key_select: 0, // VCEK — chip-unique root key
+            reserved: 0,
+            guest_field_select: field_select,
+        },
+        resp: SnpDerivedKeyResp {
+            data: [0u8; 64],
+        },
+        fw_err: 0,
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            SNP_GET_DERIVED_KEY_IOCTL,
+            &mut user_req as *mut SnpUserKeyReq,
+        )
+    };
+
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(SealError::ProviderError(format!(
+            "SNP_GET_DERIVED_KEY ioctl failed: {errno}"
+        )));
+    }
+
+    if user_req.fw_err != 0 {
+        return Err(SealError::ProviderError(format!(
+            "SNP_GET_DERIVED_KEY firmware error: 0x{:X}",
+            user_req.fw_err
+        )));
+    }
+
+    // Extract the first 32 bytes as the AES-256 key
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&user_req.resp.data[..32]);
+
+    // Zero out the remaining 32 bytes of the response that we don't use
+    user_req.resp.data[32..64].fill(0);
+
+    Ok(Zeroizing::new(key))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_derived_key(_field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealError> {
+    Err(SealError::ProviderError(
+        "SNP_GET_DERIVED_KEY only available on Linux".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

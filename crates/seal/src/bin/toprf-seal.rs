@@ -1,9 +1,12 @@
-//! CLI tool to seal a node key share.
+//! CLI tool to seal a node key share (v1 format, HKDF-based).
 //!
 //! Usage: toprf-seal --share <path> --measurement <hex> --policy <u64> --output <path>
 //!
-//! Seals a node key share file (as produced by toprf-keygen) so it can
-//! only be decrypted by a VM with the given measurement.
+//! Creates a v1 sealed blob bound to measurement + policy. This can be
+//! decrypted by ANY VM with the matching measurement (not chip-specific).
+//!
+//! For chip-specific sealing (v2, MSG_KEY_REQ), use `toprf-node --init-seal`
+//! which runs inside the TEE and binds the blob to the specific physical CPU.
 
 use std::env;
 use std::fs;

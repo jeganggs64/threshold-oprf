@@ -2,25 +2,37 @@
 //!
 //! Key loading modes (at boot, never at runtime):
 //!
-//! 1. **Auto-unseal** (production) — When `SEALED_KEY_URL` is set, the node
+//! 1. **Init-seal** (initial deployment) — `--init-seal --upload-url <URL>`
+//!    boots an ephemeral HTTPS server with a self-signed cert. The operator
+//!    verifies the attestation report (which binds the TLS pubkey), then
+//!    POSTs the key share. The node seals it with MSG_KEY_REQ and uploads
+//!    the sealed blob to object storage, then exits.
+//!
+//! 2. **Auto-unseal** (production) — When `SEALED_KEY_URL` is set, the node
 //!    fetches a sealed key blob from object storage at boot, derives the
 //!    sealing key from its AMD SEV-SNP attestation measurement, and decrypts
-//!    the share automatically. No admin interaction required after deployment.
+//!    the share automatically. Supports both v2 (MSG_KEY_REQ) and v1 (HKDF)
+//!    sealed blobs. No admin interaction required after deployment.
 //!
-//! 2. **Key file** (testing/dev) — `--key-file <PATH>` loads a NodeKeyShare
+//! 3. **Key file** (testing/dev) — `--key-file <PATH>` loads a NodeKeyShare
 //!    JSON file from disk at boot. No network endpoint is exposed for key
 //!    loading.
 //!
-//! In both modes, the key exists only in memory after loading. If the TEE
+//! In all modes, the key exists only in memory after loading. If the TEE
 //! restarts, auto-unseal re-derives the key from the sealed blob.
 //!
-//! Endpoints:
+//! Endpoints (normal mode):
 //!   GET  /health           — liveness + key status ("waiting_for_key" or "ready")
 //!   GET  /info             — public info (only when key is loaded)
 //!   POST /partial-evaluate — OPRF partial evaluation (only when key is loaded)
 //!
+//! Endpoints (init-seal mode):
+//!   GET  /attest           — raw attestation report (binary)
+//!   POST /init-key         — accept key share JSON, seal, upload, exit
+//!
 //! Usage:
 //!   toprf-node --port 3001 --key-file /path/to/share.json
+//!   toprf-node --init-seal --upload-url https://storage.blob.core.windows.net/...
 //!
 //! Environment variables:
 //!   PORT                       — HTTP listen port (default: 3001)
@@ -41,6 +53,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router};
 use k256::Scalar;
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use zeroize::{Zeroize, Zeroizing};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
@@ -269,6 +282,259 @@ async fn fetch_sealed_blob(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
     Ok(bytes.to_vec())
 }
 
+// -- Init-seal mode --
+
+/// State for the init-seal ephemeral server.
+struct InitSealState {
+    /// Upload URL for the sealed blob.
+    upload_url: String,
+    /// Raw attestation report bytes (for /attest endpoint).
+    attestation_report_bytes: Vec<u8>,
+    /// Shutdown signal sender — triggers server exit after /init-key completes.
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+/// GET /attest — returns the raw attestation report (binary).
+async fn attest_handler(
+    State(state): State<Arc<InitSealState>>,
+) -> impl IntoResponse {
+    info!("init-seal: /attest endpoint called, returning attestation report");
+    (
+        StatusCode::OK,
+        [("content-type", "application/octet-stream")],
+        state.attestation_report_bytes.clone(),
+    )
+}
+
+/// POST /init-key — accepts key share JSON, seals it, uploads, then signals shutdown.
+async fn init_key_handler(
+    State(state): State<Arc<InitSealState>>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, String), (StatusCode, String)> {
+    info!("init-seal: /init-key endpoint called, processing key share");
+
+    // Validate the body is valid JSON and a valid NodeKeyShare
+    let mut share_bytes = Zeroizing::new(body.to_vec());
+    let _share: NodeKeyShare = serde_json::from_slice(&share_bytes).map_err(|e| {
+        error!("init-seal: invalid NodeKeyShare JSON: {e}");
+        (StatusCode::BAD_REQUEST, format!("invalid NodeKeyShare JSON: {e}"))
+    })?;
+    info!("init-seal: key share JSON parsed successfully");
+
+    // Step 1: Get hardware-derived key via MSG_KEY_REQ
+    info!("init-seal: requesting hardware-derived key via MSG_KEY_REQ (SAFE_FIELD_SELECT)");
+    let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT).map_err(|e| {
+        error!("init-seal: failed to get derived key: {e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to get derived key: {e}"))
+    })?;
+    info!("init-seal: hardware-derived key obtained successfully");
+
+    // Step 2: Seal the key share
+    info!("init-seal: sealing key share with derived key");
+    let sealed_blob =
+        toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
+            .map_err(|e| {
+                error!("init-seal: sealing failed: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("sealing failed: {e}"))
+            })?;
+    info!(
+        sealed_blob_size = sealed_blob.len(),
+        "init-seal: key share sealed successfully"
+    );
+
+    // Zeroize the plaintext key share bytes
+    share_bytes.zeroize();
+    drop(share_bytes);
+    info!("init-seal: plaintext key share zeroized from memory");
+
+    // Step 3: Upload the sealed blob
+    let upload_url = &state.upload_url;
+    info!(url = %upload_url.split('?').next().unwrap_or(upload_url), "init-seal: uploading sealed blob");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| {
+            error!("init-seal: failed to build HTTP client: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to build HTTP client: {e}"))
+        })?;
+
+    let resp = client
+        .put(upload_url)
+        .header("x-ms-blob-type", "BlockBlob")
+        .header("content-type", "application/octet-stream")
+        .body(sealed_blob)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("init-seal: upload request failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}"))
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        error!(
+            http_status = %status,
+            body = %body_text,
+            "init-seal: upload returned non-success status"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("upload failed: HTTP {status}"),
+        ));
+    }
+
+    info!("init-seal: sealed blob uploaded successfully");
+    info!("init-seal: initialization complete — shutting down");
+
+    // Signal the server to shut down
+    let _ = state.shutdown_tx.send(true);
+
+    Ok((StatusCode::OK, "sealed blob uploaded successfully, node shutting down".into()))
+}
+
+/// Run the init-seal mode: generate ephemeral TLS cert, get attestation,
+/// serve /attest and /init-key, then exit after key is sealed and uploaded.
+async fn run_init_seal(port: &str, upload_url: String) {
+    use axum_server::tls_rustls::RustlsConfig;
+
+    info!("init-seal: starting initial deployment mode");
+
+    // Validate upload URL uses HTTPS
+    if !upload_url.starts_with("https://") {
+        eprintln!("Error: --upload-url must use https://");
+        std::process::exit(1);
+    }
+    info!(
+        url = %upload_url.split('?').next().unwrap_or(&upload_url),
+        "init-seal: upload URL validated"
+    );
+
+    // Step 1: Generate ephemeral TLS keypair with self-signed certificate
+    info!("init-seal: generating ephemeral TLS keypair and self-signed certificate");
+    let key_pair = rcgen::KeyPair::generate().expect("failed to generate keypair");
+    let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .expect("failed to create cert params");
+    let cert = cert_params
+        .self_signed(&key_pair)
+        .expect("failed to generate self-signed certificate");
+
+    let cert_der = cert.der().clone();
+    let key_der = key_pair.serialize_der();
+
+    // Step 2: Compute SHA-256 of the TLS certificate's public key
+    let tls_pubkey_bytes = key_pair.public_key_der();
+    let tls_pubkey_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&tls_pubkey_bytes);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    };
+    info!(
+        pubkey_hash = %hex::encode(tls_pubkey_hash),
+        "init-seal: TLS public key SHA-256 hash computed"
+    );
+
+    // Step 3: Get attestation report with TLS pubkey hash as REPORT_DATA
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&tls_pubkey_hash);
+    // Remaining 32 bytes are zeros
+
+    let provider = match env::var("SNP_PROVIDER").as_deref() {
+        Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
+        _ => toprf_seal::provider::SnpProvider::DevSevGuest,
+    };
+
+    info!("init-seal: requesting attestation report with TLS pubkey hash as REPORT_DATA");
+    let report = toprf_seal::provider::get_attestation_report(provider, Some(&report_data))
+        .await
+        .expect("init-seal: failed to get attestation report");
+
+    // Serialize the raw report body + signature for the /attest endpoint
+    let mut attestation_bytes = Vec::with_capacity(report.body_bytes.len() + 96);
+    attestation_bytes.extend_from_slice(&report.body_bytes);
+    // Pad to REPORT_BODY_SIZE if needed (should already be exact)
+    while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
+        attestation_bytes.push(0);
+    }
+    attestation_bytes.extend_from_slice(&report.signature_r);
+    attestation_bytes.extend_from_slice(&report.signature_s);
+    // Pad to full report size
+    while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
+        attestation_bytes.push(0);
+    }
+
+    info!(
+        measurement = %hex::encode(report.measurement),
+        "init-seal: attestation report obtained"
+    );
+
+    // Step 4: Set up the ephemeral HTTPS server
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let init_state = Arc::new(InitSealState {
+        upload_url,
+        attestation_report_bytes: attestation_bytes,
+        shutdown_tx,
+    });
+
+    let app = Router::new()
+        .route("/attest", get(attest_handler))
+        .route("/init-key", post(init_key_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024)) // 64KB max for key share JSON
+        .with_state(init_state);
+
+    let bind_addr = format!("0.0.0.0:{port}");
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|e| panic!("invalid bind address {bind_addr}: {e}"));
+
+    // Build rustls config from the ephemeral cert
+    let rustls_config = {
+        let cert_chain = vec![cert_der];
+        let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
+
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                cert_chain.into_iter().map(|c| c.into()).collect(),
+                private_key.into(),
+            )
+            .expect("failed to build rustls ServerConfig for init-seal");
+
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config
+    };
+
+    let tls_config = RustlsConfig::from_config(Arc::new(rustls_config));
+
+    info!(
+        addr = %bind_addr,
+        "init-seal: ephemeral HTTPS server starting — waiting for operator"
+    );
+    info!("init-seal: endpoints available:");
+    info!("  GET  /attest   — fetch raw attestation report");
+    info!("  POST /init-key — submit key share JSON");
+
+    // Serve until shutdown signal
+    let server = axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service());
+
+    tokio::select! {
+        result = server => {
+            if let Err(e) = result {
+                error!("init-seal: server error: {e}");
+            }
+        }
+        _ = shutdown_rx.wait_for(|&v| v) => {
+            info!("init-seal: shutdown signal received, exiting");
+        }
+    }
+}
+
 // -- Main --
 
 #[tokio::main]
@@ -282,6 +548,8 @@ async fn main() {
     let mut tls_key: Option<String> = None;
     let mut client_ca: Option<String> = None;
     let mut key_file: Option<String> = None;
+    let mut init_seal = false;
+    let mut upload_url: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -326,22 +594,39 @@ async fn main() {
                 }
                 key_file = Some(args[i].clone());
             }
+            "--init-seal" => {
+                init_seal = true;
+            }
+            "--upload-url" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --upload-url");
+                    std::process::exit(1);
+                }
+                upload_url = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: toprf-node [OPTIONS]");
                 eprintln!();
                 eprintln!("Key loading (at boot only — no runtime key endpoints):");
-                eprintln!("  1. Auto-unseal: set SEALED_KEY_URL to fetch and decrypt a sealed");
+                eprintln!("  1. Init-seal: --init-seal --upload-url <URL> to run the initial");
+                eprintln!("     deployment flow. The node generates an ephemeral TLS cert,");
+                eprintln!("     serves /attest and /init-key, seals the key share with");
+                eprintln!("     MSG_KEY_REQ, uploads to object storage, then exits.");
+                eprintln!("  2. Auto-unseal: set SEALED_KEY_URL to fetch and decrypt a sealed");
                 eprintln!("     key blob at boot using AMD SEV-SNP attestation.");
-                eprintln!("  2. Key file: --key-file <PATH> to load a NodeKeyShare JSON file");
+                eprintln!("  3. Key file: --key-file <PATH> to load a NodeKeyShare JSON file");
                 eprintln!("     from disk (for testing/dev).");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -p, --port <PORT>        Listen port (default: 3001)");
-                eprintln!("      --key-file <PATH>    Load key share from JSON file at boot");
-                eprintln!("      --tls-cert <PATH>    TLS server certificate (PEM)");
-                eprintln!("      --tls-key <PATH>     TLS server private key (PEM)");
-                eprintln!("      --client-ca <PATH>   CA cert for client auth (enables mTLS)");
-                eprintln!("  -h, --help               Show this help");
+                eprintln!("  -p, --port <PORT>         Listen port (default: 3001)");
+                eprintln!("      --init-seal           Run initial deployment (seal + upload) mode");
+                eprintln!("      --upload-url <URL>    HTTPS URL to upload sealed blob (init-seal only)");
+                eprintln!("      --key-file <PATH>     Load key share from JSON file at boot");
+                eprintln!("      --tls-cert <PATH>     TLS server certificate (PEM)");
+                eprintln!("      --tls-key <PATH>      TLS server private key (PEM)");
+                eprintln!("      --client-ca <PATH>    CA cert for client auth (enables mTLS)");
+                eprintln!("  -h, --help                Show this help");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PORT                        Listen port (default: 3001)");
@@ -360,6 +645,31 @@ async fn main() {
             }
         }
         i += 1;
+    }
+
+    // -- Validate mutually exclusive modes --
+    if init_seal {
+        if key_file.is_some() {
+            eprintln!("Error: --init-seal cannot be used with --key-file");
+            std::process::exit(1);
+        }
+        if env::var("SEALED_KEY_URL").is_ok() {
+            eprintln!("Error: --init-seal cannot be used with SEALED_KEY_URL");
+            std::process::exit(1);
+        }
+        if upload_url.is_none() {
+            eprintln!("Error: --init-seal requires --upload-url <URL>");
+            std::process::exit(1);
+        }
+
+        // Run init-seal mode and exit
+        run_init_seal(&port, upload_url.unwrap()).await;
+        return;
+    }
+
+    if upload_url.is_some() {
+        eprintln!("Error: --upload-url can only be used with --init-seal");
+        std::process::exit(1);
     }
 
     let state = Arc::new(NodeState {
@@ -428,44 +738,77 @@ async fn main() {
             .await
             .expect("failed to fetch sealed blob from object storage");
 
-        // Get attestation measurement — only real attestation is supported
-        let provider = match env::var("SNP_PROVIDER").as_deref() {
-            Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
-            _ => toprf_seal::provider::SnpProvider::DevSevGuest,
+        // Detect blob version to choose the right unseal path
+        let blob_version = toprf_seal::detect_sealed_version(&sealed_blob)
+            .expect("auto-unseal: failed to detect sealed blob version");
+
+        info!(blob_version = blob_version, "auto-unseal: detected sealed blob version");
+
+        let share_json = match blob_version {
+            2 => {
+                // v2: Hardware-derived key via MSG_KEY_REQ
+                info!("auto-unseal: v2 blob detected, requesting hardware-derived key via MSG_KEY_REQ");
+
+                let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT)
+                    .expect("auto-unseal: failed to get hardware-derived key via MSG_KEY_REQ");
+
+                // Log v2 header info
+                if let Ok(field_select) = toprf_seal::parse_v2_header(&sealed_blob) {
+                    info!(
+                        field_select = format!("0x{field_select:X}"),
+                        "auto-unseal: v2 blob field_select"
+                    );
+                }
+
+                Zeroizing::new(
+                    toprf_seal::unseal_derived(&sealed_blob, &derived_key)
+                        .expect("auto-unseal: v2 decryption failed — derived key mismatch or corrupt blob"),
+                )
+            }
+            1 => {
+                // v1: HKDF-from-measurement (backwards compatibility)
+                info!("auto-unseal: v1 blob detected, using HKDF-based unseal (legacy)");
+
+                // Get attestation measurement for v1 unseal
+                let provider = match env::var("SNP_PROVIDER").as_deref() {
+                    Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
+                    _ => toprf_seal::provider::SnpProvider::DevSevGuest,
+                };
+                let report =
+                    toprf_seal::provider::get_attestation_report(provider, None)
+                        .await
+                        .expect("failed to get attestation report");
+
+                // Verify report authenticity
+                toprf_seal::attestation::AttestationVerifier::verify_report(&report)
+                    .await
+                    .expect("attestation report verification failed");
+
+                let measurement = report.measurement;
+                let policy = report.policy;
+
+                // Parse sealed blob header for logging
+                if let Ok((sealed_measurement, sealed_policy)) =
+                    toprf_seal::sealing::parse_sealed_header(&sealed_blob)
+                {
+                    info!(
+                        sealed_for = %hex::encode(sealed_measurement),
+                        our_measurement = %hex::encode(measurement),
+                        sealed_policy = sealed_policy,
+                        report_policy = policy,
+                        "auto-unseal: v1 measurement comparison"
+                    );
+                }
+
+                Zeroizing::new(
+                    toprf_seal::sealing::unseal(&sealed_blob, &measurement, policy)
+                        .expect("auto-unseal: v1 decryption failed — measurement mismatch or corrupt blob"),
+                )
+            }
+            other => {
+                panic!("auto-unseal: unsupported sealed blob version: {other}");
+            }
         };
-        let report =
-            toprf_seal::provider::get_attestation_report(provider, None)
-                .await
-                .expect("failed to get attestation report");
-
-        // Verify report authenticity
-        toprf_seal::attestation::AttestationVerifier::verify_report(&report)
-            .await
-            .expect("attestation report verification failed");
-
-        let measurement = report.measurement;
-        let policy = report.policy;
-
-        // Parse sealed blob header for logging
-        if let Ok((sealed_measurement, sealed_policy)) =
-            toprf_seal::sealing::parse_sealed_header(&sealed_blob)
-        {
-            info!(
-                sealed_for = %hex::encode(sealed_measurement),
-                our_measurement = %hex::encode(measurement),
-                sealed_policy = sealed_policy,
-                report_policy = policy,
-                "auto-unseal: measurement comparison"
-            );
-        }
-
-        // Derive sealing key from OUR attestation measurement and policy,
-        // then unseal. Using the report's policy (not the blob header's)
-        // ensures we trust the hardware attestation, not stored metadata.
-        let share_json = Zeroizing::new(
-            toprf_seal::sealing::unseal(&sealed_blob, &measurement, policy)
-                .expect("auto-unseal: decryption failed — measurement mismatch or corrupt blob"),
-        );
 
         // Parse the unsealed key share
         let share: NodeKeyShare = serde_json::from_slice(&share_json)

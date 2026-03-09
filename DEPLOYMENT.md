@@ -133,7 +133,7 @@ Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). AWS signs reports with VLEK 
 
 ---
 
-## Step 3: Build node images and get measurements
+## Step 3: Build and deploy the node binary
 
 ```bash
 cargo build --release -p toprf-node
@@ -141,100 +141,69 @@ cargo build --release -p toprf-node
 docker build -f deploy/sev/Dockerfile.sev -t toprf-node:latest .
 ```
 
-### Getting the measurement (launch digest)
-
-The measurement is the SHA-384 hash of the guest's initial memory state (OVMF firmware + kernel + initrd + VMSAs), computed by the AMD Secure Processor during VM launch.
-
-**Option A: Pre-compute with `sev-snp-measure` (recommended for known firmware)**
-
-The [`sev-snp-measure`](https://github.com/virtee/sev-snp-measure) tool computes the expected launch digest from the VM inputs without booting:
-
-```bash
-pip install sev-snp-measure
-
-sev-snp-measure --mode snp \
-  --vcpus=2 \
-  --vcpu-type=EPYC-v4 \
-  --ovmf=OVMF.fd \
-  --kernel=vmlinuz \
-  --initrd=initrd.img \
-  --append="console=ttyS0"
-```
-
-This requires access to the exact firmware image the cloud provider uses, which may not always be available.
-
-**Option B: Boot once and read from attestation report (recommended for cloud VMs)**
-
-Boot the guest VM without a key (it will start but can't serve evaluations), then capture the measurement:
-
-```bash
-# Using the built-in toprf-measure tool
-toprf-measure --provider gcp --json   # GCP
-toprf-measure --provider raw --json   # Azure, AWS
-
-# Or using snpguest
-cargo install snpguest
-snpguest report --request /dev/sev-guest
-```
-
-The MEASUREMENT field (48 bytes / 96 hex chars) is the launch digest. Save it — you'll need it for sealing.
-
-**Important:** The measurement is deterministic for a given software stack + vCPU count. Two VMs with the same firmware, kernel, initrd, command line, and vCPU count will produce the same measurement, regardless of which physical machine or provider they run on. However, different cloud providers use different firmware images, so each node will likely have a different measurement.
+Deploy the `toprf-node` binary to each VM.
 
 ### What changes the measurement
+
+The measurement is the SHA-384 hash of the guest's initial memory state (OVMF firmware + kernel + initrd + VMSAs), computed by the AMD Secure Processor during VM launch.
 
 | Change | Measurement changes? | Action required |
 |--------|---------------------|-----------------|
 | Application code update | No | Just redeploy the binary |
-| Kernel update | Yes | Reseal key share |
-| Firmware/UEFI update (provider-pushed) | Yes | Reseal key share |
-| vCPU count change (instance resize) | Yes | Reseal key share |
+| Kernel update | Yes | Re-run init-seal |
+| Firmware/UEFI update (provider-pushed) | Yes | Re-run init-seal |
+| vCPU count change (instance resize) | Yes | Re-run init-seal |
 | Disk/data changes | No | Nothing |
-| Different physical host (same provider) | No | Nothing |
+| Different physical host (same provider) | Yes (different chip key) | Re-run init-seal |
+
+**Note:** With MSG_KEY_REQ sealing (v2), the sealed blob is bound to the **specific physical CPU chip**, not just the measurement. Moving to a different physical host (e.g., VM stop/start on cloud) requires re-running the init-seal flow.
 
 ---
 
-## Step 4: Seal key shares
+## Step 4: Initial key injection (init-seal)
 
-Seal each node's key share on your air-gapped machine using its TEE measurement.
+This is the critical step. Each node seals its key share using the AMD Secure Processor's MSG_KEY_REQ, which derives a key unique to this specific CPU chip + measurement + TCB version. The sealed blob can only be decrypted on the same physical chip running the same software.
+
+### How it works
+
+The `--init-seal` mode uses attested TLS to securely inject the key share:
+
+1. **Node boots** inside the SEV-SNP VM and generates an ephemeral TLS keypair
+2. **Node binds the TLS key to the attestation report** — puts the SHA-256 of the TLS public key into the `REPORT_DATA` field of the SNP attestation report
+3. **Node serves two endpoints** over HTTPS:
+   - `GET /attest` — returns the raw AMD attestation report
+   - `POST /init-key` — accepts the key share, seals it, uploads, then exits
+4. **Operator verifies the attestation** — checks AMD signature chain (ARK → ASK → VCEK), confirms the MEASUREMENT matches the expected binary, confirms REPORT_DATA contains the TLS pubkey hash
+5. **Operator sends the key share** via the attested TLS channel
+6. **Node seals** using `MSG_KEY_REQ(MEASUREMENT | TCB_VERSION)` and uploads to object storage
+
+### Field selector bitmask
+
+The AMD firmware ABI allows the guest to choose which fields are mixed into the MSG_KEY_REQ derived key via a bitmask. The implementation explicitly uses **only safe fields**:
+
+- **MEASUREMENT** (bit 3) — SHA-384 of firmware + kernel + initrd + VMSAs. Stable across reboots on the same image.
+- **TCB_VERSION** (bit 5) — Firmware and microcode security versions. Stable until a microcode update.
+
+Fields explicitly **NOT** included:
+
+- GUEST_POLICY (bit 0) — could change if VM policy is reconfigured
+- IMAGE_ID (bit 1) — operator-set, may vary between deployments
+- FAMILY_ID (bit 2) — operator-set, may vary between deployments
+- GUEST_SVN (bit 4) — changes with guest software version updates
+
+### Set up cross-provider blob storage
+
+Before running init-seal, create the storage buckets on the cross-provider storage. Each node's blob is stored on a **different** provider than where the VM runs:
+
+| Node | VM runs on | Sealed blob stored on |
+|------|-----------|----------------------|
+| Node 1 | GCP Singapore | Azure Blob Storage |
+| Node 2 | Azure US | AWS S3 |
+| Node 3 | AWS EU | GCP Cloud Storage |
+
+#### Azure Blob Storage (for Node 1's blob)
 
 ```bash
-cargo build --release -p toprf-seal
-
-# Seal each node's share with its measurement
-./target/release/toprf-seal seal \
-  --input ceremony/node-shares/node-1-share.json \
-  --measurement <node-1-measurement-hex> \
-  --policy <policy-value> \
-  --output node-1-sealed.bin
-
-./target/release/toprf-seal seal \
-  --input ceremony/node-shares/node-2-share.json \
-  --measurement <node-2-measurement-hex> \
-  --policy <policy-value> \
-  --output node-2-sealed.bin
-
-./target/release/toprf-seal seal \
-  --input ceremony/node-shares/node-3-share.json \
-  --measurement <node-3-measurement-hex> \
-  --policy <policy-value> \
-  --output node-3-sealed.bin
-```
-
-The sealed blob is AES-256-GCM encrypted with a key derived from `HKDF(measurement || policy)`. Only a TEE with the matching measurement can derive the same key and unseal.
-
----
-
-## Step 5: Upload sealed blobs (cross-provider)
-
-Each sealed blob is stored on a **different** provider than where its node runs. This ensures no single provider has access to both the VM and the blob.
-
-### Node 1 blob → Azure Blob Storage
-
-Node 1 runs on GCP, so store its blob on Azure:
-
-```bash
-# Create storage account + container (one-time)
 az storage account create \
   --name ruonidsealedkeys \
   --resource-group ruonid-rg \
@@ -245,92 +214,159 @@ az storage container create \
   --name sealed-blobs \
   --account-name ruonidsealedkeys \
   --public-access off
+```
 
-# Upload
-az storage blob upload \
-  --account-name ruonidsealedkeys \
-  --container-name sealed-blobs \
-  --name node-1-sealed.bin \
-  --file node-1-sealed.bin
+#### AWS S3 (for Node 2's blob)
 
-# Generate a SAS URL for the node to fetch at boot (valid 1 year, read-only)
-az storage blob generate-sas \
+```bash
+aws s3 mb s3://ruonid-sealed-keys-eu --region eu-west-1
+```
+
+#### GCP Cloud Storage (for Node 3's blob)
+
+```bash
+gcloud storage buckets create gs://ruonid-sealed-keys --location=asia-southeast1
+```
+
+### Run init-seal on each node
+
+SSH into each TEE VM and run:
+
+#### Node 1 (GCP Singapore)
+
+```bash
+SNP_PROVIDER=gcp \
+EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
+toprf-node \
+  --init-seal \
+  --upload-url "https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin" \
+  --port 3001
+```
+
+The node starts an HTTPS server with an ephemeral self-signed certificate. From your local machine:
+
+```bash
+# 1. Fetch the attestation report
+curl -k https://<gcp-node-ip>:3001/attest -o report.bin
+
+# 2. Verify the attestation report:
+#    - AMD signature chain valid (ARK → ASK → VCEK)?
+#    - MEASUREMENT matches expected binary?
+#    - REPORT_DATA[0..32] == SHA-256 of the TLS certificate's public key?
+#    (Use snpguest or a custom verifier)
+
+# 3. Once verified, send the key share
+curl -k https://<gcp-node-ip>:3001/init-key \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d @ceremony/node-shares/node-1-share.json
+```
+
+The node will:
+- Call MSG_KEY_REQ to derive a chip-specific key K
+- Encrypt the key share with K using AES-256-GCM (v2 sealed blob format)
+- Upload the sealed blob to the `--upload-url`
+- Zeroize the plaintext key share from memory
+- Exit
+
+Repeat for nodes 2 and 3 with their respective share files and upload URLs.
+
+#### Node 2 (Azure US East)
+
+```bash
+SNP_PROVIDER=raw \
+EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
+toprf-node \
+  --init-seal \
+  --upload-url "https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin" \
+  --port 3001
+```
+
+#### Node 3 (AWS EU Ireland)
+
+```bash
+SNP_PROVIDER=raw \
+EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
+toprf-node \
+  --init-seal \
+  --upload-url "https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin" \
+  --port 3001
+```
+
+### Security properties of init-seal
+
+- **Attested TLS** — the TLS public key hash is embedded in the AMD-signed attestation report. The operator verifies this before sending the key share, ensuring they're talking to the genuine TEE (not an impersonator).
+- **MSG_KEY_REQ** — the sealing key is derived by the AMD Secure Processor from the chip's unique root key (VCEK). It never exists outside the CPU. A different chip produces a completely different key.
+- **Field selector** — explicitly set to `MEASUREMENT | TCB_VERSION` only. No per-boot-random fields are included.
+- **Cross-provider storage** — the blob is uploaded to a different provider than where the VM runs. A single provider compromise cannot access both the VM and the blob.
+- **One-time endpoint** — `/init-key` accepts exactly one call, then the node exits. There is no persistent key injection endpoint.
+
+---
+
+## Step 5: Start nodes in normal mode
+
+After init-seal completes, restart each node in normal mode. The node fetches its sealed blob, calls MSG_KEY_REQ to derive the same chip-specific key, and unseals.
+
+### Node 1 (GCP Singapore)
+
+```bash
+# Generate a read-only SAS URL for the sealed blob
+BLOB_URL=$(az storage blob generate-sas \
   --account-name ruonidsealedkeys \
   --container-name sealed-blobs \
   --name node-1-sealed.bin \
   --permissions r \
   --expiry $(date -u -v+1y '+%Y-%m-%dT%H:%MZ') \
-  --full-uri
+  --full-uri -o tsv)
 
-# Node SEALED_KEY_URL will be:
-# https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin?sv=...&sig=...
+SEALED_KEY_URL="$BLOB_URL" \
+EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
+SNP_PROVIDER=gcp \
+toprf-node \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node1.pem \
+  --tls-key /etc/toprf/certs/node1.key \
+  --client-ca /etc/toprf/certs/ca.pem
 ```
 
-### Node 2 blob → AWS S3
+On boot, the node:
+1. Fetches the sealed blob from the cross-provider URL
+2. Calls `MSG_KEY_REQ(MEASUREMENT | TCB_VERSION)` — same chip + same software → same key K
+3. Decrypts the key share with K
+4. Verifies `k_i * G == expected_verification_share`
+5. Starts serving `/health`, `/info`, `/partial-evaluate`
 
-Node 2 runs on Azure, so store its blob on AWS:
+### Node 2 (Azure US East)
 
 ```bash
-# Create bucket (one-time)
-aws s3 mb s3://ruonid-sealed-keys-eu --region eu-west-1
-
-# Upload
-aws s3 cp node-2-sealed.bin s3://ruonid-sealed-keys-eu/node-2-sealed.bin
-
-# Create IAM user with read-only access to just this object
-aws iam create-user --user-name toprf-node2-reader
-aws iam put-user-policy --user-name toprf-node2-reader \
-  --policy-name sealed-blob-read \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::ruonid-sealed-keys-eu/node-2-sealed.bin"
-    }]
-  }'
-
-# Generate access key for the node
-aws iam create-access-key --user-name toprf-node2-reader
-
-# Or generate a pre-signed URL (valid 7 days, renew periodically)
-aws s3 presign s3://ruonid-sealed-keys-eu/node-2-sealed.bin --expires-in 604800
-
-# Node SEALED_KEY_URL will be the pre-signed URL or direct S3 URL with credentials
+SEALED_KEY_URL="https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin" \
+EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
+SNP_PROVIDER=raw \
+toprf-node \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node2.pem \
+  --tls-key /etc/toprf/certs/node2.key \
+  --client-ca /etc/toprf/certs/ca.pem
 ```
 
-### Node 3 blob → GCP Cloud Storage
-
-Node 3 runs on AWS, so store its blob on GCP:
+### Node 3 (AWS EU Ireland)
 
 ```bash
-# Create bucket (one-time)
-gcloud storage buckets create gs://ruonid-sealed-keys --location=asia-southeast1
-
-# Upload
-gcloud storage cp node-3-sealed.bin gs://ruonid-sealed-keys/node-3-sealed.bin
-
-# Create a service account with read-only access
-gcloud iam service-accounts create toprf-node3-reader
-gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-keys \
-  --member=serviceAccount:toprf-node3-reader@PROJECT.iam.gserviceaccount.com \
-  --role=roles/storage.objectViewer
-
-# Generate a signed URL (valid 7 days)
-gcloud storage sign-url gs://ruonid-sealed-keys/node-3-sealed.bin \
-  --duration=7d \
-  --private-key-file=service-account-key.json
-
-# Node SEALED_KEY_URL will be the signed URL
+SEALED_KEY_URL="https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin" \
+EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
+SNP_PROVIDER=raw \
+toprf-node \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node3.pem \
+  --tls-key /etc/toprf/certs/node3.key \
+  --client-ca /etc/toprf/certs/ca.pem
 ```
 
-### Security notes
+### Backwards compatibility
 
-- **Cross-provider storage is critical.** A rogue employee at provider X can access the VM on X but not the blob on provider Y. They would need to compromise two independent providers simultaneously.
-- **The sealed blob is encrypted** (AES-256-GCM bound to the TEE measurement), so even with blob access, decryption requires a VM with the matching measurement. Cross-provider storage is defense-in-depth.
-- **Use time-limited signed URLs** rather than static credentials where possible. Rotate them periodically.
-- **Delete plaintext key share files** (`node-*-share.json`) after sealing. The admin recovery shares are the only backup.
-- **The threshold protects you even if cross-provider storage fails.** An attacker needs 2-of-3 shares. Even if they compromise one provider entirely (VM + blob on a different provider), they only get 1 share.
+The node auto-detects the sealed blob format:
+- **v2 blobs** (from `--init-seal`): Uses `MSG_KEY_REQ` — chip-specific, strongest security
+- **v1 blobs** (from `toprf-seal` CLI): Uses HKDF from measurement — not chip-specific, but works across hardware
 
 ---
 
@@ -360,56 +396,7 @@ Distribute:
 
 ---
 
-## Step 7: Deploy TEE nodes
-
-On each TEE VM, run the node binary with auto-unseal. The node fetches its sealed blob, gets a hardware attestation report, derives the sealing key, and decrypts the share — all at boot with no manual intervention.
-
-### Node 1 (GCP Singapore)
-
-```bash
-SEALED_KEY_URL="https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin?sv=...&sig=..." \
-EXPECTED_VERIFICATION_SHARE=<node-1-verification-share-from-public-config.json> \
-SNP_PROVIDER=gcp \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node1.pem \
-  --tls-key /etc/toprf/certs/node1.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
-`SNP_PROVIDER=gcp` uses the GCP metadata API for attestation reports.
-
-### Node 2 (Azure US East)
-
-```bash
-SEALED_KEY_URL="https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin?X-Amz-..." \
-EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
-SNP_PROVIDER=raw \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node2.pem \
-  --tls-key /etc/toprf/certs/node2.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
-`SNP_PROVIDER=raw` reads attestation reports from `/dev/sev-guest`.
-
-### Node 3 (AWS EU Ireland)
-
-```bash
-SEALED_KEY_URL="https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin?X-Goog-..." \
-EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
-SNP_PROVIDER=raw \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node3.pem \
-  --tls-key /etc/toprf/certs/node3.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
----
-
-## Step 8: Configure the proxy
+## Step 7: Configure the proxy
 
 Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config.json`:
 
@@ -446,7 +433,7 @@ Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config
 
 ---
 
-## Step 9: Deploy the API + proxy
+## Step 8: Deploy the API + proxy
 
 The Express API and Rust proxy run together. Build and deploy:
 
@@ -466,7 +453,7 @@ This starts:
 
 ---
 
-## Step 10: Verify
+## Step 9: Verify
 
 ```bash
 # Express health
@@ -504,26 +491,27 @@ curl --cacert certs/ca/ca.pem \
 
 ## Firmware update / resealing procedure
 
-When a cloud provider pushes a firmware update (or you change instance size), the SEV-SNP measurement changes and the node will fail to unseal on next boot.
+With MSG_KEY_REQ sealing (v2), the sealed blob is bound to the specific physical CPU chip AND the measurement. Resealing is needed when:
+- The cloud provider pushes a firmware update (measurement changes)
+- You change instance size / vCPU count (measurement changes)
+- The VM moves to a different physical host (different chip key)
 
 **Procedure:**
 
-1. **Before the update takes effect**, the running node still has the key in memory and is serving traffic normally.
+1. **Boot the updated VM** with the new firmware/instance size.
 
-2. **Get the new measurement.** Boot a test VM with the updated firmware/instance size and run `toprf-measure` to capture the new measurement.
-
-3. **Reseal on your air-gapped machine:**
+2. **Re-run init-seal** — the node will generate a new sealed blob bound to the new chip + measurement:
    ```bash
-   ./target/release/toprf-seal seal \
-     --input ceremony/node-shares/node-N-share.json \
-     --measurement <new-measurement> \
-     --policy <policy-value> \
-     --output node-N-sealed-v2.bin
+   SNP_PROVIDER=raw \
+   EXPECTED_VERIFICATION_SHARE=<node-N-verification-share> \
+   toprf-node \
+     --init-seal \
+     --upload-url <cross-provider-upload-url> \
+     --port 3001
    ```
+   Then send the key share to `/init-key` as in the initial deployment.
 
-4. **Upload the new blob** to the cross-provider storage, replacing the old one.
-
-5. **Apply the update and restart the node.** It will fetch the new blob and unseal with the new measurement.
+3. **Restart in normal mode** with `SEALED_KEY_URL` pointing to the new blob.
 
 **If you no longer have the plaintext key shares** (deleted after initial sealing), use the admin recovery shares to reconstruct and re-split:
 
