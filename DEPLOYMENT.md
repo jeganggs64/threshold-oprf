@@ -1,6 +1,6 @@
 # Threshold OPRF Deployment Guide
 
-Production deployment of the threshold OPRF system: Express API server (AWS) + Rust threshold proxy + 3 TEE nodes across GCP, OVHCloud, and Hetzner.
+Production deployment of the threshold OPRF system: Express API server + Rust threshold proxy + 3 TEE nodes across GCP, Azure, and AWS.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ Production deployment of the threshold OPRF system: Express API server (AWS) + R
 Mobile App
     |  HTTPS (api.ruonlabs.com)
     v
-  AWS ALB
+  Cloud Load Balancer (any provider)
     |
     v
   Express API (port 3002)        <-- attestation, rate limiting, billing
@@ -16,20 +16,43 @@ Mobile App
     v
   Rust TOPRF Proxy (port 3000)   <-- fans out to TEE nodes, DLEQ verification
     |  mTLS
-    +--- Node 1 (GCP Confidential VM,  SEV-SNP)
-    +--- Node 2 (OVHCloud bare metal,  SEV-SNP)
-    +--- Node 3 (Hetzner bare metal,   SEV-SNP)
+    +--- Node 1 (GCP Singapore,     N2D Confidential VM,  SEV-SNP)
+    +--- Node 2 (Azure US East,     DCasv5 Confidential VM, SEV-SNP)
+    +--- Node 3 (AWS EU Ireland,    C6a SEV-SNP instance)
 ```
 
-Express and the Rust proxy run together on the same AWS host. Only Express is exposed externally. The Rust proxy communicates with TEE nodes over mTLS.
+Express and the Rust proxy run together on the same host. Only Express is exposed externally. The Rust proxy communicates with TEE nodes over mTLS.
 
-Nodes are spread across three providers in different jurisdictions to minimize the impact of a single provider compromise or legal order — each provider only has 1-of-3 shares (below the threshold of 2).
+Nodes are spread across three cloud providers in different geographic jurisdictions to minimize the impact of a single provider compromise or legal order — each provider only has 1-of-3 shares (below the threshold of 2).
+
+### Cost estimate
+
+| Provider | Instance | vCPUs | RAM | Region | ~Monthly |
+|----------|----------|-------|-----|--------|----------|
+| GCP | n2d-standard-2 (Confidential VM) | 2 | 8 GB | asia-southeast1 (Singapore) | ~$85 |
+| Azure | Standard_DC2as_v5 | 2 | 8 GB | East US | ~$63 |
+| AWS | c6a.large + SEV-SNP | 2 | 4 GB | eu-west-1 (Ireland) | ~$64 |
+| **Total nodes** | | | | | **~$212/mo** |
+
+These are the smallest SEV-SNP capable instances on each provider. Scaling to larger instances (e.g., 4 vCPUs) changes the SEV-SNP measurement (vCPU count affects the VMSA blob in the launch digest), so resealing is required after any instance size change.
+
+### Cross-provider sealed blob storage
+
+To prevent a single cloud provider from having both the VM and the sealed blob (which together could allow unsealing), store each node's sealed blob on a **different** provider:
+
+| Node | VM runs on | Sealed blob stored on |
+|------|-----------|----------------------|
+| Node 1 | GCP Singapore | Azure Blob Storage |
+| Node 2 | Azure US | AWS S3 |
+| Node 3 | AWS EU | GCP Cloud Storage |
+
+This way, compromising a single provider only gives access to either the VM or the blob, never both.
 
 ---
 
 ## Step 1: Generate keys
 
-Run on an air-gapped machine if possible. This generates the threshold key shares and admin recovery shares.
+Run on an air-gapped machine. This generates the threshold key shares and admin recovery shares.
 
 ```bash
 cd threshold-oprf
@@ -60,66 +83,69 @@ Keep `public-config.json` — you'll need the `group_public_key` and `verificati
 
 ## Step 2: Provision 3 TEE servers
 
-| Node | Provider | Server type | TEE | Attestation |
-|------|----------|-------------|-----|-------------|
-| 1 | GCP | N2D Confidential VM (AMD EPYC) | AMD SEV-SNP | GCP metadata API |
-| 2 | OVHCloud | Bare metal Scale (AMD EPYC 9005) | AMD SEV-SNP | `/dev/sev-guest` |
-| 3 | Hetzner | AX162 dedicated (AMD EPYC 9454P) | AMD SEV-SNP | `/dev/sev-guest` |
+All three providers offer managed AMD SEV-SNP confidential VMs — no bare metal setup or BIOS configuration required.
 
-### GCP (Node 1) — Managed Confidential VM
-
-GCP handles the hypervisor and SEV-SNP setup. Create a Confidential VM:
+### Node 1: GCP Singapore
 
 ```bash
 gcloud compute instances create toprf-node-1 \
-  --zone=europe-west1-b \
+  --zone=asia-southeast1-b \
   --machine-type=n2d-standard-2 \
   --confidential-compute-type=SEV_SNP \
   --image-family=ubuntu-2404-lts-amd64 \
   --image-project=ubuntu-os-cloud
 ```
 
-Attestation reports are available via the GCP metadata service or `/dev/sev-guest`. The `toprf-node` binary supports both (`SNP_PROVIDER=gcp` uses the metadata API, `SNP_PROVIDER=raw` uses `/dev/sev-guest` directly).
+Attestation: GCP metadata API (`SNP_PROVIDER=gcp`) or `/dev/sev-guest` (`SNP_PROVIDER=raw`).
 
-### OVHCloud (Node 2) — Bare metal
+### Node 2: Azure US East
 
-OVHCloud provides bare metal servers with AMD EPYC processors. You must configure SEV-SNP yourself:
+```bash
+az vm create \
+  --resource-group ruonid-rg \
+  --name toprf-node-2 \
+  --location eastus \
+  --size Standard_DC2as_v5 \
+  --image Canonical:ubuntu-24_04-lts:cvm:latest \
+  --security-type ConfidentialVM \
+  --os-disk-security-encryption-type VMGuestStateOnly \
+  --admin-username azureuser \
+  --generate-ssh-keys
+```
 
-1. Order a Scale series server with AMD EPYC 9005 (or 9004) processor
-2. Access BIOS via IPMI/KVM console and enable:
-   - SMEE (Secure Memory Encryption)
-   - SEV Control
-   - SEV-ES ASID Space Limit > 1
-   - SNP / RMP Table
-3. Set up a host OS with KVM and QEMU (with SEV-SNP support — upstream Linux kernel 6.x+)
-4. Launch a confidential guest VM with SNP enabled
-5. Inside the guest, `/dev/sev-guest` becomes available via the `sev-guest` kernel module
+Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). Azure also provides Microsoft Azure Attestation (MAA) service for remote verification.
 
-### Hetzner (Node 3) — Bare metal
+### Node 3: AWS EU Ireland
 
-Same setup as OVHCloud — Hetzner provides dedicated root servers with AMD EPYC:
+```bash
+aws ec2 run-instances \
+  --region eu-west-1 \
+  --instance-type c6a.large \
+  --image-id ami-xxxxxxxxx \
+  --cpu-options AmdSevSnp=enabled \
+  --key-name ruonid-node3 \
+  --security-group-ids sg-xxxxxxxxx
+```
 
-1. Order an AX162 (EPYC 9454P, 48 cores) or similar AMD EPYC server
-2. Access BIOS via KVM console (Hetzner provides 3 free hours, then ~EUR 8.40/3h) and enable SEV-SNP settings
-3. Set up host KVM + QEMU with SEV-SNP
-4. Launch a confidential guest VM
-5. `/dev/sev-guest` available inside the guest
+Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). AWS signs reports with VLEK (Versioned Loaded Endorsement Key) rather than VCEK.
 
-For a detailed walkthrough of bare-metal SEV-SNP setup, see: https://blog.lyc8503.net/en/post/amd-sev-snp/
+**Note:** AWS SEV-SNP is currently available in only 2 regions: `us-east-2` (Ohio) and `eu-west-1` (Ireland). Only M6a, C6a, and R6a instance families support it.
 
 ---
 
 ## Step 3: Build node images and get measurements
 
 ```bash
+cargo build --release -p toprf-node
+# Or build a Docker image:
 docker build -f deploy/sev/Dockerfile.sev -t toprf-node:latest .
 ```
 
 ### Getting the measurement (launch digest)
 
-The measurement is the SHA-384 hash of the guest's initial memory state (OVMF firmware + kernel + initrd), computed by the AMD Secure Processor during VM launch.
+The measurement is the SHA-384 hash of the guest's initial memory state (OVMF firmware + kernel + initrd + VMSAs), computed by the AMD Secure Processor during VM launch.
 
-**Option A: Pre-compute with `sev-snp-measure` (recommended)**
+**Option A: Pre-compute with `sev-snp-measure` (recommended for known firmware)**
 
 The [`sev-snp-measure`](https://github.com/virtee/sev-snp-measure) tool computes the expected launch digest from the VM inputs without booting:
 
@@ -135,31 +161,42 @@ sev-snp-measure --mode snp \
   --append="console=ttyS0"
 ```
 
-This gives you the measurement deterministically from the build artifacts.
+This requires access to the exact firmware image the cloud provider uses, which may not always be available.
 
-**Option B: Boot once and read from attestation report**
+**Option B: Boot once and read from attestation report (recommended for cloud VMs)**
 
-Boot the guest VM, then read the measurement from inside:
+Boot the guest VM without a key (it will start but can't serve evaluations), then capture the measurement:
 
 ```bash
-# Install snpguest (Rust CLI for /dev/sev-guest)
+# Using the built-in toprf-measure tool
+toprf-measure --provider gcp --json   # GCP
+toprf-measure --provider raw --json   # Azure, AWS
+
+# Or using snpguest
 cargo install snpguest
-
-# Get attestation report
 snpguest report --request /dev/sev-guest
-
-# The MEASUREMENT field (48 bytes) is the launch digest
 ```
 
-On GCP, you can also read it from the metadata API.
+The MEASUREMENT field (48 bytes / 96 hex chars) is the launch digest. Save it — you'll need it for sealing.
 
-Use the same measurement for all nodes running the same guest image. If the images differ per provider (different kernels/firmware), each node will have a different measurement.
+**Important:** The measurement is deterministic for a given software stack + vCPU count. Two VMs with the same firmware, kernel, initrd, command line, and vCPU count will produce the same measurement, regardless of which physical machine or provider they run on. However, different cloud providers use different firmware images, so each node will likely have a different measurement.
+
+### What changes the measurement
+
+| Change | Measurement changes? | Action required |
+|--------|---------------------|-----------------|
+| Application code update | No | Just redeploy the binary |
+| Kernel update | Yes | Reseal key share |
+| Firmware/UEFI update (provider-pushed) | Yes | Reseal key share |
+| vCPU count change (instance resize) | Yes | Reseal key share |
+| Disk/data changes | No | Nothing |
+| Different physical host (same provider) | No | Nothing |
 
 ---
 
 ## Step 4: Seal key shares
 
-Seal each node's key share using its TEE measurement. The sealed blob can only be decrypted by a TEE instance with the matching measurement.
+Seal each node's key share on your air-gapped machine using its TEE measurement.
 
 ```bash
 cargo build --release -p toprf-seal
@@ -167,125 +204,133 @@ cargo build --release -p toprf-seal
 # Seal each node's share with its measurement
 ./target/release/toprf-seal seal \
   --input ceremony/node-shares/node-1-share.json \
-  --measurement <node-1-measurement> \
+  --measurement <node-1-measurement-hex> \
   --policy <policy-value> \
   --output node-1-sealed.bin
 
 ./target/release/toprf-seal seal \
   --input ceremony/node-shares/node-2-share.json \
-  --measurement <node-2-measurement> \
+  --measurement <node-2-measurement-hex> \
   --policy <policy-value> \
   --output node-2-sealed.bin
 
 ./target/release/toprf-seal seal \
   --input ceremony/node-shares/node-3-share.json \
-  --measurement <node-3-measurement> \
+  --measurement <node-3-measurement-hex> \
   --policy <policy-value> \
   --output node-3-sealed.bin
 ```
 
+The sealed blob is AES-256-GCM encrypted with a key derived from `HKDF(measurement || policy)`. Only a TEE with the matching measurement can derive the same key and unseal.
+
 ---
 
-## Step 5: Upload sealed blobs to object storage
+## Step 5: Upload sealed blobs (cross-provider)
 
-Each sealed blob must be accessible by its corresponding TEE node at boot time via HTTPS. Upload each blob to the S3-compatible object storage of the provider where that node runs.
+Each sealed blob is stored on a **different** provider than where its node runs. This ensures no single provider has access to both the VM and the blob.
 
-### GCP (Node 1) — Google Cloud Storage
+### Node 1 blob → Azure Blob Storage
+
+Node 1 runs on GCP, so store its blob on Azure:
+
+```bash
+# Create storage account + container (one-time)
+az storage account create \
+  --name ruonidsealedkeys \
+  --resource-group ruonid-rg \
+  --location eastus \
+  --sku Standard_LRS
+
+az storage container create \
+  --name sealed-blobs \
+  --account-name ruonidsealedkeys \
+  --public-access off
+
+# Upload
+az storage blob upload \
+  --account-name ruonidsealedkeys \
+  --container-name sealed-blobs \
+  --name node-1-sealed.bin \
+  --file node-1-sealed.bin
+
+# Generate a SAS URL for the node to fetch at boot (valid 1 year, read-only)
+az storage blob generate-sas \
+  --account-name ruonidsealedkeys \
+  --container-name sealed-blobs \
+  --name node-1-sealed.bin \
+  --permissions r \
+  --expiry $(date -u -v+1y '+%Y-%m-%dT%H:%MZ') \
+  --full-uri
+
+# Node SEALED_KEY_URL will be:
+# https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin?sv=...&sig=...
+```
+
+### Node 2 blob → AWS S3
+
+Node 2 runs on Azure, so store its blob on AWS:
 
 ```bash
 # Create bucket (one-time)
-gcloud storage buckets create gs://ruonid-sealed-keys --location=europe-west1
+aws s3 mb s3://ruonid-sealed-keys-eu --region eu-west-1
 
 # Upload
-gcloud storage cp node-1-sealed.bin gs://ruonid-sealed-keys/node-1-sealed.bin
+aws s3 cp node-2-sealed.bin s3://ruonid-sealed-keys-eu/node-2-sealed.bin
 
-# Restrict access: only the node VM's service account can read
-gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-keys \
-  --member=serviceAccount:node1-sa@project.iam.gserviceaccount.com \
-  --role=roles/storage.objectViewer
-
-# Node URL:
-# https://storage.googleapis.com/ruonid-sealed-keys/node-1-sealed.bin
-```
-
-### OVHCloud (Node 2) — S3-compatible Object Storage
-
-OVHCloud offers S3-compatible object storage with zero egress fees. Create credentials in the OVH control panel under Public Cloud > Object Storage > S3 Users.
-
-```bash
-# Configure aws-cli with OVH S3 credentials
-aws configure --profile ovh
-# Set endpoint: https://s3.<region>.cloud.ovh.net (e.g., s3.gra.cloud.ovh.net)
-
-# Create bucket
-aws --profile ovh --endpoint-url https://s3.gra.cloud.ovh.net \
-  s3 mb s3://ruonid-sealed-keys
-
-# Upload
-aws --profile ovh --endpoint-url https://s3.gra.cloud.ovh.net \
-  s3 cp node-2-sealed.bin s3://ruonid-sealed-keys/node-2-sealed.bin
-
-# Restrict access: set bucket policy to allow only the node's S3 user
-aws --profile ovh --endpoint-url https://s3.gra.cloud.ovh.net \
-  s3api put-bucket-policy --bucket ruonid-sealed-keys --policy '{
+# Create IAM user with read-only access to just this object
+aws iam create-user --user-name toprf-node2-reader
+aws iam put-user-policy --user-name toprf-node2-reader \
+  --policy-name sealed-blob-read \
+  --policy-document '{
     "Version": "2012-10-17",
     "Statement": [{
       "Effect": "Allow",
-      "Principal": { "AWS": ["arn:aws:iam:::user/node2-s3-user"] },
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::ruonid-sealed-keys/node-2-sealed.bin"
+      "Resource": "arn:aws:s3:::ruonid-sealed-keys-eu/node-2-sealed.bin"
     }]
   }'
 
-# Node URL:
-# https://s3.gra.cloud.ovh.net/ruonid-sealed-keys/node-2-sealed.bin
-# (or https://ruonid-sealed-keys.s3.gra.cloud.ovh.net/node-2-sealed.bin)
+# Generate access key for the node
+aws iam create-access-key --user-name toprf-node2-reader
+
+# Or generate a pre-signed URL (valid 7 days, renew periodically)
+aws s3 presign s3://ruonid-sealed-keys-eu/node-2-sealed.bin --expires-in 604800
+
+# Node SEALED_KEY_URL will be the pre-signed URL or direct S3 URL with credentials
 ```
 
-### Hetzner (Node 3) — S3-compatible Object Storage
+### Node 3 blob → GCP Cloud Storage
 
-Hetzner offers Ceph-backed S3-compatible storage. Create credentials in the Hetzner Cloud Console under Object Storage.
+Node 3 runs on AWS, so store its blob on GCP:
 
 ```bash
-# Configure aws-cli with Hetzner S3 credentials
-aws configure --profile hetzner
-# Set endpoint: https://fsn1.your-objectstorage.com (Falkenstein)
-# or https://nbg1.your-objectstorage.com (Nuremberg)
-# or https://hel1.your-objectstorage.com (Helsinki)
-
-# Create bucket
-aws --profile hetzner --endpoint-url https://fsn1.your-objectstorage.com \
-  s3 mb s3://ruonid-sealed-keys
+# Create bucket (one-time)
+gcloud storage buckets create gs://ruonid-sealed-keys --location=asia-southeast1
 
 # Upload
-aws --profile hetzner --endpoint-url https://fsn1.your-objectstorage.com \
-  s3 cp node-3-sealed.bin s3://ruonid-sealed-keys/node-3-sealed.bin
+gcloud storage cp node-3-sealed.bin gs://ruonid-sealed-keys/node-3-sealed.bin
 
-# Set bucket policy to restrict access
-aws --profile hetzner --endpoint-url https://fsn1.your-objectstorage.com \
-  s3api put-bucket-policy --bucket ruonid-sealed-keys --policy '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Deny",
-      "Principal": "*",
-      "Action": "s3:*",
-      "Resource": ["arn:aws:s3:::ruonid-sealed-keys", "arn:aws:s3:::ruonid-sealed-keys/*"],
-      "Condition": {
-        "StringNotEquals": { "aws:username": "node3-s3-user" }
-      }
-    }]
-  }'
+# Create a service account with read-only access
+gcloud iam service-accounts create toprf-node3-reader
+gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-keys \
+  --member=serviceAccount:toprf-node3-reader@PROJECT.iam.gserviceaccount.com \
+  --role=roles/storage.objectViewer
 
-# Node URL:
-# https://fsn1.your-objectstorage.com/ruonid-sealed-keys/node-3-sealed.bin
+# Generate a signed URL (valid 7 days)
+gcloud storage sign-url gs://ruonid-sealed-keys/node-3-sealed.bin \
+  --duration=7d \
+  --private-key-file=service-account-key.json
+
+# Node SEALED_KEY_URL will be the signed URL
 ```
 
 ### Security notes
 
-- **Never make sealed blob buckets public.** Use per-user credentials or IAM policies so only the specific node can read its blob.
-- **The sealed blob is encrypted** (AES-256-GCM bound to the TEE measurement), so even if someone obtains it, they cannot decrypt it without matching hardware. Access restrictions are defense-in-depth.
-- **Delete the plaintext key share files** (`node-*-share.json`) after sealing. The admin recovery shares are the only way to reconstruct the secret if all sealed blobs are lost.
-- **Pre-signed URLs** are another option for OVH/Hetzner — generate a time-limited URL for the node to fetch at boot, avoiding stored credentials on the node.
+- **Cross-provider storage is critical.** A rogue employee at provider X can access the VM on X but not the blob on provider Y. They would need to compromise two independent providers simultaneously.
+- **The sealed blob is encrypted** (AES-256-GCM bound to the TEE measurement), so even with blob access, decryption requires a VM with the matching measurement. Cross-provider storage is defense-in-depth.
+- **Use time-limited signed URLs** rather than static credentials where possible. Rotate them periodically.
+- **Delete plaintext key share files** (`node-*-share.json`) after sealing. The admin recovery shares are the only backup.
+- **The threshold protects you even if cross-provider storage fails.** An attacker needs 2-of-3 shares. Even if they compromise one provider entirely (VM + blob on a different provider), they only get 1 share.
 
 ---
 
@@ -308,10 +353,10 @@ certs/
 ```
 
 Distribute:
-- `ca.pem` + `proxy-client.pem` + `proxy-client.key` → AWS (proxy)
+- `ca.pem` + `proxy-client.pem` + `proxy-client.key` → proxy host
 - `ca.pem` + `node1.pem` + `node1.key` → GCP node
-- `ca.pem` + `node2.pem` + `node2.key` → OVHCloud node
-- `ca.pem` + `node3.pem` + `node3.key` → Hetzner node
+- `ca.pem` + `node2.pem` + `node2.key` → Azure node
+- `ca.pem` + `node3.pem` + `node3.key` → AWS node
 
 ---
 
@@ -319,10 +364,10 @@ Distribute:
 
 On each TEE VM, run the node binary with auto-unseal. The node fetches its sealed blob, gets a hardware attestation report, derives the sealing key, and decrypts the share — all at boot with no manual intervention.
 
-### Node 1 (GCP)
+### Node 1 (GCP Singapore)
 
 ```bash
-SEALED_KEY_URL=https://storage.googleapis.com/ruonid-sealed-keys/node-1-sealed.bin \
+SEALED_KEY_URL="https://ruonidsealedkeys.blob.core.windows.net/sealed-blobs/node-1-sealed.bin?sv=...&sig=..." \
 EXPECTED_VERIFICATION_SHARE=<node-1-verification-share-from-public-config.json> \
 SNP_PROVIDER=gcp \
 toprf-node \
@@ -332,12 +377,12 @@ toprf-node \
   --client-ca /etc/toprf/certs/ca.pem
 ```
 
-`SNP_PROVIDER=gcp` uses the GCP metadata API to retrieve the attestation report.
+`SNP_PROVIDER=gcp` uses the GCP metadata API for attestation reports.
 
-### Node 2 (OVHCloud)
+### Node 2 (Azure US East)
 
 ```bash
-SEALED_KEY_URL=https://s3.gra.cloud.ovh.net/ruonid-sealed-keys/node-2-sealed.bin \
+SEALED_KEY_URL="https://ruonid-sealed-keys-eu.s3.eu-west-1.amazonaws.com/node-2-sealed.bin?X-Amz-..." \
 EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
 SNP_PROVIDER=raw \
 toprf-node \
@@ -347,12 +392,12 @@ toprf-node \
   --client-ca /etc/toprf/certs/ca.pem
 ```
 
-`SNP_PROVIDER=raw` reads the attestation report directly from `/dev/sev-guest` via the kernel's `sev-guest` module. The guest VM must have SEV-SNP enabled and the module loaded.
+`SNP_PROVIDER=raw` reads attestation reports from `/dev/sev-guest`.
 
-### Node 3 (Hetzner)
+### Node 3 (AWS EU Ireland)
 
 ```bash
-SEALED_KEY_URL=https://fsn1.your-objectstorage.com/ruonid-sealed-keys/node-3-sealed.bin \
+SEALED_KEY_URL="https://storage.googleapis.com/ruonid-sealed-keys/node-3-sealed.bin?X-Goog-..." \
 EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
 SNP_PROVIDER=raw \
 toprf-node \
@@ -362,13 +407,9 @@ toprf-node \
   --client-ca /etc/toprf/certs/ca.pem
 ```
 
-Same as OVHCloud — `SNP_PROVIDER=raw` talks to `/dev/sev-guest` directly.
-
 ---
 
 ## Step 8: Configure the proxy
-
-Copy `certs/` to `ruonid/deploy/certs/` on the AWS host.
 
 Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config.json`:
 
@@ -389,12 +430,12 @@ Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config
     },
     {
       "node_id": 2,
-      "endpoint": "https://<ovhcloud-node-ip-or-dns>:3001",
+      "endpoint": "https://<azure-node-ip-or-dns>:3001",
       "verification_share": "<node 2 verification_share>"
     },
     {
       "node_id": 3,
-      "endpoint": "https://<hetzner-node-ip-or-dns>:3001",
+      "endpoint": "https://<aws-node-ip-or-dns>:3001",
       "verification_share": "<node 3 verification_share>"
     }
   ]
@@ -405,27 +446,23 @@ Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config
 
 ---
 
-## Step 9: Deploy on AWS
+## Step 9: Deploy the API + proxy
 
-Build the Rust proxy image (from the threshold-oprf repo):
+The Express API and Rust proxy run together. Build and deploy:
 
 ```bash
+# Build proxy image (from threshold-oprf repo)
 cd threshold-oprf
 docker build -f deploy/Dockerfile.proxy -t toprf-proxy:latest .
-```
 
-Deploy both services:
-
-```bash
+# Deploy both services
 cd ruonid
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
 This starts:
-- **Express API** on port 3002 (exposed to ALB)
+- **Express API** on port 3002 (exposed to load balancer)
 - **Rust TOPRF Proxy** on port 3000 (internal only, not exposed)
-
-Your existing ALB routes `api.ruonlabs.com` to port 3002 — no DNS or ALB changes needed.
 
 ---
 
@@ -438,10 +475,10 @@ curl https://api.ruonlabs.com/health
 # OPRF challenge (nonce issuance)
 curl https://api.ruonlabs.com/oprf/challenge
 
-# Rust proxy health (from the AWS host only, not externally)
+# Rust proxy health (from the API host only, not externally)
 curl http://localhost:3000/health
 
-# Individual node health (from the AWS host, via mTLS)
+# Individual node health (from the API host, via mTLS)
 curl --cacert certs/ca/ca.pem \
      --cert certs/proxy/proxy-client.pem \
      --key certs/proxy/proxy-client.key \
@@ -457,33 +494,44 @@ curl --cacert certs/ca/ca.pem \
 - [ ] `POST /oprf/evaluate` returns `{ partials: [...], threshold: 2 }`
 - [ ] Mobile app can complete full OPRF flow (hash, blind, evaluate, combine, unblind, derive ruonId)
 - [ ] Delete plaintext key share files from the ceremony machine
-- [ ] Store admin recovery shares in separate secure locations
-- [ ] Set up monitoring webhook for GCP node (`toprf-monitor --webhook-url ...`)
+- [ ] Store admin recovery shares in separate secure locations (different physical locations)
+- [ ] Set up monitoring for all 3 nodes
 - [ ] Verify mTLS: nodes reject connections without the proxy client cert
-- [ ] Verify sealed blob buckets are not publicly accessible
-- [ ] Verify OVH/Hetzner node BIOS has SEV-SNP enabled and `/dev/sev-guest` is accessible in guest
+- [ ] Verify sealed blob storage is private (no public access)
+- [ ] Set `AMD_ARK_FINGERPRINT` env var on the proxy for AMD root cert pinning
 
 ---
 
-## Bare metal SEV-SNP setup notes (OVHCloud + Hetzner)
+## Firmware update / resealing procedure
 
-Unlike GCP which provides managed confidential VMs, OVHCloud and Hetzner give you bare metal. You are responsible for:
+When a cloud provider pushes a firmware update (or you change instance size), the SEV-SNP measurement changes and the node will fail to unseal on next boot.
 
-1. **BIOS configuration** — Enable SMEE, SEV Control, SEV-ES ASID Space Limit > 1, SNP, and RMP Table via IPMI/KVM console.
+**Procedure:**
 
-2. **Host hypervisor** — Install a Linux host (kernel 6.x+ with SEV-SNP support) with KVM and QEMU. The upstream kernel and QEMU both support SEV-SNP.
+1. **Before the update takes effect**, the running node still has the key in memory and is serving traffic normally.
 
-3. **Guest VM launch** — Launch the node's guest VM with SNP enabled. QEMU flags include `-object sev-snp-guest,...` and the appropriate OVMF firmware.
+2. **Get the new measurement.** Boot a test VM with the updated firmware/instance size and run `toprf-measure` to capture the new measurement.
 
-4. **Guest kernel module** — The guest kernel needs the `sev-guest` module loaded (`modprobe sev-guest`) to expose `/dev/sev-guest`.
+3. **Reseal on your air-gapped machine:**
+   ```bash
+   ./target/release/toprf-seal seal \
+     --input ceremony/node-shares/node-N-share.json \
+     --measurement <new-measurement> \
+     --policy <policy-value> \
+     --output node-N-sealed-v2.bin
+   ```
 
-5. **Attestation verification** — The node verifies its own attestation report against AMD's Key Distribution Service (KDS) certificate chain: ARK (self-signed) → ASK → VCEK → report signature.
+4. **Upload the new blob** to the cross-provider storage, replacing the old one.
 
-For a detailed walkthrough: https://blog.lyc8503.net/en/post/amd-sev-snp/
+5. **Apply the update and restart the node.** It will fetch the new blob and unseal with the new measurement.
 
-Useful tools:
-- [`sev-snp-measure`](https://github.com/virtee/sev-snp-measure) — Pre-compute expected launch digest from VM artifacts
-- [`snpguest`](https://github.com/virtee/snpguest) — Rust CLI for interacting with `/dev/sev-guest`
+**If you no longer have the plaintext key shares** (deleted after initial sealing), use the admin recovery shares to reconstruct and re-split:
+
+```bash
+./target/release/toprf-keygen recover \
+  --shares admin-share-1.json admin-share-2.json admin-share-3.json \
+  --output-dir ./recovered
+```
 
 ---
 
@@ -493,7 +541,7 @@ If you need to rotate the threshold secret (adding/removing nodes, suspected com
 
 1. Use `toprf-keygen reshare` to generate new shares from existing ones (any 2-of-3 nodes can participate)
 2. Seal new shares with current TEE measurements
-3. Upload new sealed blobs to object storage
+3. Upload new sealed blobs to cross-provider storage
 4. Restart nodes — they auto-unseal with new shares
 5. Update `proxy-config.json` with new verification shares and group public key
 6. Restart the Rust proxy
