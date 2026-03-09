@@ -1,0 +1,33 @@
+{
+  "group_public_key": "02a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+  "threshold": 2,
+  "nodes": [
+    {
+      "node_id": 1,
+      "endpoint": "https://node1.toprf.example.com:8443",
+      "verification_share": "03aabbccdd11223344556677889900aabbccdd11223344556677889900aabbccdd11"
+    },
+    {
+      "node_id": 2,
+      "endpoint": "https://node2.toprf.example.com:8443",
+      "verification_share": "03bbccddee22334455667788990011bbccddee22334455667788990011bbccddee22"
+    },
+    {
+      "node_id": 3,
+      "endpoint": "https://node3.toprf.example.com:8443",
+      "verification_share": "03ccddeeff33445566778899001122ccddeeff33445566778899001122ccddeeff33"
+    }
+  ],
+  "rate_limit": {
+    "per_hour": 10,
+    "per_day": 30
+  },
+  "require_attestation": true,
+  "apple_app_id": "TEAMID.com.example.app",
+  "android_package_name": "com.example.app",
+  "node_ca_cert": "certs/ca/ca.pem",
+  "proxy_client_cert": "certs/proxy/proxy-client.pem",
+  "proxy_client_key": "certs/proxy/proxy-client.key",
+  "device_keys_path": "data/device-keys.json",
+  "rate_limit_path": "data/rate-limits.json"
+}

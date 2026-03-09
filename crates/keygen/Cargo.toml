@@ -1,0 +1,13 @@
+[package]
+name = "toprf-keygen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+toprf-core = { path = "../core" }
+k256 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }

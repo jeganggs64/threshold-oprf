@@ -1,0 +1,111 @@
+# =============================================================================
+# Gramine manifest template for toprf-node
+#
+# This manifest tells Gramine how to run the toprf-node binary inside an
+# Intel SGX enclave. Gramine intercepts system calls and provides a
+# compatibility layer so the binary runs unmodified.
+#
+# Template variables (resolved by gramine-manifest):
+#   {{ log_level }}    - Gramine log level (error/warning/debug/trace)
+#   {{ arch_libdir }}  - Architecture-specific lib dir (e.g. /lib/x86_64-linux-gnu)
+#
+# Reference: https://gramine.readthedocs.io/en/stable/manifest-syntax.html
+# =============================================================================
+
+[libos]
+entrypoint = "/app/toprf-node"
+
+[loader]
+entrypoint = "file:{{ gramine.libos }}"
+log_level = "{{ log_level }}"
+argv = ["/app/toprf-node"]
+
+# Environment variables available to the enclave process
+[loader.env]
+LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/lib"
+SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt"
+RUST_LOG = { passthrough = true }
+NODE_INDEX = { passthrough = true }
+THRESHOLD = { passthrough = true }
+TOTAL_NODES = { passthrough = true }
+LISTEN_ADDR = { passthrough = true }
+TLS_CERT_PATH = { passthrough = true }
+TLS_KEY_PATH = { passthrough = true }
+
+# =============================================================================
+# Filesystem mounts
+# =============================================================================
+[fs]
+mounts = [
+    { path = "/lib",                  uri = "file:{{ gramine.runtimedir() }}" },
+    { path = "{{ arch_libdir }}",     uri = "file:{{ arch_libdir }}" },
+    { path = "/usr/lib",              uri = "file:/usr/lib" },
+    { path = "/etc",                  uri = "file:/etc" },
+    { path = "/app/toprf-node",       uri = "file:/app/toprf-node" },
+
+    # TLS certificates - mounted read-only from the host
+    { path = "/etc/toprf/certs",      uri = "file:/etc/toprf/certs" },
+]
+
+# =============================================================================
+# SGX-specific settings
+# =============================================================================
+[sgx]
+# Enable SGX remote attestation (DCAP-based)
+remote_attestation = "dcap"
+
+# Enclave memory size. This needs to be large enough for the Rust async runtime,
+# cryptographic operations (OPRF evaluations, polynomial arithmetic), and any
+# in-memory key material. 256 MiB is a reasonable starting point.
+enclave_size = "256M"
+
+# Maximum number of threads inside the enclave. Tokio typically needs at least
+# as many threads as CPU cores, plus a few for blocking tasks.
+max_threads = 8
+
+# Trusted files - these are measured and their hashes baked into the enclave
+# measurement (MRENCLAVE). Any modification will cause the enclave to refuse
+# to start, guaranteeing code integrity.
+trusted_files = [
+    "file:{{ gramine.libos }}",
+    "file:/app/toprf-node",
+    "file:{{ gramine.runtimedir() }}/",
+    "file:{{ arch_libdir }}/",
+    "file:/usr/lib/",
+    # NOTE: Update these paths to match your deployment's certificate filenames.
+    # gen-certs.sh creates certs/nodes/node{1,2,3}.pem and .key files.
+    # Copy or symlink the appropriate node cert as server.pem/server.key,
+    # or update these paths to match your naming convention.
+    "file:/etc/toprf/certs/nodes/server.pem",
+    "file:/etc/toprf/certs/nodes/server.key",
+    "file:/etc/toprf/certs/ca/ca.pem",
+]
+
+# Allowed files - not measured, but the enclave can read/write them.
+# Use sparingly; prefer trusted_files for anything security-critical.
+allowed_files = [
+    "file:/etc/ssl/certs/ca-certificates.crt",
+    "file:/etc/nsswitch.conf",
+    "file:/etc/resolv.conf",
+    "file:/etc/hosts",
+    "file:/etc/host.conf",
+    "file:/etc/gai.conf",
+]
+
+# ISV (Independent Software Vendor) settings for attestation
+isvprodid = 1
+isvsvn    = 1
+
+# =============================================================================
+# System call policy
+# =============================================================================
+[sys]
+# Enable hardened system call handling. Gramine will only allow system calls
+# that are explicitly whitelisted, reducing the attack surface.
+enable_sigterm_injection = true
+
+# Stack size per thread (default 256K can be tight for Rust; 1M is safer)
+stack.size = "1M"
+
+# Brk (heap) size
+brk.max_size = "32M"

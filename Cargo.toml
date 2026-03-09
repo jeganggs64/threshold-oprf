@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/keygen",
+    "crates/node",
+    "crates/proxy",
+    "crates/seal",
+    "crates/monitor",
+]
+
+[workspace.dependencies]
+frost-secp256k1 = "2.2.0"
+k256 = { version = "0.13", features = ["arithmetic", "hash2curve"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+p256 = { version = "0.13", features = ["ecdsa"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+ciborium = "0.2"
+x509-parser = { version = "0.16", features = ["verify"] }
+base64 = "0.22"
+pem = "3"
+aes-gcm = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1", features = ["derive"] }

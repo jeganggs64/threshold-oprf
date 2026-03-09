@@ -1,0 +1,17 @@
+# Generated TLS certificates
+certs/
+
+# Build artifacts
+/target/
+
+# Ceremony outputs (key shares)
+ceremony/
+admin-shares/
+node-shares/
+
+# Environment files
+.env
+.env.*
+
+# Private keys
+*.key

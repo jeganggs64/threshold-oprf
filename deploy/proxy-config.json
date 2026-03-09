@@ -1,0 +1,29 @@
+{
+  "group_public_key": "PLACEHOLDER — replace with output from toprf-keygen",
+  "threshold": 2,
+  "require_attestation": false,
+  "rate_limit": {
+    "per_hour": 100,
+    "per_day": 1000
+  },
+  "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
+  "proxy_client_cert": "/etc/toprf/certs/proxy/proxy-client.pem",
+  "proxy_client_key": "/etc/toprf/certs/proxy/proxy-client.key",
+  "nodes": [
+    {
+      "node_id": 1,
+      "endpoint": "https://node-1:3001",
+      "verification_share": "PLACEHOLDER"
+    },
+    {
+      "node_id": 2,
+      "endpoint": "https://node-2:3001",
+      "verification_share": "PLACEHOLDER"
+    },
+    {
+      "node_id": 3,
+      "endpoint": "https://node-3:3001",
+      "verification_share": "PLACEHOLDER"
+    }
+  ]
+}

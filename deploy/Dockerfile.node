@@ -1,0 +1,73 @@
+# =============================================================================
+# Stage 1: Build the toprf-node binary
+# =============================================================================
+FROM rust:1.83-bookworm AS builder
+
+WORKDIR /build
+
+# Copy workspace-level manifests first for layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Copy all crate Cargo.tomls so dependency resolution works
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/keygen/Cargo.toml crates/keygen/Cargo.toml
+COPY crates/node/Cargo.toml crates/node/Cargo.toml
+COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
+COPY crates/seal/Cargo.toml crates/seal/Cargo.toml
+COPY crates/monitor/Cargo.toml crates/monitor/Cargo.toml
+
+# Create stub lib/main files so `cargo fetch` can resolve the workspace.
+# This lets us cache the dependency download layer independently of source changes.
+RUN mkdir -p crates/core/src crates/keygen/src crates/node/src crates/proxy/src crates/seal/src crates/monitor/src && \
+    echo "// stub" > crates/core/src/lib.rs && \
+    echo "fn main() {}" > crates/keygen/src/main.rs && \
+    echo "fn main() {}" > crates/node/src/main.rs && \
+    echo "fn main() {}" > crates/proxy/src/main.rs && \
+    echo "fn main(){}" > crates/seal/src/lib.rs && \
+    echo "fn main(){}" > crates/monitor/src/main.rs
+
+# Pre-fetch and compile dependencies (cached unless Cargo.toml/lock change)
+RUN cargo build --release -p toprf-node 2>/dev/null || true
+
+# Now copy the real source code
+COPY crates/ crates/
+
+# Touch the source files so cargo recognises them as newer than the stubs
+RUN touch crates/core/src/lib.rs \
+    crates/node/src/main.rs \
+    crates/keygen/src/main.rs \
+    crates/proxy/src/main.rs
+
+# Build the actual release binary
+RUN cargo build --release -p toprf-node
+
+# =============================================================================
+# Stage 2: Minimal runtime image
+# =============================================================================
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for the service
+RUN groupadd --gid 1001 toprf && \
+    useradd --uid 1001 --gid toprf --shell /bin/false --create-home toprf
+
+COPY --from=builder /build/target/release/toprf-node /usr/local/bin/toprf-node
+
+# Directory for TLS certificates (mounted at runtime)
+RUN mkdir -p /etc/toprf/certs && chown -R toprf:toprf /etc/toprf
+
+USER toprf
+WORKDIR /home/toprf
+
+EXPOSE 3001
+
+LABEL org.opencontainers.image.title="toprf-node" \
+      org.opencontainers.image.description="Threshold OPRF node for distributed key evaluation" \
+      org.opencontainers.image.vendor="ruonid" \
+      org.opencontainers.image.source="https://github.com/jeganggs64/threshold-oprf" \
+      org.opencontainers.image.licenses="MIT"
+
+ENTRYPOINT ["/usr/local/bin/toprf-node"]

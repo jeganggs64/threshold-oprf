@@ -1,0 +1,14 @@
+target/
+certs/
+ceremony/
+.git/
+*.key
+*.pem
+admin-shares/
+node-shares/
+scripts/
+deploy/
+config/
+.gitignore
+README.md
+CLAUDE.md

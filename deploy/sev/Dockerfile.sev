@@ -1,0 +1,104 @@
+# =============================================================================
+# Dockerfile for AMD SEV-SNP Confidential VMs
+#
+# AMD SEV-SNP (Secure Encrypted Virtualization - Secure Nested Paging) provides
+# hardware-based memory encryption and integrity at the VM level. Unlike SGX
+# (which enclaves a process) or Nitro (which uses a separate enclave VM),
+# SEV-SNP encrypts the entire VM's memory with a key managed by the AMD
+# Secure Processor.
+#
+# This means the application binary runs UNMODIFIED -- no special SDKs, no
+# manifest files, no vsock proxying. The confidentiality guarantee comes from
+# the VM platform, not the application packaging.
+#
+# Deployment targets:
+#   - Azure Confidential VMs (DCasv5 / ECasv5 series)
+#       az vm create --size Standard_DC4as_v5 --security-type ConfidentialVM ...
+#   - GCP Confidential VMs (N2D with AMD EPYC Milan/Genoa)
+#       gcloud compute instances create ... --confidential-compute \
+#         --machine-type n2d-standard-4
+#   - AWS (EC2 instances on AMD EPYC with SEV-SNP support)
+#
+# Attestation:
+#   SEV-SNP provides an attestation report signed by the AMD Secure Processor.
+#   The report includes a measurement of the VM's initial state (equivalent to
+#   PCR values in other TEE models). Your attestation verifier should check:
+#     1. The report signature chains to AMD's root of trust (ARK/ASK/VCEK)
+#     2. The MEASUREMENT field matches the expected VM image digest
+#     3. The HOST_DATA field (if set) matches your deployment policy
+#     4. The REPORT_DATA field contains a challenge nonce from the verifier
+#
+#   Libraries for attestation:
+#     - sev-snp-measure (Python): compute expected measurements offline
+#     - virtee/sev (Rust crate): parse and verify attestation reports
+#     - Azure MAA (Microsoft Azure Attestation) service
+#     - Google Confidential Computing API
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM rust:1.83-bookworm AS builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/keygen/Cargo.toml crates/keygen/Cargo.toml
+COPY crates/node/Cargo.toml crates/node/Cargo.toml
+COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
+COPY crates/seal/Cargo.toml crates/seal/Cargo.toml
+COPY crates/monitor/Cargo.toml crates/monitor/Cargo.toml
+
+RUN mkdir -p crates/core/src crates/keygen/src crates/node/src crates/proxy/src && \
+    echo "// stub" > crates/core/src/lib.rs && \
+    echo "fn main() {}" > crates/keygen/src/main.rs && \
+    echo "fn main() {}" > crates/node/src/main.rs && \
+    echo "fn main() {}" > crates/proxy/src/main.rs && \
+    mkdir -p crates/seal/src && echo "" > crates/seal/src/lib.rs && \
+    mkdir -p crates/seal/src/bin && echo "fn main(){}" > crates/seal/src/bin/toprf-measure.rs && echo "fn main(){}" > crates/seal/src/bin/toprf-seal.rs && \
+    mkdir -p crates/monitor/src && echo "fn main(){}" > crates/monitor/src/main.rs
+
+RUN cargo build --release -p toprf-node 2>/dev/null || true
+
+COPY crates/ crates/
+
+RUN touch crates/core/src/lib.rs \
+    crates/node/src/main.rs \
+    crates/keygen/src/main.rs \
+    crates/proxy/src/main.rs
+
+RUN cargo build --release -p toprf-node
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime (standard Debian -- SEV-SNP is transparent to the guest)
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        # sevctl is useful for fetching attestation reports from the guest.
+        # Install from https://github.com/virtee/sevctl or cargo install sevctl
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd --gid 1001 toprf && \
+    useradd --uid 1001 --gid toprf --shell /bin/false --create-home toprf
+
+COPY --from=builder /build/target/release/toprf-node /usr/local/bin/toprf-node
+
+# Directory for TLS certificates
+RUN mkdir -p /etc/toprf/certs && chown -R toprf:toprf /etc/toprf
+
+USER toprf
+WORKDIR /home/toprf
+
+EXPOSE 3001
+
+LABEL org.opencontainers.image.title="toprf-node-sev" \
+      org.opencontainers.image.description="Threshold OPRF node for AMD SEV-SNP Confidential VMs" \
+      org.opencontainers.image.vendor="ruonid"
+
+ENTRYPOINT ["/usr/local/bin/toprf-node"]
