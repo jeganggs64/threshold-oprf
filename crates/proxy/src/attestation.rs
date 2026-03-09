@@ -407,10 +407,16 @@ fn verify_apple_cert_chain(x5c: &[Vec<u8>]) -> Result<(), String> {
 
 /// Verify the attestation nonce in the credential certificate's extension.
 /// OID 1.2.840.113635.100.8.2 contains the nonce.
+///
+/// The extension value is DER-encoded with the following ASN.1 structure:
+///   SEQUENCE { SET { SEQUENCE { INTEGER, OCTET STRING <nonce> } } }
+/// We parse the structure properly rather than relying on byte offsets.
 fn verify_attestation_nonce(
     cert: &x509_parser::certificate::X509Certificate,
     expected_nonce: &[u8],
 ) -> Result<(), String> {
+    use x509_parser::der_parser::parse_der;
+
     // Apple App Attest nonce OID: 1.2.840.113635.100.8.2
     let nonce_oid = x509_parser::oid_registry::Oid::from(&[1, 2, 840, 113635, 100, 8, 2])
         .expect("invalid OID");
@@ -422,18 +428,42 @@ fn verify_attestation_nonce(
 
     let ext_value = ext.value;
 
-    // The extension value contains an ASN.1 SEQUENCE with an OCTET STRING.
-    // The nonce is the last 32 bytes.
-    if ext_value.len() < 32 {
-        return Err("nonce extension too short".into());
-    }
-    let nonce_from_cert = &ext_value[ext_value.len() - 32..];
+    // Parse the DER-encoded extension value
+    let (_, parsed) = parse_der(ext_value)
+        .map_err(|e| format!("failed to parse nonce extension ASN.1: {e}"))?;
+
+    // Walk the ASN.1 structure to extract the OCTET STRING containing the nonce.
+    // Expected: SEQUENCE { SET/SEQUENCE { ... OCTET STRING } }
+    // We recursively descend into constructed types (SEQUENCE/SET/context-tagged)
+    // until we find the first OCTET STRING.
+    let nonce_from_cert = find_octet_string(&parsed)
+        .ok_or("nonce extension does not contain an OCTET STRING")?;
 
     if nonce_from_cert != expected_nonce {
         return Err("attestation nonce mismatch".into());
     }
 
     Ok(())
+}
+
+/// Recursively search a parsed DER object for the first OCTET STRING value.
+fn find_octet_string<'a>(obj: &'a x509_parser::der_parser::ber::BerObject<'a>) -> Option<&'a [u8]> {
+    use x509_parser::der_parser::ber::BerObjectContent;
+
+    match &obj.content {
+        BerObjectContent::OctetString(data) => Some(data),
+        BerObjectContent::Sequence(items) | BerObjectContent::Set(items) => {
+            for item in items {
+                if let Some(found) = find_octet_string(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        // Context-tagged (constructed) — e.g., [1] EXPLICIT wrapping
+        BerObjectContent::Tagged(_, _, inner) => find_octet_string(inner),
+        _ => None,
+    }
 }
 
 /// Extract the public key PEM from an X.509 certificate.

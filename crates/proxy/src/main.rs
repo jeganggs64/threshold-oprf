@@ -303,7 +303,10 @@ async fn attest(
         &state.config.apple_app_id,
         &mut key_store,
     )
-    .map_err(|e| (StatusCode::FORBIDDEN, format!("attestation failed: {e}")))?;
+    .map_err(|e| {
+        warn!(error = %e, "attestation failed during device registration");
+        (StatusCode::FORBIDDEN, "attestation failed".to_string())
+    })?;
 
     Ok(Json(AttestResponse { device_id }))
 }
@@ -343,7 +346,10 @@ async fn evaluate(
             &state.http_client,
         )
         .await
-        .map_err(|e| (StatusCode::FORBIDDEN, format!("attestation failed: {e}")))?
+        .map_err(|e| {
+            warn!(error = %e, "attestation failed during evaluation");
+            (StatusCode::FORBIDDEN, "attestation failed".to_string())
+        })?
     } else {
         "anonymous".to_string()
     };
@@ -365,7 +371,10 @@ async fn evaluate(
 
     // -- 3. Validate blinded point --
     let blinded_point = hex_to_point(&req.blinded_point)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid blinded_point: {e}")))?;
+        .map_err(|e| {
+            warn!(error = %e, "invalid blinded_point from client");
+            (StatusCode::BAD_REQUEST, "invalid blinded_point".to_string())
+        })?;
 
     let threshold = state.config.threshold as usize;
 
@@ -392,16 +401,23 @@ async fn evaluate(
                 Ok(r) if r.status().is_success() => {
                     match r.json::<PartialEvaluation>().await {
                         Ok(partial) => Ok((node_id, partial)),
-                        Err(e) => Err((node_id, format!("bad response: {e}"))),
+                        Err(e) => {
+                            eprintln!("node {node_id}: bad response: {e}");
+                            Err((node_id, "bad response from node".to_string()))
+                        }
                     }
                 }
                 Ok(r) => {
                     let status = r.status();
                     let body = r.bytes().await.unwrap_or_default();
                     let body = String::from_utf8_lossy(&body[..body.len().min(1024)]).to_string();
-                    Err((node_id, format!("HTTP {status}: {body}")))
+                    eprintln!("node {node_id}: HTTP {status}: {body}");
+                    Err((node_id, format!("node returned HTTP {status}")))
                 }
-                Err(e) => Err((node_id, format!("request failed: {e}"))),
+                Err(e) => {
+                    eprintln!("node {node_id}: request failed: {e}");
+                    Err((node_id, "request to node failed".to_string()))
+                }
             }
         });
     }

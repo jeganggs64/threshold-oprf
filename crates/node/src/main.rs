@@ -30,7 +30,7 @@
 
 use std::env;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
@@ -176,6 +176,35 @@ async fn eval(
 
 // -- Auto-unseal helpers --
 
+/// Returns `true` if the IP is loopback, private, link-local, or otherwise
+/// not a globally routable address. Used to block SSRF via DNS rebinding.
+fn is_non_global_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()          // 127.0.0.0/8
+            || v4.is_private()        // 10/8, 172.16/12, 192.168/16
+            || v4.is_link_local()     // 169.254/16
+            || v4.is_broadcast()      // 255.255.255.255
+            || v4.is_unspecified()    // 0.0.0.0
+            || v4.is_documentation()  // 192.0.2/24, 198.51.100/24, 203.0.113/24
+            // Shared address space (RFC 6598) — used by carrier-grade NAT
+            || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // 100.64/10
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()          // ::1
+            || v6.is_unspecified()    // ::
+            // IPv4-mapped (::ffff:0:0/96) — check the embedded v4
+            || match v6.to_ipv4_mapped() {
+                Some(v4) => is_non_global_ip(&IpAddr::V4(v4)),
+                None => false,
+            }
+            // Unique local (fc00::/7) and link-local (fe80::/10)
+            || (v6.segments()[0] & 0xfe00) == 0xfc00
+            || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 async fn fetch_sealed_blob(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if url.starts_with("file://") {
         tracing::warn!("using file:// URL for sealed blob — not recommended for production");
@@ -191,23 +220,31 @@ async fn fetch_sealed_blob(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
         return Err("SEALED_KEY_URL must use https:// (or file:// for local testing)".into());
     }
 
-    // Block private/loopback addresses to prevent SSRF
-    let blocked = [
-        "127.", "0.", "10.", "169.254.",
-        "172.16.", "172.17.", "172.18.", "172.19.",
-        "172.20.", "172.21.", "172.22.", "172.23.",
-        "172.24.", "172.25.", "172.26.", "172.27.",
-        "172.28.", "172.29.", "172.30.", "172.31.",
-        "192.168.", "localhost", "[::1]", "[::ffff:",
-    ];
-    let host = url.strip_prefix("https://").unwrap_or(url);
-    let host = host.split('/').next().unwrap_or("");
-    let host = host.split(':').next().unwrap_or("");
-    for b in &blocked {
-        if host.starts_with(b) || host == *b {
-            return Err(
-                format!("SEALED_KEY_URL must not target internal address: {host}").into(),
-            );
+    // Block private/loopback/link-local addresses to prevent SSRF.
+    // We resolve the hostname to IPs and reject any non-global address.
+    // This defeats DNS rebinding attacks where a hostname initially resolves
+    // to a public IP but later re-resolves to an internal one.
+    let authority = url.strip_prefix("https://").unwrap_or(url);
+    let authority = authority.split('/').next().unwrap_or("");
+    let host_for_resolve = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:443")
+    };
+    let addrs: Vec<SocketAddr> = host_for_resolve
+        .to_socket_addrs()
+        .map_err(|e| format!("failed to resolve SEALED_KEY_URL host: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err("SEALED_KEY_URL host resolved to no addresses".into());
+    }
+    for addr in &addrs {
+        if is_non_global_ip(&addr.ip()) {
+            return Err(format!(
+                "SEALED_KEY_URL resolved to non-public address {} — SSRF blocked",
+                addr.ip()
+            )
+            .into());
         }
     }
 
