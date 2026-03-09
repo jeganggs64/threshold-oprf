@@ -38,7 +38,7 @@ const AAD_SIZE: usize = 100;
 /// sealing_key = HKDF-SHA256(
 ///   ikm  = measurement (48 bytes) || policy (8 bytes LE),
 ///   salt = random 32-byte salt,
-///   info = "ki"
+///   info = "snp-seal-v1-aes256gcm-key"
 /// )
 /// ```
 pub fn derive_sealing_key(measurement: &[u8; 48], policy: u64, salt: &[u8; SALT_SIZE]) -> Zeroizing<[u8; 32]> {
@@ -48,7 +48,7 @@ pub fn derive_sealing_key(measurement: &[u8; 48], policy: u64, salt: &[u8; SALT_
 
     let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
     let mut key = [0u8; 32];
-    hk.expand(b"ki", &mut key)
+    hk.expand(b"snp-seal-v1-aes256gcm-key", &mut key)
         .expect("HKDF expand should not fail for 32-byte output");
     Zeroizing::new(key)
 }

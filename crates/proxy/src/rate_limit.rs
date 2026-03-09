@@ -20,6 +20,12 @@ use tracing::{debug, info, warn};
 const ONE_HOUR_MS: u64 = 3_600_000;
 const ONE_DAY_MS: u64 = 86_400_000;
 
+/// Maximum number of distinct device entries in the rate limiter.
+/// If the map exceeds this size after sweeping expired entries,
+/// new requests are rejected to prevent memory exhaustion from
+/// an attacker generating unlimited unique device IDs.
+const MAX_ENTRIES: usize = 2_000_000;
+
 // ---------------------------------------------------------------------------
 // Per-device state (internal)
 // ---------------------------------------------------------------------------
@@ -129,6 +135,21 @@ impl RateLimiter {
         per_day: u32,
     ) -> Result<(), &'static str> {
         let now_ms = Self::now_epoch_ms();
+
+        // If this is a new device (not already tracked), check the entry cap
+        // to prevent memory exhaustion from an attacker generating unlimited
+        // unique device IDs.
+        if !self.devices.contains_key(device_id) && self.devices.len() >= MAX_ENTRIES {
+            // Try to reclaim space by sweeping expired entries first.
+            self.sweep_expired();
+            if self.devices.len() >= MAX_ENTRIES {
+                warn!(
+                    entries = self.devices.len(),
+                    "rate_limit: entry cap reached, rejecting new device"
+                );
+                return Err("rate limit capacity exceeded — try again later");
+            }
+        }
 
         let state = self
             .devices

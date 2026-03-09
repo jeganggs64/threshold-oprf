@@ -167,7 +167,6 @@ async fn eval(
 
     info!(
         node_id = key.node_id,
-        partial_point = %partial.partial_point,
         "partial evaluation complete"
     );
 

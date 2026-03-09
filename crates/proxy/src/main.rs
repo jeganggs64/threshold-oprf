@@ -338,7 +338,6 @@ async fn attest(
 async fn evaluate(
     State(state): State<Arc<ProxyState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Json(req): Json<EvalRequest>,
 ) -> Result<Json<EvalResponse>, (StatusCode, String)> {
     // -- 1. Attestation + nonce validation --
@@ -376,15 +375,13 @@ async fn evaluate(
             (StatusCode::FORBIDDEN, "attestation failed".to_string())
         })?
     } else {
-        // When attestation is disabled, use client IP as rate-limit key
-        // instead of a fixed string (which would make the rate limiter trivially bypassable).
-        let client_ip = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| peer_addr.ip().to_string());
-        format!("anon:{client_ip}")
+        // When attestation is disabled, use the peer (TCP source) IP as the
+        // rate-limit key. X-Forwarded-For is not used because it is trivially
+        // spoofable by clients. The peer address comes from the kernel and is
+        // unforgeable. If the operator deploys behind a reverse proxy and needs
+        // the real client IP, they should configure the proxy to set a trusted
+        // header and add explicit trust logic here.
+        format!("anon:{}", peer_addr.ip())
     };
 
     // -- 2. Rate limiting --
@@ -791,6 +788,10 @@ async fn main() {
         }
         (None, None) => {
             // -- Plain HTTP mode --
+            // Note: `axum::serve` with a `TcpListener` automatically provides
+            // `ConnectInfo<SocketAddr>` to handlers, so we do not need to call
+            // `into_make_service_with_connect_info` here (unlike the TLS path
+            // which uses `axum_server`).
             info!(addr = %bind_addr, "starting toprf-proxy (plain HTTP)");
 
             let listener = TcpListener::bind(&bind_addr)

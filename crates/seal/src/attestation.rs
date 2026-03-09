@@ -5,6 +5,7 @@
 //! Distribution Service (KDS) and validating the full chain (VCEK -> ASK -> ARK).
 
 use p384::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
 use x509_parser::prelude::*;
 use x509_parser::time::ASN1Time;
 
@@ -20,8 +21,9 @@ impl AttestationVerifier {
     /// 2. Fetch VCEK certificate from AMD KDS
     /// 3. Fetch and verify the AMD certificate chain (ASK + ARK)
     /// 4. Verify VCEK is signed by ASK, ASK is signed by ARK, ARK is self-signed
-    /// 5. Parse VCEK cert, extract P-384 public key
-    /// 6. Verify ECDSA-P384-SHA384 signature over report body
+    /// 5. Verify ARK fingerprint against pinned value (if configured)
+    /// 6. Parse VCEK cert, extract P-384 public key
+    /// 7. Verify ECDSA-P384-SHA384 signature over report body
     pub async fn verify_report(report: &SnpReport) -> Result<(), SealError> {
         let vcek_der = Self::fetch_vcek_cert(report).await?;
         let product = Self::detect_product(report);
@@ -35,6 +37,11 @@ impl AttestationVerifier {
         Self::verify_cert_signature(&ask_der, &ark_der)?;
         // Verify VCEK is signed by ASK
         Self::verify_cert_signature(&vcek_der, &ask_der)?;
+
+        // Verify ARK fingerprint against pinned value (if configured via
+        // AMD_ARK_FINGERPRINT env var). The value must be the lowercase hex
+        // SHA-256 digest of the DER-encoded ARK certificate.
+        Self::verify_ark_fingerprint(&ark_der)?;
 
         let pubkey_bytes = Self::extract_vcek_pubkey(&vcek_der)?;
         Self::verify_signature(report, &pubkey_bytes)
@@ -57,6 +64,7 @@ impl AttestationVerifier {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SealError::NetworkError(format!("failed to build HTTP client: {e}")))?;
         let resp = client
@@ -92,6 +100,7 @@ impl AttestationVerifier {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SealError::NetworkError(e.to_string()))?;
         let resp = client.get(&url).send().await
@@ -203,6 +212,39 @@ impl AttestationVerifier {
 
         tracing::info!("SNP report signature verified successfully");
         Ok(())
+    }
+
+    /// Verify the ARK certificate fingerprint against the pinned value.
+    ///
+    /// If the `AMD_ARK_FINGERPRINT` environment variable is set, compute the
+    /// SHA-256 digest of the DER-encoded ARK certificate and compare it against
+    /// the expected value. If the variable is not set, log a warning and allow
+    /// (defense in depth — operators should always pin in production).
+    fn verify_ark_fingerprint(ark_der: &[u8]) -> Result<(), SealError> {
+        match std::env::var("AMD_ARK_FINGERPRINT") {
+            Ok(expected_hex) => {
+                let expected_hex = expected_hex.trim().to_lowercase();
+                let actual = Sha256::digest(ark_der);
+                let actual_hex = hex::encode(actual);
+
+                if actual_hex != expected_hex {
+                    return Err(SealError::AttestationFailed(format!(
+                        "AMD ARK fingerprint mismatch: expected {expected_hex}, got {actual_hex}"
+                    )));
+                }
+
+                tracing::info!("AMD ARK fingerprint verified: {actual_hex}");
+                Ok(())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "AMD_ARK_FINGERPRINT not set — ARK certificate is NOT pinned. \
+                     Set this env var to the SHA-256 hex digest of the ARK DER certificate \
+                     for your AMD product family to defend against MITM on the KDS connection."
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Detect the AMD product name from the report.
