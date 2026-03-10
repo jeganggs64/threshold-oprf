@@ -87,23 +87,24 @@ pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealErr
     use std::os::unix::io::AsRawFd;
 
     // SNP_GET_DERIVED_KEY = _IOWR('S', 0x1, struct snp_guest_request_ioctl)
-    // The ioctl number encodes the size of snp_guest_request_ioctl, which
-    // changed between kernel versions:
     //
-    // Kernel 6.7+: struct is __packed__, 33 bytes (added fw_err field)
-    //   _IOWR('S', 0x1, 33) = 0xC021_5301
-    //
-    // Kernel < 6.7: struct is __packed__, 25 bytes (no fw_err)
-    //   _IOWR('S', 0x1, 25) = 0xC019_5301
-    const SNP_GET_DERIVED_KEY_V2: libc::c_ulong = 0xC021_5301; // kernel 6.7+
-    const SNP_GET_DERIVED_KEY_V1: libc::c_ulong = 0xC019_5301; // kernel < 6.7
+    // struct snp_guest_request_ioctl (from kernel headers, naturally aligned):
+    //   u8  msg_version;   // offset 0 (+ 7 bytes padding)
+    //   u64 req_data;      // offset 8
+    //   u64 resp_data;     // offset 16
+    //   u64 exitinfo2;     // offset 24
+    //   Total: 32 bytes → _IOWR('S', 0x1, 32) = 0xC020_5301
+    const SNP_GET_DERIVED_KEY: libc::c_ulong = 0xC020_5301;
 
-    // Payload: request for a derived key
+    // Payload: request for a derived key (matches kernel's snp_derived_key_req)
     #[repr(C)]
     struct SnpDerivedKeyReq {
-        root_key_select: u32,
-        reserved: u32,
-        guest_field_select: u64,
+        root_key_select: u32, // 0 = VCEK, 1 = VMRK
+        rsvd: u32,
+        guest_field_select: u64, // bitmask of fields to mix in
+        vmpl: u32,
+        guest_svn: u32,
+        tcb_version: u64,
     }
 
     // Payload: response containing the derived key
@@ -112,20 +113,11 @@ pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealErr
         data: [u8; 64],
     }
 
-    // Kernel 6.7+: snp_guest_request_ioctl with fw_err (33 bytes packed)
-    #[repr(C, packed)]
-    struct SnpGuestRequestIoctlV2 {
+    // ioctl wrapper (naturally aligned, NOT packed)
+    #[repr(C)]
+    struct SnpGuestRequestIoctl {
         msg_version: u8,
-        req_data: u64,
-        resp_data: u64,
-        exitinfo2: u64,
-        fw_err: u64,
-    }
-
-    // Kernel < 6.7: snp_guest_request_ioctl without fw_err (25 bytes packed)
-    #[repr(C, packed)]
-    struct SnpGuestRequestIoctlV1 {
-        msg_version: u8,
+        _pad: [u8; 7],
         req_data: u64,
         resp_data: u64,
         exitinfo2: u64,
@@ -139,75 +131,44 @@ pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealErr
 
     let mut req = SnpDerivedKeyReq {
         root_key_select: 0, // VCEK — chip-unique root key
-        reserved: 0,
+        rsvd: 0,
         guest_field_select: field_select,
+        vmpl: 0,
+        guest_svn: 0,
+        tcb_version: 0,
     };
 
     let mut resp = SnpDerivedKeyResp { data: [0u8; 64] };
 
-    // Try kernel 6.7+ ioctl first (with fw_err field)
-    let mut ioctl_v2 = SnpGuestRequestIoctlV2 {
+    let mut ioctl_req = SnpGuestRequestIoctl {
         msg_version: 1,
+        _pad: [0u8; 7],
         req_data: &mut req as *mut SnpDerivedKeyReq as u64,
         resp_data: &mut resp as *mut SnpDerivedKeyResp as u64,
         exitinfo2: 0,
-        fw_err: 0,
     };
 
     let ret = unsafe {
         libc::ioctl(
             fd.as_raw_fd(),
-            SNP_GET_DERIVED_KEY_V2,
-            &mut ioctl_v2 as *mut SnpGuestRequestIoctlV2,
+            SNP_GET_DERIVED_KEY,
+            &mut ioctl_req as *mut SnpGuestRequestIoctl,
         )
     };
 
-    if ret == 0 {
-        let fw_err = ioctl_v2.fw_err;
-        if fw_err != 0 {
-            return Err(SealError::ProviderError(format!(
-                "SNP_GET_DERIVED_KEY firmware error: 0x{fw_err:X}"
-            )));
-        }
-    } else {
-        let errno_v2 = std::io::Error::last_os_error();
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        return Err(SealError::ProviderError(format!(
+            "SNP_GET_DERIVED_KEY ioctl failed: {errno}"
+        )));
+    }
 
-        // If ENOTTY (ioctl not recognized), try older kernel ABI
-        if errno_v2.raw_os_error() == Some(libc::ENOTTY) {
-            tracing::info!("SNP_GET_DERIVED_KEY v2 ioctl not supported, trying v1 (kernel < 6.7)");
-
-            // Reset payloads
-            req.root_key_select = 0;
-            req.reserved = 0;
-            req.guest_field_select = field_select;
-            resp.data = [0u8; 64];
-
-            let mut ioctl_v1 = SnpGuestRequestIoctlV1 {
-                msg_version: 1,
-                req_data: &mut req as *mut SnpDerivedKeyReq as u64,
-                resp_data: &mut resp as *mut SnpDerivedKeyResp as u64,
-                exitinfo2: 0,
-            };
-
-            let ret = unsafe {
-                libc::ioctl(
-                    fd.as_raw_fd(),
-                    SNP_GET_DERIVED_KEY_V1,
-                    &mut ioctl_v1 as *mut SnpGuestRequestIoctlV1,
-                )
-            };
-
-            if ret != 0 {
-                let errno_v1 = std::io::Error::last_os_error();
-                return Err(SealError::ProviderError(format!(
-                    "SNP_GET_DERIVED_KEY ioctl failed (tried v2: {errno_v2}, v1: {errno_v1})"
-                )));
-            }
-        } else {
-            return Err(SealError::ProviderError(format!(
-                "SNP_GET_DERIVED_KEY ioctl failed: {errno_v2}"
-            )));
-        }
+    // Check firmware error (lower 32 bits of exitinfo2)
+    let fw_err = ioctl_req.exitinfo2 & 0xFFFF_FFFF;
+    if fw_err != 0 {
+        return Err(SealError::ProviderError(format!(
+            "SNP_GET_DERIVED_KEY firmware error: 0x{fw_err:X}"
+        )));
     }
 
     // Extract the first 32 bytes as the AES-256 key
@@ -343,10 +304,8 @@ fn get_report_dev_sev_guest_ioctl(report_data: Option<&[u8; 64]>) -> Result<SnpR
     use std::os::unix::io::AsRawFd;
 
     // SNP_GET_REPORT = _IOWR('S', 0x0, struct snp_guest_request_ioctl)
-    // Kernel 6.7+: size 33 (packed, with fw_err)
-    // Kernel < 6.7: size 25 (packed, no fw_err)
-    const SNP_GET_REPORT_V2: libc::c_ulong = 0xC021_5300; // kernel 6.7+
-    const SNP_GET_REPORT_V1: libc::c_ulong = 0xC019_5300; // kernel < 6.7
+    // struct is naturally aligned, 32 bytes → _IOWR('S', 0x0, 32) = 0xC020_5300
+    const SNP_GET_REPORT: libc::c_ulong = 0xC020_5300;
 
     #[repr(C)]
     struct SnpReportReq {
@@ -357,26 +316,14 @@ fn get_report_dev_sev_guest_ioctl(report_data: Option<&[u8; 64]>) -> Result<SnpR
 
     #[repr(C)]
     struct SnpReportResp {
-        status: u32,
-        report_size: u32,
-        rsvd: [u8; 24],
-        report: [u8; 4000],
+        data: [u8; 4000],
     }
 
-    // Kernel 6.7+: packed with fw_err (33 bytes)
-    #[repr(C, packed)]
-    struct SnpGuestRequestIoctlV2 {
+    // Naturally aligned ioctl wrapper (32 bytes)
+    #[repr(C)]
+    struct SnpGuestRequestIoctl {
         msg_version: u8,
-        req_data: u64,
-        resp_data: u64,
-        exitinfo2: u64,
-        fw_err: u64,
-    }
-
-    // Kernel < 6.7: packed without fw_err (25 bytes)
-    #[repr(C, packed)]
-    struct SnpGuestRequestIoctlV1 {
-        msg_version: u8,
+        _pad: [u8; 7],
         req_data: u64,
         resp_data: u64,
         exitinfo2: u64,
@@ -397,77 +344,39 @@ fn get_report_dev_sev_guest_ioctl(report_data: Option<&[u8; 64]>) -> Result<SnpR
         req.user_data = *data;
     }
 
-    let mut resp = SnpReportResp {
-        status: 0,
-        report_size: 0,
-        rsvd: [0u8; 24],
-        report: [0u8; 4000],
-    };
+    let mut resp = SnpReportResp { data: [0u8; 4000] };
 
-    // Try v2 ioctl first (kernel 6.7+)
-    let mut ioctl_v2 = SnpGuestRequestIoctlV2 {
+    let mut ioctl_req = SnpGuestRequestIoctl {
         msg_version: 1,
+        _pad: [0u8; 7],
         req_data: &req as *const SnpReportReq as u64,
         resp_data: &mut resp as *mut SnpReportResp as u64,
         exitinfo2: 0,
-        fw_err: 0,
     };
 
     let ret = unsafe {
         libc::ioctl(
             fd.as_raw_fd(),
-            SNP_GET_REPORT_V2,
-            &mut ioctl_v2 as *mut SnpGuestRequestIoctlV2,
+            SNP_GET_REPORT,
+            &mut ioctl_req as *mut SnpGuestRequestIoctl,
         )
     };
 
     if ret != 0 {
-        let errno_v2 = std::io::Error::last_os_error();
-        if errno_v2.raw_os_error() == Some(libc::ENOTTY) {
-            // Try v1 ioctl (kernel < 6.7)
-            let mut ioctl_v1 = SnpGuestRequestIoctlV1 {
-                msg_version: 1,
-                req_data: &req as *const SnpReportReq as u64,
-                resp_data: &mut resp as *mut SnpReportResp as u64,
-                exitinfo2: 0,
-            };
-
-            let ret = unsafe {
-                libc::ioctl(
-                    fd.as_raw_fd(),
-                    SNP_GET_REPORT_V1,
-                    &mut ioctl_v1 as *mut SnpGuestRequestIoctlV1,
-                )
-            };
-
-            if ret != 0 {
-                let errno_v1 = std::io::Error::last_os_error();
-                return Err(SealError::ProviderError(format!(
-                    "SNP_GET_REPORT ioctl failed (tried v2: {errno_v2}, v1: {errno_v1})"
-                )));
-            }
-        } else {
-            return Err(SealError::ProviderError(format!(
-                "SNP_GET_REPORT ioctl failed: {errno_v2}"
-            )));
-        }
-    }
-
-    if resp.status != 0 {
+        let errno = std::io::Error::last_os_error();
         return Err(SealError::ProviderError(format!(
-            "SNP_GET_REPORT returned error status: {}",
-            resp.status
+            "SNP_GET_REPORT ioctl failed: {errno}"
         )));
     }
 
-    let report_size = resp.report_size as usize;
-    if report_size < REPORT_TOTAL_SIZE {
+    if resp.data.len() < REPORT_TOTAL_SIZE {
         return Err(SealError::ProviderError(format!(
-            "SNP report too small: {report_size} bytes (expected >= {REPORT_TOTAL_SIZE})"
+            "SNP report too small: {} bytes (expected >= {REPORT_TOTAL_SIZE})",
+            resp.data.len()
         )));
     }
 
-    SnpReport::from_bytes(&resp.report[..REPORT_TOTAL_SIZE])
+    SnpReport::from_bytes(&resp.data[..REPORT_TOTAL_SIZE])
 }
 
 #[cfg(test)]
