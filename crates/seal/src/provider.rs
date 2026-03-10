@@ -337,6 +337,7 @@ async fn get_report_gcp_metadata(report_data: Option<&[u8; 64]>) -> Result<SnpRe
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "linux"))]
     use super::*;
 
     #[cfg(not(target_os = "linux"))]
