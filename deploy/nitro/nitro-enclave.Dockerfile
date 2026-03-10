@@ -1,7 +1,7 @@
 # =============================================================================
 # Stage 1: Build the toprf-node binary (same as standard Dockerfile)
 # =============================================================================
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 

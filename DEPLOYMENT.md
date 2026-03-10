@@ -6,7 +6,7 @@ Production deployment of the threshold OPRF system: Express API server + Rust th
 
 ```
 Mobile App
-    |  HTTPS (api.ruonlabs.com)
+    |  HTTPS (<your-domain>)
     v
   Cloud Load Balancer (any provider)
     |
@@ -86,10 +86,12 @@ All three providers offer managed AMD SEV-SNP confidential VMs — no bare metal
 ### Node 1: GCP Singapore
 
 ```bash
+# SEV-SNP VMs can't live migrate, so maintenance-policy must be TERMINATE
 gcloud compute instances create toprf-node-1 \
   --zone=asia-southeast1-b \
   --machine-type=n2d-standard-2 \
   --confidential-compute-type=SEV_SNP \
+  --maintenance-policy=TERMINATE \
   --image-family=ubuntu-2404-lts-amd64 \
   --image-project=ubuntu-os-cloud
 ```
@@ -99,14 +101,17 @@ Attestation: GCP metadata API (`SNP_PROVIDER=gcp`) or `/dev/sev-guest` (`SNP_PRO
 ### Node 2: Azure US East
 
 ```bash
+# Create resource group first: az group create --name <azure-rg> --location eastus
+# Confidential VMs require vTPM enabled
 az vm create \
-  --resource-group ruonid-rg \
+  --resource-group <azure-rg> \
   --name toprf-node-2 \
   --location eastus \
   --size Standard_DC2as_v5 \
   --image Canonical:ubuntu-24_04-lts:cvm:latest \
   --security-type ConfidentialVM \
   --os-disk-security-encryption-type VMGuestStateOnly \
+  --enable-vtpm true \
   --admin-username azureuser \
   --generate-ssh-keys
 ```
@@ -116,13 +121,19 @@ Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). Azure also provides Microsof
 ### Node 3: AWS EU Ireland
 
 ```bash
-aws ec2 run-instances \
-  --region eu-west-1 \
-  --instance-type c6a.large \
-  --image-id ami-xxxxxxxxx \
-  --cpu-options AmdSevSnp=enabled \
-  --key-name ruonid-node3 \
-  --security-group-ids sg-xxxxxxxxx
+# Find the latest Ubuntu 24.04 AMI
+AMI_ID=$(aws ec2 describe-images --region eu-west-1 --owners 099720109477 --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' --output text)
+
+# Create SSH key pair (if needed)
+aws ec2 create-key-pair --key-name <aws-key-name> --region eu-west-1 --query 'KeyMaterial' --output text > <aws-key-name>.pem
+chmod 400 <aws-key-name>.pem
+
+# Create security group (allow SSH only for now; port 3001 is opened in Step 8)
+SG_ID=$(aws ec2 create-security-group --group-name toprf-node3 --description "TOPRF Node 3" --region eu-west-1 --query 'GroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr "$(curl -s4 ifconfig.me)/32" --region eu-west-1
+
+# Launch the instance
+aws ec2 run-instances --region eu-west-1 --instance-type c6a.large --image-id "$AMI_ID" --cpu-options AmdSevSnp=enabled --key-name <aws-key-name> --security-group-ids "$SG_ID"
 ```
 
 Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). AWS signs reports with VLEK (Versioned Loaded Endorsement Key) rather than VCEK.
@@ -131,15 +142,66 @@ Attestation: `/dev/sev-guest` (`SNP_PROVIDER=raw`). AWS signs reports with VLEK 
 
 ---
 
-## Step 3: Build and deploy the node binary
+## Step 3: Build and push Docker images
+
+All images must be built for `linux/amd64` since the TEE VMs are x86_64. If building on Apple Silicon, always pass `--platform linux/amd64`.
+
+### Build from the threshold-oprf repo
 
 ```bash
-cargo build --release -p toprf-node
-# Or build a Docker image:
-docker build -f deploy/sev/Dockerfile.sev -t toprf-node:latest .
+cd threshold-oprf
+
+# Node image
+docker buildx build --platform linux/amd64 -f deploy/sev/Dockerfile.sev -t toprf-node:latest --load .
+
+# Proxy image
+docker buildx build --platform linux/amd64 -f deploy/Dockerfile.proxy -t toprf-proxy:latest --load .
 ```
 
-Deploy the `toprf-node` binary to each VM.
+### Push to ECR
+
+```bash
+aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com
+
+docker tag toprf-node:latest <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest
+docker push <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest
+
+docker tag toprf-proxy:latest <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-proxy:latest
+docker push <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-proxy:latest
+```
+
+### Install Docker + pull image on each VM
+
+SSH into each VM and run:
+
+```bash
+# GCP:   gcloud compute ssh toprf-node-1 --zone=asia-southeast1-b
+# Azure: ssh azureuser@<azure-node-ip>
+# AWS:   ssh -i <aws-key-name>.pem ubuntu@<aws-node-ip>
+
+# Install Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Install AWS CLI (needed for ECR login)
+sudo apt update && sudo apt install -y unzip curl
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+rm -rf awscliv2.zip aws/
+
+# Configure AWS credentials
+aws configure
+# Access Key ID: <your-key>
+# Secret Access Key: <your-secret>
+# Region: eu-west-2
+# Output format: (press Enter for default)
+
+# Login to ECR and pull the node image
+aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com
+docker pull <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest
+```
 
 ### What changes the measurement
 
@@ -196,11 +258,9 @@ Create a storage bucket on each provider for that node's sealed blob. Grant the 
 #### GCP Cloud Storage (Node 1)
 
 ```bash
-# Create bucket
-gcloud storage buckets create gs://ruonid-sealed-node1 --location=asia-southeast1
+gcloud storage buckets create gs://<gcp-sealed-bucket> --location=asia-southeast1
 
-# Grant the VM's service account access
-gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-node1 \
+gcloud storage buckets add-iam-policy-binding gs://<gcp-sealed-bucket> \
   --member="serviceAccount:$(gcloud compute instances describe toprf-node-1 \
     --zone=asia-southeast1-b --format='get(serviceAccounts[0].email)')" \
   --role="roles/storage.objectAdmin"
@@ -209,69 +269,54 @@ gcloud storage buckets add-iam-policy-binding gs://ruonid-sealed-node1 \
 #### Azure Blob Storage (Node 2)
 
 ```bash
-# Create storage account + container
-az storage account create \
-  --name ruonidsealednode2 \
-  --resource-group ruonid-rg \
-  --location eastus \
-  --sku Standard_LRS
+# Enable managed identity on the VM
+az vm identity assign --resource-group <azure-rg> --name toprf-node-2
 
-az storage container create \
-  --name sealed-blobs \
-  --account-name ruonidsealednode2 \
-  --public-access off
+# Create storage account + container (do this in the Azure portal if CLI auth fails)
+az storage account create --name <azure-storage-account> --resource-group <azure-rg> --location eastus --sku Standard_LRS
+az storage container create --name sealed-blobs --account-name <azure-storage-account> --public-access off
 
-# Assign the VM's managed identity read/write access
-VM_IDENTITY=$(az vm show --resource-group ruonid-rg --name toprf-node-2 \
-  --query identity.principalId -o tsv)
-
-az role assignment create \
-  --assignee "$VM_IDENTITY" \
-  --role "Storage Blob Data Contributor" \
-  --scope "/subscriptions/<sub-id>/resourceGroups/ruonid-rg/providers/Microsoft.Storage/storageAccounts/ruonidsealednode2"
-```
-
-**Note:** Enable a system-assigned managed identity on the VM if not already enabled:
-```bash
-az vm identity assign --resource-group ruonid-rg --name toprf-node-2
+# Grant the VM's managed identity access
+VM_IDENTITY=$(az vm show --resource-group <azure-rg> --name toprf-node-2 --query identity.principalId -o tsv)
+az role assignment create --assignee "$VM_IDENTITY" --role "Storage Blob Data Contributor" --scope "/subscriptions/<azure-subscription-id>/resourceGroups/<azure-rg>/providers/Microsoft.Storage/storageAccounts/<azure-storage-account>"
 ```
 
 #### AWS S3 (Node 3)
 
 ```bash
-# Create bucket
-aws s3 mb s3://ruonid-sealed-node3 --region eu-west-1
+aws s3 mb s3://<aws-sealed-bucket> --region eu-west-1
 
-# Create an IAM policy for the bucket
-aws iam create-policy --policy-name toprf-node3-sealed-blob --policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject"],
-    "Resource": "arn:aws:s3:::ruonid-sealed-node3/node-3-sealed.bin"
-  }]
-}'
+aws iam create-policy --policy-name toprf-node3-sealed-blob --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::<aws-sealed-bucket>/node-3-sealed.bin"}]}'
 
-# Attach to the instance's IAM role
-aws iam attach-role-policy \
-  --role-name toprf-node3-role \
-  --policy-arn arn:aws:iam::<account-id>:policy/toprf-node3-sealed-blob
+aws iam create-role --role-name toprf-node3-role --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+aws iam attach-role-policy --role-name toprf-node3-role --policy-arn arn:aws:iam::<aws-account-id>:policy/toprf-node3-sealed-blob
+
+aws iam create-instance-profile --instance-profile-name toprf-node3-profile
+aws iam add-role-to-instance-profile --instance-profile-name toprf-node3-profile --role-name toprf-node3-role
+
+# Find the instance ID
+aws ec2 describe-instances --region eu-west-1 --filters "Name=instance-state-name,Values=running,pending" --query 'Reservations[*].Instances[*].[InstanceId,InstanceType]' --output text
+
+# Associate the profile (replace with your instance ID)
+aws ec2 associate-iam-instance-profile --instance-id <node3-instance-id> --iam-instance-profile Name=toprf-node3-profile --region eu-west-1
 ```
-
-**Note:** Create an IAM role and attach it to the EC2 instance as an instance profile if not already done.
 
 ### Run init-seal on each node
 
-SSH into each TEE VM and run:
+SSH into each TEE VM and run the Docker container in init-seal mode. The `--device` flag passes through the SEV-SNP attestation device so the container can access the AMD Secure Processor.
 
 #### Node 1 (GCP Singapore)
 
 ```bash
-SNP_PROVIDER=gcp \
-EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
-toprf-node \
+docker run --rm -it \
+  -e SNP_PROVIDER=gcp \
+  -e EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
   --init-seal \
-  --upload-url "gs://ruonid-sealed-node1/node-1-sealed.bin" \
+  --upload-url "gs://<gcp-sealed-bucket>/node-1-sealed.bin" \
   --port 3001
 ```
 
@@ -301,33 +346,37 @@ The node will:
 - Zeroize the plaintext key share from memory
 - Exit
 
-Repeat for nodes 2 and 3 with their respective share files and upload URLs.
-
 #### Node 2 (Azure US East)
 
 ```bash
-SNP_PROVIDER=raw \
-EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
-toprf-node \
+docker run --rm -it \
+  -e SNP_PROVIDER=raw \
+  -e EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
   --init-seal \
-  --upload-url "https://ruonidsealednode2.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
+  --upload-url "https://<azure-storage-account>.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
   --port 3001
 ```
 
-The node uses the VM's managed identity to authenticate the upload — no credentials needed.
+Then from your local machine, verify attestation and send `node-2-share.json` as above.
 
 #### Node 3 (AWS EU Ireland)
 
 ```bash
-SNP_PROVIDER=raw \
-EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
-toprf-node \
+docker run --rm -it \
+  -e SNP_PROVIDER=raw \
+  -e EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
   --init-seal \
-  --upload-url "s3://ruonid-sealed-node3/node-3-sealed.bin" \
+  --upload-url "s3://<aws-sealed-bucket>/node-3-sealed.bin" \
   --port 3001
 ```
 
-The node uses the instance profile's IAM role to authenticate — no credentials needed.
+Then from your local machine, verify attestation and send `node-3-share.json` as above.
 
 ### Security properties of init-seal
 
@@ -339,73 +388,9 @@ The node uses the instance profile's IAM role to authenticate — no credentials
 
 ---
 
-## Step 5: Start nodes in normal mode
+## Step 5: Generate mTLS certificates
 
-After init-seal completes, restart each node in normal mode. The node fetches its sealed blob, calls MSG_KEY_REQ to derive the same chip-specific key, and unseals.
-
-Each node uses its native cloud identity to fetch the sealed blob — no expiring URLs or credentials to manage.
-
-### Node 1 (GCP Singapore)
-
-```bash
-SEALED_KEY_URL="gs://ruonid-sealed-node1/node-1-sealed.bin" \
-EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
-SNP_PROVIDER=gcp \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node1.pem \
-  --tls-key /etc/toprf/certs/node1.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
-On boot, the node:
-1. Fetches the sealed blob from the cross-provider URL
-2. Calls `MSG_KEY_REQ(MEASUREMENT | TCB_VERSION)` — same chip + same software → same key K
-3. Decrypts the key share with K
-4. Verifies `k_i * G == expected_verification_share`
-5. Starts serving `/health`, `/info`, `/partial-evaluate`
-
-### Node 2 (Azure US East)
-
-```bash
-SEALED_KEY_URL="https://ruonidsealednode2.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
-EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
-SNP_PROVIDER=raw \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node2.pem \
-  --tls-key /etc/toprf/certs/node2.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
-The node uses the VM's managed identity to authenticate the download.
-
-### Node 3 (AWS EU Ireland)
-
-```bash
-SEALED_KEY_URL="s3://ruonid-sealed-node3/node-3-sealed.bin" \
-EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
-SNP_PROVIDER=raw \
-toprf-node \
-  --port 3001 \
-  --tls-cert /etc/toprf/certs/node3.pem \
-  --tls-key /etc/toprf/certs/node3.key \
-  --client-ca /etc/toprf/certs/ca.pem
-```
-
-The node uses the instance profile's IAM role to authenticate the download.
-
-### Backwards compatibility
-
-The node auto-detects the sealed blob format:
-- **v2 blobs** (from `--init-seal`): Uses `MSG_KEY_REQ` — chip-specific, strongest security
-- **v1 blobs** (from `toprf-seal` CLI): Uses HKDF from measurement — not chip-specific, but works across hardware
-
----
-
-## Step 6: Generate mTLS certificates
-
-Generate a private CA and certificates for mutual TLS between the proxy and nodes.
+Generate a private CA and certificates for mutual TLS between the proxy and nodes. Do this **before** starting nodes in normal mode.
 
 ```bash
 cd threshold-oprf
@@ -416,22 +401,108 @@ This creates:
 
 ```
 certs/
-  ca/ca.pem, ca.key           # Private CA
-  nodes/node{1,2,3}.pem/key   # Node server certs (TLS)
-  proxy/proxy-client.pem/key   # Proxy client cert (mTLS)
+  ca/ca.pem, ca.key                      # Private CA
+  nodes/node1.pem, node1.key             # Node 1 server cert
+  nodes/node2.pem, node2.key             # Node 2 server cert
+  nodes/node3.pem, node3.key             # Node 3 server cert
+  proxy/proxy-client.pem, proxy-client.key  # Proxy client cert (mTLS)
 ```
 
-Distribute:
-- `ca.pem` + `proxy-client.pem` + `proxy-client.key` → proxy host
-- `ca.pem` + `node1.pem` + `node1.key` → GCP node
-- `ca.pem` + `node2.pem` + `node2.key` → Azure node
-- `ca.pem` + `node3.pem` + `node3.key` → AWS node
+Copy certs to each VM (create `/etc/toprf/certs/` first):
+
+```bash
+# On each VM:
+sudo mkdir -p /etc/toprf/certs
+
+# From your local machine — copy the relevant certs to each node:
+# Node 1 (GCP):
+gcloud compute scp certs/ca/ca.pem certs/nodes/node1.pem certs/nodes/node1.key toprf-node-1:/tmp/ --zone=asia-southeast1-b
+# Then on the VM: sudo mv /tmp/{ca.pem,node1.pem,node1.key} /etc/toprf/certs/
+
+# Node 2 (Azure):
+scp certs/ca/ca.pem certs/nodes/node2.pem certs/nodes/node2.key azureuser@<azure-ip>:/tmp/
+# Then on the VM: sudo mv /tmp/{ca.pem,node2.pem,node2.key} /etc/toprf/certs/
+
+# Node 3 (AWS):
+scp -i <aws-key-name>.pem certs/ca/ca.pem certs/nodes/node3.pem certs/nodes/node3.key ubuntu@<aws-ip>:/tmp/
+# Then on the VM: sudo mv /tmp/{ca.pem,node3.pem,node3.key} /etc/toprf/certs/
+```
+
+---
+
+## Step 6: Start nodes in normal mode
+
+After init-seal completes, restart each node in normal mode. The node fetches its sealed blob, calls MSG_KEY_REQ to derive the same chip-specific key, and unseals.
+
+### Node 1 (GCP Singapore)
+
+```bash
+docker run -d --name toprf-node --restart=unless-stopped \
+  -e SEALED_KEY_URL="gs://<gcp-sealed-bucket>/node-1-sealed.bin" \
+  -e EXPECTED_VERIFICATION_SHARE=<node-1-verification-share> \
+  -e SNP_PROVIDER=gcp \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -v /etc/toprf/certs:/etc/toprf/certs:ro \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node1.pem \
+  --tls-key /etc/toprf/certs/node1.key \
+  --client-ca /etc/toprf/certs/ca.pem
+```
+
+On boot, the node:
+1. Fetches the sealed blob from the cloud storage URL
+2. Calls `MSG_KEY_REQ(MEASUREMENT | TCB_VERSION)` — same chip + same software → same key K
+3. Decrypts the key share with K
+4. Verifies `k_i * G == expected_verification_share`
+5. Starts serving `/health`, `/info`, `/partial-evaluate`
+
+### Node 2 (Azure US East)
+
+```bash
+docker run -d --name toprf-node --restart=unless-stopped \
+  -e SEALED_KEY_URL="https://<azure-storage-account>.blob.core.windows.net/sealed-blobs/node-2-sealed.bin" \
+  -e EXPECTED_VERIFICATION_SHARE=<node-2-verification-share> \
+  -e SNP_PROVIDER=raw \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -v /etc/toprf/certs:/etc/toprf/certs:ro \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node2.pem \
+  --tls-key /etc/toprf/certs/node2.key \
+  --client-ca /etc/toprf/certs/ca.pem
+```
+
+### Node 3 (AWS EU Ireland)
+
+```bash
+docker run -d --name toprf-node --restart=unless-stopped \
+  -e SEALED_KEY_URL="s3://<aws-sealed-bucket>/node-3-sealed.bin" \
+  -e EXPECTED_VERIFICATION_SHARE=<node-3-verification-share> \
+  -e SNP_PROVIDER=raw \
+  --device /dev/sev-guest:/dev/sev-guest \
+  -v /etc/toprf/certs:/etc/toprf/certs:ro \
+  -p 3001:3001 \
+  <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
+  --port 3001 \
+  --tls-cert /etc/toprf/certs/node3.pem \
+  --tls-key /etc/toprf/certs/node3.key \
+  --client-ca /etc/toprf/certs/ca.pem
+```
+
+### Backwards compatibility
+
+The node auto-detects the sealed blob format:
+- **v2 blobs** (from `--init-seal`): Uses `MSG_KEY_REQ` — chip-specific, strongest security
+- **v1 blobs** (from `toprf-seal` CLI): Uses HKDF from measurement — not chip-specific, but works across hardware
 
 ---
 
 ## Step 7: Configure the proxy
 
-Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config.json`:
+Edit `deploy/proxy-config.json` using values from `ceremony/public-config.json`:
 
 ```json
 {
@@ -439,9 +510,9 @@ Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config
   "threshold": 2,
   "require_attestation": false,
   "rate_limit": { "per_hour": 1000, "per_day": 10000 },
-  "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
-  "proxy_client_cert": "/etc/toprf/certs/proxy/proxy-client.pem",
-  "proxy_client_key": "/etc/toprf/certs/proxy/proxy-client.key",
+  "node_ca_cert": "/etc/toprf/certs/ca.pem",
+  "proxy_client_cert": "/etc/toprf/certs/proxy-client.pem",
+  "proxy_client_key": "/etc/toprf/certs/proxy-client.key",
   "nodes": [
     {
       "node_id": 1,
@@ -468,15 +539,44 @@ Edit `ruonid/deploy/proxy-config.json` using values from `ceremony/public-config
 
 ## Step 8: Deploy the API + proxy
 
-The Express API and Rust proxy run together. Build and deploy:
+The Express API and Rust proxy run together on the same host.
+
+### Open port 3001 on each node's firewall
+
+Now that you know the proxy host's public IP, allow it to reach the nodes:
 
 ```bash
-# Build proxy image (from threshold-oprf repo)
-cd threshold-oprf
-docker build -f deploy/Dockerfile.proxy -t toprf-proxy:latest .
+# GCP Node 1
+gcloud compute firewall-rules create allow-toprf-proxy \
+  --allow=tcp:3001 \
+  --source-ranges=<proxy-ip>/32 \
+  --target-tags=toprf-node
 
-# Deploy both services
-cd ruonid
+# Azure Node 2
+az network nsg rule create --resource-group <azure-rg> --nsg-name toprf-node-2NSG \
+  --name allow-toprf-proxy --priority 100 --access Allow \
+  --protocol Tcp --destination-port-ranges 3001 --source-address-prefixes <proxy-ip>/32
+
+# AWS Node 3
+aws ec2 authorize-security-group-ingress --group-id <node3-sg-id> --protocol tcp --port 3001 --cidr <proxy-ip>/32 --region eu-west-1
+```
+
+### Copy proxy certs to the API host
+
+```bash
+sudo mkdir -p /etc/toprf/certs
+# Copy ca.pem, proxy-client.pem, proxy-client.key to /etc/toprf/certs/
+```
+
+### Build and deploy
+
+```bash
+cd threshold-oprf
+
+# Set environment variables
+cp deploy/.env deploy/.env.local  # edit with real values
+
+# Start both services
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
@@ -490,18 +590,18 @@ This starts:
 
 ```bash
 # Express health
-curl https://api.ruonlabs.com/health
+curl https://<your-domain>/health
 
 # OPRF challenge (nonce issuance)
-curl https://api.ruonlabs.com/oprf/challenge
+curl https://<your-domain>/oprf/challenge
 
 # Rust proxy health (from the API host only, not externally)
 curl http://localhost:3000/health
 
 # Individual node health (from the API host, via mTLS)
-curl --cacert certs/ca/ca.pem \
-     --cert certs/proxy/proxy-client.pem \
-     --key certs/proxy/proxy-client.key \
+curl --cacert /etc/toprf/certs/ca.pem \
+     --cert /etc/toprf/certs/proxy-client.pem \
+     --key /etc/toprf/certs/proxy-client.key \
      https://<node-ip>:3001/health
 ```
 
@@ -535,9 +635,12 @@ With MSG_KEY_REQ sealing (v2), the sealed blob is bound to the specific physical
 
 2. **Re-run init-seal** — the node will generate a new sealed blob bound to the new chip + measurement:
    ```bash
-   SNP_PROVIDER=raw \
-   EXPECTED_VERIFICATION_SHARE=<node-N-verification-share> \
-   toprf-node \
+   docker run --rm -it \
+     -e SNP_PROVIDER=raw \
+     -e EXPECTED_VERIFICATION_SHARE=<node-N-verification-share> \
+     --device /dev/sev-guest:/dev/sev-guest \
+     -p 3001:3001 \
+     <aws-account-id>.dkr.ecr.eu-west-2.amazonaws.com/<ecr-repo-prefix>/toprf-node:latest \
      --init-seal \
      --upload-url "<same storage URL as initial deployment>" \
      --port 3001
