@@ -36,7 +36,9 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes via mTLS
 
 Utilities:
+  auto-config   Auto-populate config.env (IPs, account ID, SG, proxy IP)
   show-ips      Fetch public IPs from all 3 providers
+
 Shortcuts:
   pre-seal      setup-vms → build → storage → certs
   post-seal     start → firewall → proxy-config → verify
@@ -118,12 +120,12 @@ scp_to_node() {
     esac
 }
 
-# Load ceremony data from public-config.json
+# Load node shares data from public-config.json
 _ceremony_loaded=false
 load_ceremony() {
     if $_ceremony_loaded; then return; fi
-    local config="${CEREMONY_DIR}/public-config.json"
-    [[ -f "$config" ]] || die "$config not found. Run toprf-keygen init first."
+    local config="${NODE_SHARES_DIR}/public-config.json"
+    [[ -f "$config" ]] || die "$config not found. Run toprf-keygen node-shares first."
     GROUP_PUBLIC_KEY=$(jq -r '.group_public_key' "$config")
     THRESHOLD=$(jq -r '.threshold' "$config")
     VS_1=$(jq -r '.verification_shares[] | select(.node_id == 1) | .verification_share' "$config")
@@ -419,7 +421,7 @@ step_init_seal() {
         provider=$(node_snp_provider "$i")
         vs=$(node_vs "$i")
         url=$(sealed_url "$i")
-        share="${CEREMONY_DIR}/node-shares/node-${i}-share.json"
+        share="${NODE_SHARES_DIR}/node-${i}-share.json"
 
         [[ -f "$share" ]] || die "Key share not found: $share"
 
@@ -658,6 +660,97 @@ step_show_ips() {
     echo "    NODE3_IP=${ip3:-}"
 }
 
+# ─── 13. Auto-config ────────────────────────────────────────────────────────
+
+# Helper: update or append a key=value in config.env
+_set_config() {
+    local key="$1" value="$2"
+    if grep -q "^${key}=" "$CONFIG_FILE"; then
+        # Only update if currently empty
+        if grep -q "^${key}=$" "$CONFIG_FILE" || grep -q "^${key}=\s*$" "$CONFIG_FILE"; then
+            sed -i.bak "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+            echo "  ${key}=${value}"
+        else
+            echo "  ${key} already set, skipping"
+        fi
+    fi
+}
+
+step_auto_config() {
+    echo ""
+    info "Auto-populating config.env with values from cloud providers"
+    echo ""
+
+    # AWS Account ID
+    echo "  Fetching AWS account ID..."
+    local aws_id
+    aws_id=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || true
+    if [[ -n "$aws_id" ]]; then
+        _set_config "AWS_ACCOUNT_ID" "$aws_id"
+    else
+        warn "Could not fetch AWS account ID (aws sts get-caller-identity failed)"
+    fi
+
+    # Node IPs
+    echo "  Fetching Node 1 IP (GCP)..."
+    local ip1
+    ip1=$(gcloud compute instances describe "$GCP_VM_NAME" \
+        --zone="$GCP_ZONE" --project="$GCP_PROJECT" \
+        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null) || true
+    if [[ -n "$ip1" ]]; then
+        _set_config "NODE1_IP" "$ip1"
+    else
+        warn "Could not fetch Node 1 IP"
+    fi
+
+    echo "  Fetching Node 2 IP (Azure)..."
+    local ip2
+    ip2=$(az vm show -d --resource-group "$AZURE_RG" --name "$AZURE_VM_NAME" \
+        --query publicIps -o tsv 2>/dev/null) || true
+    if [[ -n "$ip2" ]]; then
+        _set_config "NODE2_IP" "$ip2"
+    else
+        warn "Could not fetch Node 2 IP"
+    fi
+
+    echo "  Fetching Node 3 IP (AWS)..."
+    local ip3
+    ip3=$(aws ec2 describe-instances --region "$AWS_NODE_REGION" \
+        --filters "Name=tag:Name,Values=${AWS_VM_NAME:-toprf-node-3}" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) || true
+    if [[ -n "$ip3" && "$ip3" != "None" ]]; then
+        _set_config "NODE3_IP" "$ip3"
+    else
+        warn "Could not fetch Node 3 IP"
+    fi
+
+    # AWS Security Group ID (from the node instance)
+    echo "  Fetching AWS security group ID..."
+    local sg_id
+    sg_id=$(aws ec2 describe-instances --region "$AWS_NODE_REGION" \
+        --filters "Name=tag:Name,Values=${AWS_VM_NAME:-toprf-node-3}" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text 2>/dev/null) || true
+    if [[ -n "$sg_id" && "$sg_id" != "None" ]]; then
+        _set_config "AWS_SG_ID" "$sg_id"
+    else
+        warn "Could not fetch AWS security group ID"
+    fi
+
+    # Proxy IP (NAT Gateway EIP from ECS state file)
+    local ecs_state="${SCRIPT_DIR}/ecs-state.env"
+    if [[ -f "$ecs_state" ]]; then
+        echo "  Reading PROXY_IP from ecs-state.env..."
+        local nat_eip
+        nat_eip=$(grep '^NAT_EIP=' "$ecs_state" | cut -d= -f2) || true
+        if [[ -n "$nat_eip" ]]; then
+            _set_config "PROXY_IP" "$nat_eip"
+        fi
+    fi
+
+    echo ""
+    echo "  Done. Review config.env and fill in any remaining empty fields."
+}
+
 # ─── 13. Redeploy (build + push + pull + restart) ───────────────────────────
 
 step_redeploy() {
@@ -691,7 +784,9 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes via mTLS
 
 Utilities:
+  auto-config   Auto-populate config.env (IPs, account ID, SG, proxy IP)
   show-ips      Fetch public IPs from all 3 providers
+
 Shortcuts:
   pre-seal      setup-vms → build → storage → certs
   post-seal     start → firewall → proxy-config → verify
@@ -716,6 +811,7 @@ for step in "$@"; do
         start)        step_start ;;
         proxy-config) step_proxy_config ;;
         verify)       step_verify ;;
+        auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
         redeploy)     step_redeploy ;;
         pre-seal)
