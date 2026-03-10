@@ -62,7 +62,8 @@ impl NonceStore {
     /// Remove expired nonces.
     fn sweep(&mut self) {
         let ttl = self.ttl;
-        self.store.retain(|_, created_at| created_at.elapsed() < ttl);
+        self.store
+            .retain(|_, created_at| created_at.elapsed() < ttl);
     }
 }
 

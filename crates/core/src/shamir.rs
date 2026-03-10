@@ -3,8 +3,8 @@
 //! Uses `frost-secp256k1::keys::split` to split an existing OPRF secret key
 //! into threshold shares, and provides conversion to/from raw k256 types.
 
-use frost_secp256k1 as frost;
 use frost::keys::IdentifierList;
+use frost_secp256k1 as frost;
 use k256::Scalar;
 use rand::rngs::OsRng;
 
@@ -24,12 +24,14 @@ pub fn split_key(
         return Err(TOPRFError::InvalidInput("threshold must be >= 2".into()));
     }
     if total_shares < threshold {
-        return Err(TOPRFError::InvalidInput("total_shares must be >= threshold".into()));
+        return Err(TOPRFError::InvalidInput(
+            "total_shares must be >= threshold".into(),
+        ));
     }
 
     // Convert k256::Scalar to FROST's SigningKey
     let scalar_bytes: k256::FieldBytes = secret_scalar.into();
-    let signing_key = frost::SigningKey::deserialize(scalar_bytes.as_slice())
+    let signing_key = frost::SigningKey::deserialize(&scalar_bytes[..])
         .map_err(|e| TOPRFError::Frost(format!("failed to create SigningKey: {e}")))?;
 
     // Split using FROST's trusted dealer
@@ -44,7 +46,8 @@ pub fn split_key(
 
     // Extract group public key
     let group_verifying_key = public_key_package.verifying_key();
-    let group_pk_bytes = group_verifying_key.serialize()
+    let group_pk_bytes = group_verifying_key
+        .serialize()
         .map_err(|e| TOPRFError::Frost(format!("serialize group key: {e}")))?;
     let group_pk_hex = hex::encode(&group_pk_bytes);
 
@@ -59,7 +62,8 @@ pub fn split_key(
         let verifying_share = key_package.verifying_share();
 
         let share_bytes = signing_share.serialize();
-        let verify_bytes = verifying_share.serialize()
+        let verify_bytes = verifying_share
+            .serialize()
             .map_err(|e| TOPRFError::Frost(format!("serialize verifying share: {e}")))?;
 
         // Extract node_id from FROST Identifier (1-indexed)
@@ -109,7 +113,7 @@ pub fn reconstruct_secret(shares: &[NodeKeyShare]) -> Result<Scalar, TOPRFError>
     for share in shares {
         let scalar = hex_to_scalar(&share.secret_share)?;
         let lambda = crate::combine::lagrange_coefficient(share.node_id, &node_ids)?;
-        secret = secret + lambda * scalar;
+        secret += lambda * scalar;
     }
     Ok(secret)
 }

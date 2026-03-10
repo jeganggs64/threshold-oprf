@@ -54,18 +54,18 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router};
 use k256::Scalar;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use zeroize::{Zeroize, Zeroizing};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+use zeroize::{Zeroize, Zeroizing};
 
 use toprf_core::partial_eval::partial_evaluate;
 use toprf_core::{hex_to_point, hex_to_scalar, NodeKeyShare, PartialEvaluation};
@@ -145,10 +145,10 @@ async fn health(State(state): State<Arc<NodeState>>) -> Json<HealthResponse> {
 async fn node_info(
     State(state): State<Arc<NodeState>>,
 ) -> Result<Json<InfoResponse>, (StatusCode, String)> {
-    let key = state.loaded_key.get().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "no key loaded".into(),
-    ))?;
+    let key = state
+        .loaded_key
+        .get()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no key loaded".into()))?;
 
     Ok(Json(InfoResponse {
         node_id: key.node_id,
@@ -164,11 +164,7 @@ async fn eval(
     Json(req): Json<EvalRequest>,
 ) -> Result<Json<PartialEvaluation>, axum::response::Response> {
     let key = state.loaded_key.get().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no key loaded".to_string(),
-        )
-            .into_response()
+        (StatusCode::SERVICE_UNAVAILABLE, "no key loaded".to_string()).into_response()
     })?;
 
     let blinded_point = match hex_to_point(&req.blinded_point) {
@@ -183,14 +179,15 @@ async fn eval(
         Ok(p) => p,
         Err(e) => {
             warn!("partial evaluation failed: {e}");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "evaluation failed".to_string()).into_response());
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "evaluation failed".to_string(),
+            )
+                .into_response());
         }
     };
 
-    info!(
-        node_id = key.node_id,
-        "partial evaluation complete"
-    );
+    info!(node_id = key.node_id, "partial evaluation complete");
 
     Ok(Json(partial))
 }
@@ -211,9 +208,7 @@ struct InitSealState {
 }
 
 /// GET /attest — returns the raw attestation report (binary).
-async fn attest_handler(
-    State(state): State<Arc<InitSealState>>,
-) -> impl IntoResponse {
+async fn attest_handler(State(state): State<Arc<InitSealState>>) -> impl IntoResponse {
     info!("init-seal: /attest endpoint called, returning attestation report");
     (
         StatusCode::OK,
@@ -233,7 +228,10 @@ async fn init_key_handler(
     let mut share_bytes = Zeroizing::new(body.to_vec());
     let _share: NodeKeyShare = serde_json::from_slice(&share_bytes).map_err(|e| {
         error!("init-seal: invalid NodeKeyShare JSON: {e}");
-        (StatusCode::BAD_REQUEST, format!("invalid NodeKeyShare JSON: {e}"))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid NodeKeyShare JSON: {e}"),
+        )
     })?;
     info!("init-seal: key share JSON parsed successfully");
 
@@ -241,7 +239,10 @@ async fn init_key_handler(
     info!("init-seal: requesting hardware-derived key via MSG_KEY_REQ (SAFE_FIELD_SELECT)");
     let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT).map_err(|e| {
         error!("init-seal: failed to get derived key: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to get derived key: {e}"))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to get derived key: {e}"),
+        )
     })?;
     info!("init-seal: hardware-derived key obtained successfully");
 
@@ -251,7 +252,10 @@ async fn init_key_handler(
         toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
             .map_err(|e| {
                 error!("init-seal: sealing failed: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("sealing failed: {e}"))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("sealing failed: {e}"),
+                )
             })?;
     info!(
         sealed_blob_size = sealed_blob.len(),
@@ -271,7 +275,10 @@ async fn init_key_handler(
         .await
         .map_err(|e| {
             error!("init-seal: upload failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("upload failed: {e}"))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("upload failed: {e}"),
+            )
         })?;
 
     info!("init-seal: sealed blob uploaded successfully");
@@ -280,7 +287,10 @@ async fn init_key_handler(
     // Signal the server to shut down
     let _ = state.shutdown_tx.send(true);
 
-    Ok((StatusCode::OK, "sealed blob uploaded successfully, node shutting down".into()))
+    Ok((
+        StatusCode::OK,
+        "sealed blob uploaded successfully, node shutting down".into(),
+    ))
 }
 
 /// Run the init-seal mode: generate ephemeral TLS cert, get attestation,
@@ -388,10 +398,7 @@ async fn run_init_seal(port: &str, upload_url: String) {
 
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(
-                cert_chain.into_iter().map(|c| c.into()).collect(),
-                private_key.into(),
-            )
+            .with_single_cert(cert_chain.into_iter().collect(), private_key.into())
             .expect("failed to build rustls ServerConfig for init-seal");
 
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -409,8 +416,7 @@ async fn run_init_seal(port: &str, upload_url: String) {
     info!("  POST /init-key — submit key share JSON");
 
     // Serve until shutdown signal
-    let server = axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service());
+    let server = axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service());
 
     tokio::select! {
         result = server => {
@@ -509,7 +515,9 @@ async fn main() {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -p, --port <PORT>         Listen port (default: 3001)");
-                eprintln!("      --init-seal           Run initial deployment (seal + upload) mode");
+                eprintln!(
+                    "      --init-seal           Run initial deployment (seal + upload) mode"
+                );
                 eprintln!("      --upload-url <URL>    Storage URL for sealed blob (gs://, s3://, https://, file://)");
                 eprintln!("      --key-file <PATH>     Load key share from JSON file at boot");
                 eprintln!("      --tls-cert <PATH>     TLS server certificate (PEM)");
@@ -573,8 +581,8 @@ async fn main() {
         }
 
         info!("loading key share from file: {path}");
-        let share_bytes = std::fs::read(path)
-            .unwrap_or_else(|e| panic!("failed to read key file {path}: {e}"));
+        let share_bytes =
+            std::fs::read(path).unwrap_or_else(|e| panic!("failed to read key file {path}: {e}"));
         let share: NodeKeyShare = serde_json::from_slice(&share_bytes)
             .unwrap_or_else(|e| panic!("invalid NodeKeyShare JSON in {path}: {e}"));
 
@@ -606,7 +614,10 @@ async fn main() {
             total_shares: share.total_shares,
         };
 
-        state.loaded_key.set(loaded).expect("key file: OnceLock already set");
+        state
+            .loaded_key
+            .set(loaded)
+            .expect("key file: OnceLock already set");
         info!(
             node_id = share.node_id,
             threshold = share.threshold,
@@ -617,7 +628,10 @@ async fn main() {
 
     // -- Auto-unseal from object storage (if configured) --
     if let Ok(sealed_url) = env::var("SEALED_KEY_URL") {
-        info!("auto-unseal: fetching sealed key from {}", cloud_storage::display_url(&sealed_url));
+        info!(
+            "auto-unseal: fetching sealed key from {}",
+            cloud_storage::display_url(&sealed_url)
+        );
 
         let expected_vs = env::var("EXPECTED_VERIFICATION_SHARE")
             .expect("EXPECTED_VERIFICATION_SHARE required when SEALED_KEY_URL is set");
@@ -630,7 +644,10 @@ async fn main() {
         let blob_version = toprf_seal::detect_sealed_version(&sealed_blob)
             .expect("auto-unseal: failed to detect sealed blob version");
 
-        info!(blob_version = blob_version, "auto-unseal: detected sealed blob version");
+        info!(
+            blob_version = blob_version,
+            "auto-unseal: detected sealed blob version"
+        );
 
         let share_json = match blob_version {
             2 => {
@@ -649,8 +666,9 @@ async fn main() {
                 }
 
                 Zeroizing::new(
-                    toprf_seal::unseal_derived(&sealed_blob, &derived_key)
-                        .expect("auto-unseal: v2 decryption failed — derived key mismatch or corrupt blob"),
+                    toprf_seal::unseal_derived(&sealed_blob, &derived_key).expect(
+                        "auto-unseal: v2 decryption failed — derived key mismatch or corrupt blob",
+                    ),
                 )
             }
             1 => {
@@ -662,10 +680,9 @@ async fn main() {
                     Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
                     _ => toprf_seal::provider::SnpProvider::DevSevGuest,
                 };
-                let report =
-                    toprf_seal::provider::get_attestation_report(provider, None)
-                        .await
-                        .expect("failed to get attestation report");
+                let report = toprf_seal::provider::get_attestation_report(provider, None)
+                    .await
+                    .expect("failed to get attestation report");
 
                 // Verify report authenticity
                 toprf_seal::attestation::AttestationVerifier::verify_report(&report)
@@ -689,8 +706,9 @@ async fn main() {
                 }
 
                 Zeroizing::new(
-                    toprf_seal::sealing::unseal(&sealed_blob, &measurement, policy)
-                        .expect("auto-unseal: v1 decryption failed — measurement mismatch or corrupt blob"),
+                    toprf_seal::sealing::unseal(&sealed_blob, &measurement, policy).expect(
+                        "auto-unseal: v1 decryption failed — measurement mismatch or corrupt blob",
+                    ),
                 )
             }
             other => {
@@ -703,8 +721,8 @@ async fn main() {
             .expect("auto-unseal: unsealed data is not valid NodeKeyShare JSON");
 
         // Verify key: k_i * G == expected verification share
-        let key_scalar = hex_to_scalar(&share.secret_share)
-            .expect("auto-unseal: invalid secret_share scalar");
+        let key_scalar =
+            hex_to_scalar(&share.secret_share).expect("auto-unseal: invalid secret_share scalar");
         let computed_vs = {
             use k256::elliptic_curve::ops::MulByGenerator;
             use k256::ProjectivePoint;
@@ -769,7 +787,9 @@ async fn main() {
 
                 let mut root_store = RootCertStore::empty();
                 for cert in ca_certs {
-                    root_store.add(cert).expect("failed to add CA cert to root store");
+                    root_store
+                        .add(cert)
+                        .expect("failed to add CA cert to root store");
                 }
 
                 let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
@@ -785,9 +805,10 @@ async fn main() {
                 let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("failed to parse server certificate PEM");
-                let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
-                    .expect("failed to parse server private key PEM")
-                    .expect("no private key found in PEM file");
+                let private_key =
+                    rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+                        .expect("failed to parse server private key PEM")
+                        .expect("no private key found in PEM file");
 
                 rustls::ServerConfig::builder()
                     .with_client_cert_verifier(client_verifier)
@@ -803,9 +824,10 @@ async fn main() {
                 let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("failed to parse server certificate PEM");
-                let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
-                    .expect("failed to parse server private key PEM")
-                    .expect("no private key found in PEM file");
+                let private_key =
+                    rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+                        .expect("failed to parse server private key PEM")
+                        .expect("no private key found in PEM file");
 
                 rustls::ServerConfig::builder()
                     .with_no_client_auth()

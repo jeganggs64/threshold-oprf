@@ -34,7 +34,9 @@ pub fn partial_evaluate(
 
     use k256::elliptic_curve::Group;
     if bool::from(blinded_point.is_identity()) {
-        return Err(TOPRFError::InvalidInput("blinded point is the identity element".into()));
+        return Err(TOPRFError::InvalidInput(
+            "blinded point is the identity element".into(),
+        ));
     }
 
     // E_i = k_i * B
@@ -64,7 +66,9 @@ pub fn verify_partial(
 ) -> Result<(), TOPRFError> {
     use k256::elliptic_curve::Group;
     if bool::from(blinded_point.is_identity()) {
-        return Err(TOPRFError::InvalidInput("blinded point is the identity element".into()));
+        return Err(TOPRFError::InvalidInput(
+            "blinded point is the identity element".into(),
+        ));
     }
 
     let partial_point = hex_to_point(&partial.partial_point)?;
@@ -95,9 +99,9 @@ pub fn verify_partial(
 /// 4. Response s = t - c*k
 fn dleq_prove(
     secret: &Scalar,
-    base_point: &ProjectivePoint,    // B
-    evaluation: &ProjectivePoint,    // E = k*B
-    public_share: &ProjectivePoint,  // V = k*G
+    base_point: &ProjectivePoint,   // B
+    evaluation: &ProjectivePoint,   // E = k*B
+    public_share: &ProjectivePoint, // V = k*G
 ) -> DLEQProof {
     use zeroize::Zeroizing;
     let t = Zeroizing::new(Scalar::random(&mut OsRng));
@@ -126,9 +130,9 @@ fn dleq_prove(
 /// 2. Recompute challenge c' = H(G, B, V, E, A1, A2)
 /// 3. Check c == c'
 fn dleq_verify(
-    base_point: &ProjectivePoint,    // B
-    evaluation: &ProjectivePoint,    // E
-    public_share: &ProjectivePoint,  // V
+    base_point: &ProjectivePoint,   // B
+    evaluation: &ProjectivePoint,   // E
+    public_share: &ProjectivePoint, // V
     challenge: &Scalar,
     response: &Scalar,
 ) -> Result<(), ()> {
@@ -139,7 +143,8 @@ fn dleq_verify(
     // A2 = s*B + c*E
     let a2 = base_point * response + evaluation * challenge;
 
-    let expected_challenge = dleq_challenge(&generator, base_point, public_share, evaluation, &a1, &a2);
+    let expected_challenge =
+        dleq_challenge(&generator, base_point, public_share, evaluation, &a1, &a2);
 
     use k256::elliptic_curve::subtle::ConstantTimeEq;
     if bool::from(challenge.ct_eq(&expected_challenge)) {
@@ -194,7 +199,7 @@ mod tests {
         let blinded_point = ProjectivePoint::mul_by_generator(&Scalar::random(&mut OsRng));
 
         let partial = partial_evaluate(1, &key_share, &blinded_point).unwrap();
-        let expected = blinded_point * &key_share;
+        let expected = blinded_point * key_share;
         let partial_point = hex_to_point(&partial.partial_point).unwrap();
 
         assert_eq!(point_to_hex(&partial_point), point_to_hex(&expected));
@@ -207,11 +212,7 @@ mod tests {
         let verification_share = ProjectivePoint::mul_by_generator(&key_share);
 
         let partial = partial_evaluate(1, &key_share, &blinded_point).unwrap();
-        let result = verify_partial(
-            &partial,
-            &blinded_point,
-            &point_to_hex(&verification_share),
-        );
+        let result = verify_partial(&partial, &blinded_point, &point_to_hex(&verification_share));
         assert!(result.is_ok());
     }
 
@@ -223,11 +224,7 @@ mod tests {
         let wrong_verification = ProjectivePoint::mul_by_generator(&wrong_share);
 
         let partial = partial_evaluate(1, &key_share, &blinded_point).unwrap();
-        let result = verify_partial(
-            &partial,
-            &blinded_point,
-            &point_to_hex(&wrong_verification),
-        );
+        let result = verify_partial(&partial, &blinded_point, &point_to_hex(&wrong_verification));
         assert!(result.is_err());
     }
 }

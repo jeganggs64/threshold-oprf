@@ -44,7 +44,10 @@ impl std::fmt::Debug for ReshareContribution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReshareContribution")
             .field("commitments", &self.commitments)
-            .field("sub_shares", &format!("<{} shares redacted>", self.sub_shares.len()))
+            .field(
+                "sub_shares",
+                &format!("<{} shares redacted>", self.sub_shares.len()),
+            )
             .finish()
     }
 }
@@ -83,27 +86,37 @@ pub fn generate_reshare_contribution(
     }
 
     // Validate no zero IDs in participant_ids or new_node_ids
-    if node_id == 0 || participant_ids.iter().any(|&id| id == 0) {
+    if node_id == 0 || participant_ids.contains(&0) {
         return Err(TOPRFError::InvalidInput("node_id must be nonzero".into()));
     }
-    if new_node_ids.iter().any(|&id| id == 0) {
-        return Err(TOPRFError::InvalidInput("new_node_ids must all be nonzero".into()));
+    if new_node_ids.contains(&0) {
+        return Err(TOPRFError::InvalidInput(
+            "new_node_ids must all be nonzero".into(),
+        ));
     }
     if !participant_ids.contains(&node_id) {
-        return Err(TOPRFError::InvalidInput("node_id must be in participant_ids".into()));
+        return Err(TOPRFError::InvalidInput(
+            "node_id must be in participant_ids".into(),
+        ));
     }
     // Check for duplicate participant_ids
     let mut seen_participants = std::collections::HashSet::new();
     for &id in participant_ids {
         if !seen_participants.insert(id) {
-            return Err(TOPRFError::InvalidInput(format!("duplicate participant_id: {}", id)));
+            return Err(TOPRFError::InvalidInput(format!(
+                "duplicate participant_id: {}",
+                id
+            )));
         }
     }
     // Check for duplicate new_node_ids
     let mut seen = std::collections::HashSet::new();
     for &id in new_node_ids {
         if !seen.insert(id) {
-            return Err(TOPRFError::InvalidInput(format!("duplicate new_node_id: {}", id)));
+            return Err(TOPRFError::InvalidInput(format!(
+                "duplicate new_node_id: {}",
+                id
+            )));
         }
     }
 
@@ -126,7 +139,7 @@ pub fn generate_reshare_contribution(
     // Compute commitments: C_j = a_j * G (Feldman VSS)
     let commitments: Vec<ProjectivePoint> = coefficients
         .iter()
-        .map(|c| ProjectivePoint::mul_by_generator(c))
+        .map(ProjectivePoint::mul_by_generator)
         .collect();
 
     // Evaluate the polynomial at each new node's ID
@@ -166,14 +179,17 @@ pub fn combine_reshare_contributions(
     group_public_key: &str,
 ) -> Result<NodeKeyShare, TOPRFError> {
     if new_node_id == 0 {
-        return Err(TOPRFError::InvalidInput("new_node_id must be nonzero".into()));
+        return Err(TOPRFError::InvalidInput(
+            "new_node_id must be nonzero".into(),
+        ));
     }
     // Check for duplicate contributions from the same old node
     let mut seen_from = std::collections::HashSet::new();
     for contrib in contributions {
         if !seen_from.insert(contrib.from_node_id) {
             return Err(TOPRFError::InvalidInput(format!(
-                "duplicate contribution from node {}", contrib.from_node_id
+                "duplicate contribution from node {}",
+                contrib.from_node_id
             )));
         }
     }
@@ -205,8 +221,8 @@ pub fn combine_reshare_contributions(
         let mut computed = ProjectivePoint::IDENTITY;
         let mut x_pow = Scalar::ONE;
         for commitment in &contribution.commitments {
-            computed = computed + (commitment * &x_pow);
-            x_pow = x_pow * x;
+            computed += commitment * &x_pow;
+            x_pow *= x;
         }
 
         if !bool::from(expected.ct_eq(&computed)) {
@@ -237,7 +253,7 @@ pub fn combine_reshare_contributions(
             .iter()
             .find(|(id, _)| *id == new_node_id)
             .unwrap();
-        new_share = new_share + sub_share.1;
+        new_share += sub_share.1;
     }
 
     if bool::from(new_share.is_zero()) {
@@ -263,8 +279,8 @@ fn evaluate_polynomial(coefficients: &[Scalar], x: &Scalar) -> Scalar {
     let mut x_pow = Scalar::ONE;
 
     for coeff in coefficients {
-        result = result + coeff * &x_pow;
-        x_pow = x_pow * x;
+        result += coeff * &x_pow;
+        x_pow *= x;
     }
 
     result
@@ -289,16 +305,13 @@ mod tests {
     fn test_reshare_2_of_3_to_2_of_3() {
         let secret = Scalar::random(&mut OsRng);
         let blinded_point = ProjectivePoint::mul_by_generator(&Scalar::random(&mut OsRng));
-        let expected = blinded_point * &secret;
+        let expected = blinded_point * secret;
 
         // Original split
         let keygen = split_key(&secret, 2, 3).unwrap();
 
         // Reshare using nodes 1 and 2 → new nodes 4, 5, 6
-        let participant_ids: Vec<NodeId> = vec![
-            keygen.shares[0].node_id,
-            keygen.shares[1].node_id,
-        ];
+        let participant_ids: Vec<NodeId> = vec![keygen.shares[0].node_id, keygen.shares[1].node_id];
         let new_node_ids: Vec<NodeId> = vec![4, 5, 6];
         let new_threshold = 2u16;
 
@@ -366,14 +379,11 @@ mod tests {
     fn test_reshare_2_of_3_to_3_of_5() {
         let secret = Scalar::random(&mut OsRng);
         let blinded_point = ProjectivePoint::mul_by_generator(&Scalar::random(&mut OsRng));
-        let expected = blinded_point * &secret;
+        let expected = blinded_point * secret;
 
         let keygen = split_key(&secret, 2, 3).unwrap();
 
-        let participant_ids: Vec<NodeId> = vec![
-            keygen.shares[0].node_id,
-            keygen.shares[2].node_id,
-        ];
+        let participant_ids: Vec<NodeId> = vec![keygen.shares[0].node_id, keygen.shares[2].node_id];
         let new_node_ids: Vec<NodeId> = vec![10, 11, 12, 13, 14];
         let new_threshold = 3u16;
 
@@ -415,7 +425,7 @@ mod tests {
             .collect();
 
         // Test subset {10, 12, 14}
-        let subset = vec![0usize, 2, 4];
+        let subset = [0usize, 2, 4];
         let partials: Vec<_> = subset
             .iter()
             .map(|&i| {
@@ -437,10 +447,7 @@ mod tests {
         let secret = Scalar::random(&mut OsRng);
         let keygen = split_key(&secret, 2, 3).unwrap();
 
-        let participant_ids: Vec<NodeId> = vec![
-            keygen.shares[0].node_id,
-            keygen.shares[1].node_id,
-        ];
+        let participant_ids: Vec<NodeId> = vec![keygen.shares[0].node_id, keygen.shares[1].node_id];
         let new_node_ids: Vec<NodeId> = vec![4, 5, 6];
 
         let mut contributions: Vec<ReshareContribution> = participant_ids
@@ -456,7 +463,8 @@ mod tests {
         // Tamper with the first contribution's sub-share
         contributions[0].sub_shares[0].1 = Scalar::random(&mut OsRng);
 
-        let result = combine_reshare_contributions(4, &contributions, 2, 2, 3, &keygen.group_public_key);
+        let result =
+            combine_reshare_contributions(4, &contributions, 2, 2, 3, &keygen.group_public_key);
         assert!(result.is_err(), "should reject tampered contribution");
     }
 }

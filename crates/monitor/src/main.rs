@@ -23,7 +23,7 @@
 use std::env;
 use std::time::Duration;
 
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 const GCP_MAINTENANCE_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/maintenance-event";
@@ -130,15 +130,36 @@ fn validate_webhook_url(url: &str) -> Result<(), String> {
 
     // Block internal/metadata IPs (IPv4 and IPv6)
     let blocked_hosts = [
-        "169.254.", "127.", "0.", "10.",
-        "172.16.", "172.17.", "172.18.", "172.19.",
-        "172.20.", "172.21.", "172.22.", "172.23.",
-        "172.24.", "172.25.", "172.26.", "172.27.",
-        "172.28.", "172.29.", "172.30.", "172.31.",
-        "192.168.", "metadata.google.internal",
+        "169.254.",
+        "127.",
+        "0.",
+        "10.",
+        "172.16.",
+        "172.17.",
+        "172.18.",
+        "172.19.",
+        "172.20.",
+        "172.21.",
+        "172.22.",
+        "172.23.",
+        "172.24.",
+        "172.25.",
+        "172.26.",
+        "172.27.",
+        "172.28.",
+        "172.29.",
+        "172.30.",
+        "172.31.",
+        "192.168.",
+        "metadata.google.internal",
         "localhost",
-        "[::1]", "[::ffff:", "::1", "::ffff:",
-        "fe80:", "fc00:", "fd00:",
+        "[::1]",
+        "[::ffff:",
+        "::1",
+        "::ffff:",
+        "fe80:",
+        "fc00:",
+        "fd00:",
     ];
 
     // Extract host from URL
@@ -154,7 +175,9 @@ fn validate_webhook_url(url: &str) -> Result<(), String> {
 
     for blocked in &blocked_hosts {
         if host.starts_with(blocked) || host == *blocked {
-            return Err(format!("webhook URL must not target internal address: {host}"));
+            return Err(format!(
+                "webhook URL must not target internal address: {host}"
+            ));
         }
     }
 
@@ -210,7 +233,9 @@ fn parse_config() -> MonitorConfig {
                 eprintln!("Sends webhook alerts when host maintenance is scheduled.");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --webhook-url <URL>     Webhook URL for alerts (also: WEBHOOK_URL env var)");
+                eprintln!(
+                    "  --webhook-url <URL>     Webhook URL for alerts (also: WEBHOOK_URL env var)"
+                );
                 eprintln!("  --poll-interval <SECS>  Poll interval in seconds (default: 60)");
                 eprintln!("  --node-id <ID>          Node identifier for alert messages");
                 eprintln!("  -h, --help              Show this help");
