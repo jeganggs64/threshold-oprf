@@ -241,20 +241,209 @@ pub fn verify_apple_attestation(
 
 /// Verify a Google Play Integrity token.
 ///
-/// **NOT YET IMPLEMENTED**: Google Play Integrity API requires OAuth2
-/// service account authentication.  The `_service_account_key` parameter
-/// is currently unused and unauthenticated requests will be rejected by
-/// Google's API with 401/403.  This function short-circuits with an error
-/// until proper service account authentication is implemented.
+/// 1. Decodes the base64 token to extract the integrity token string.
+/// 2. Obtains an OAuth2 access token using the service account key (JWT assertion flow).
+/// 3. Calls the Google Play Integrity API to decode the integrity token.
+/// 4. Validates nonce, package name, device integrity, and app integrity.
+/// 5. Returns a device ID derived from a SHA-256 hash of the token.
 pub async fn verify_google_play_integrity(
-    _token_b64: &str,
-    _nonce: &str,
-    _package_name: &str,
-    _service_account_key: &str,
-    _http_client: &reqwest::Client,
+    token_b64: &str,
+    nonce: &str,
+    package_name: &str,
+    service_account_key: &str,
+    http_client: &reqwest::Client,
 ) -> Result<DeviceId, String> {
-    tracing::error!("Google Play Integrity verification not yet implemented - requires OAuth2 auth");
-    Err("Google Play Integrity verification not yet implemented".into())
+    let b64 = base64::engine::general_purpose::STANDARD;
+
+    // 1. Decode the base64 token to get the integrity token string from JSON
+    let token_json_bytes = b64
+        .decode(token_b64)
+        .map_err(|e| format!("invalid base64 token: {e}"))?;
+    let token_json_str = String::from_utf8(token_json_bytes)
+        .map_err(|e| format!("invalid UTF-8 in token: {e}"))?;
+    let token_parsed: serde_json::Value = serde_json::from_str(&token_json_str)
+        .map_err(|e| format!("invalid JSON in token: {e}"))?;
+    let integrity_token = token_parsed["integrityToken"]
+        .as_str()
+        .ok_or("token JSON missing integrityToken field")?
+        .to_string();
+
+    // 2. Get an OAuth2 access token using the service account key
+    let access_token = get_google_access_token(service_account_key, http_client).await?;
+
+    // 3. Call Google Play Integrity API to decode the token
+    let api_url = format!(
+        "https://playintegrity.googleapis.com/v1/{}:decodeIntegrityToken",
+        package_name
+    );
+
+    let decode_body = serde_json::json!({
+        "integrity_token": integrity_token
+    });
+
+    let api_response = http_client
+        .post(&api_url)
+        .bearer_auth(&access_token)
+        .json(&decode_body)
+        .send()
+        .await
+        .map_err(|e| format!("Play Integrity API request failed: {e}"))?;
+
+    if !api_response.status().is_success() {
+        let status = api_response.status();
+        let body = api_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".into());
+        return Err(format!(
+            "Play Integrity API returned {status}: {body}"
+        ));
+    }
+
+    let response_json: serde_json::Value = api_response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse Play Integrity API response: {e}"))?;
+
+    // 4. Validate the response
+    let token_payload = &response_json["tokenPayloadExternal"];
+
+    // 4a. Validate nonce — Google returns it in requestDetails.nonce (base64-encoded)
+    let response_nonce = token_payload["requestDetails"]["nonce"]
+        .as_str()
+        .ok_or("response missing requestDetails.nonce")?;
+    let expected_nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce.as_bytes());
+    if response_nonce != expected_nonce_b64 {
+        return Err(format!(
+            "nonce mismatch: expected {expected_nonce_b64}, got {response_nonce}"
+        ));
+    }
+
+    // 4b. Validate package name
+    let response_package = token_payload["requestDetails"]["requestPackageName"]
+        .as_str()
+        .ok_or("response missing requestDetails.requestPackageName")?;
+    if response_package != package_name {
+        return Err(format!(
+            "package name mismatch: expected {package_name}, got {response_package}"
+        ));
+    }
+
+    // 4c. Validate device integrity
+    let device_verdict = token_payload["deviceIntegrity"]["deviceRecognitionVerdict"]
+        .as_array()
+        .ok_or("response missing deviceIntegrity.deviceRecognitionVerdict")?;
+    let has_device_integrity = device_verdict
+        .iter()
+        .any(|v| v.as_str() == Some("MEETS_DEVICE_INTEGRITY"));
+    if !has_device_integrity {
+        return Err(format!(
+            "device does not meet integrity requirements: {:?}",
+            device_verdict
+        ));
+    }
+
+    // 4d. Validate app integrity
+    let app_verdict = token_payload["appIntegrity"]["appRecognitionVerdict"]
+        .as_str()
+        .ok_or("response missing appIntegrity.appRecognitionVerdict")?;
+    if app_verdict != "PLAY_RECOGNIZED" {
+        return Err(format!(
+            "app not recognized by Play: {app_verdict}"
+        ));
+    }
+
+    // 5. Derive a device ID from the token hash
+    let token_hash = Sha256::digest(integrity_token.as_bytes());
+    let device_id = hex::encode(token_hash);
+
+    info!(device_id = %device_id, "Google Play Integrity verification succeeded");
+
+    Ok(device_id)
+}
+
+/// Service account key JSON structure (subset of fields we need).
+#[derive(serde::Deserialize)]
+struct ServiceAccountKey {
+    client_email: String,
+    private_key: String,
+    token_uri: Option<String>,
+}
+
+/// Google OAuth2 token response.
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+}
+
+/// Obtain a Google OAuth2 access token using a service account key (JWT assertion flow).
+///
+/// Creates a JWT signed with the service account's RSA private key, then exchanges
+/// it at Google's token endpoint for an access token.
+async fn get_google_access_token(
+    service_account_key_json: &str,
+    http_client: &reqwest::Client,
+) -> Result<String, String> {
+    let sa_key: ServiceAccountKey = serde_json::from_str(service_account_key_json)
+        .map_err(|e| format!("invalid service account key JSON: {e}"))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {e}"))?
+        .as_secs();
+
+    let token_uri = sa_key
+        .token_uri
+        .as_deref()
+        .unwrap_or("https://oauth2.googleapis.com/token");
+
+    // Build JWT claims
+    let claims = serde_json::json!({
+        "iss": sa_key.client_email,
+        "sub": sa_key.client_email,
+        "aud": "https://oauth2.googleapis.com/token",
+        "scope": "https://www.googleapis.com/auth/playintegrity",
+        "iat": now,
+        "exp": now + 3600,
+    });
+
+    // Sign the JWT with RS256
+    let encoding_key = jsonwebtoken::EncodingKey::from_rsa_pem(sa_key.private_key.as_bytes())
+        .map_err(|e| format!("invalid RSA private key in service account: {e}"))?;
+
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    let jwt_assertion = jsonwebtoken::encode(&header, &claims, &encoding_key)
+        .map_err(|e| format!("failed to encode JWT assertion: {e}"))?;
+
+    // Exchange JWT for access token
+    let token_response = http_client
+        .post(token_uri)
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            ),
+            ("assertion", &jwt_assertion),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("OAuth2 token request failed: {e}"))?;
+
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let body = token_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable>".into());
+        return Err(format!("OAuth2 token endpoint returned {status}: {body}"));
+    }
+
+    let token_data: TokenResponse = token_response
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse OAuth2 token response: {e}"))?;
+
+    Ok(token_data.access_token)
 }
 
 // ---------------------------------------------------------------------------
