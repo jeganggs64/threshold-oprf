@@ -35,7 +35,7 @@ crates/
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
   monitor/    GCP maintenance event monitor with webhook alerts
-docker/       Dockerfiles, docker-compose, TEE-specific configs (sev, sgx, nitro)
+docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation scripts (deploy.sh, setup-ecs.sh)
 scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
 ```
