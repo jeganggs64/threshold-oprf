@@ -128,7 +128,8 @@ pub fn verify_apple_assertion(
     verify_p256_signature(&entry.public_key_pem, &composite_hash, &signature)?;
 
     // 8. Verify and update counter (bytes 33-36 of authData, big-endian)
-    let new_counter = u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
+    let new_counter =
+        u32::from_be_bytes([auth_data[33], auth_data[34], auth_data[35], auth_data[36]]);
     if new_counter <= entry.counter {
         return Err(format!(
             "counter replay: received {new_counter}, expected > {}",
@@ -218,7 +219,8 @@ pub fn verify_apple_attestation(
     // Apple's key_id is the SHA-256 hash of the EC public key point, base64-encoded.
     let public_key_bytes = cred_cert.public_key().subject_public_key.data.to_vec();
     let computed_key_id_hash = Sha256::digest(&public_key_bytes);
-    let computed_key_id_b64 = base64::engine::general_purpose::STANDARD.encode(computed_key_id_hash);
+    let computed_key_id_b64 =
+        base64::engine::general_purpose::STANDARD.encode(computed_key_id_hash);
     if key_id != computed_key_id_b64 {
         return Err(format!(
             "key_id mismatch: provided {} but cert public key hashes to {}",
@@ -227,7 +229,8 @@ pub fn verify_apple_attestation(
     }
 
     // 6. Store the key (rejects re-registration of existing keys)
-    key_store.save_key(key_id, &public_key_pem, 0)
+    key_store
+        .save_key(key_id, &public_key_pem, 0)
         .map_err(|e| format!("failed to store device key: {e}"))?;
 
     info!(key_id = %key_id, "Apple App Attest device registered");
@@ -259,10 +262,10 @@ pub async fn verify_google_play_integrity(
     let token_json_bytes = b64
         .decode(token_b64)
         .map_err(|e| format!("invalid base64 token: {e}"))?;
-    let token_json_str = String::from_utf8(token_json_bytes)
-        .map_err(|e| format!("invalid UTF-8 in token: {e}"))?;
-    let token_parsed: serde_json::Value = serde_json::from_str(&token_json_str)
-        .map_err(|e| format!("invalid JSON in token: {e}"))?;
+    let token_json_str =
+        String::from_utf8(token_json_bytes).map_err(|e| format!("invalid UTF-8 in token: {e}"))?;
+    let token_parsed: serde_json::Value =
+        serde_json::from_str(&token_json_str).map_err(|e| format!("invalid JSON in token: {e}"))?;
     let integrity_token = token_parsed["integrityToken"]
         .as_str()
         .ok_or("token JSON missing integrityToken field")?
@@ -295,9 +298,7 @@ pub async fn verify_google_play_integrity(
             .text()
             .await
             .unwrap_or_else(|_| "<unreadable>".into());
-        return Err(format!(
-            "Play Integrity API returned {status}: {body}"
-        ));
+        return Err(format!("Play Integrity API returned {status}: {body}"));
     }
 
     let response_json: serde_json::Value = api_response
@@ -348,9 +349,7 @@ pub async fn verify_google_play_integrity(
         .as_str()
         .ok_or("response missing appIntegrity.appRecognitionVerdict")?;
     if app_verdict != "PLAY_RECOGNIZED" {
-        return Err(format!(
-            "app not recognized by Play: {app_verdict}"
-        ));
+        return Err(format!("app not recognized by Play: {app_verdict}"));
     }
 
     // 5. Derive a device ID from the token hash
@@ -419,10 +418,7 @@ async fn get_google_access_token(
     let token_response = http_client
         .post(token_uri)
         .form(&[
-            (
-                "grant_type",
-                "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            ),
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
             ("assertion", &jwt_assertion),
         ])
         .send()
@@ -505,8 +501,7 @@ fn decode_cbor_assertion(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
 
     let auth_data = get_cbor_bytes(map, "authenticatorData")
         .ok_or("CBOR assertion missing authenticatorData")?;
-    let signature =
-        get_cbor_bytes(map, "signature").ok_or("CBOR assertion missing signature")?;
+    let signature = get_cbor_bytes(map, "signature").ok_or("CBOR assertion missing signature")?;
 
     Ok((auth_data, signature))
 }
@@ -524,8 +519,8 @@ fn verify_p256_signature(
         .map_err(|e| format!("invalid public key PEM: {e}"))?;
 
     // The signature from Apple is DER-encoded. Convert to fixed-size format.
-    let signature = Signature::from_der(signature_der)
-        .map_err(|e| format!("invalid DER signature: {e}"))?;
+    let signature =
+        Signature::from_der(signature_der).map_err(|e| format!("invalid DER signature: {e}"))?;
 
     // Apple signs the raw hash (no additional hashing), so we use verify_prehash
     use p256::ecdsa::signature::hazmat::PrehashVerifier;
@@ -577,7 +572,10 @@ fn verify_apple_cert_chain(x5c: &[Vec<u8>]) -> Result<(), String> {
             .map_err(|e| format!("cert chain signature verification failed at index {i}: {e}"))?;
 
         if !parsed_certs[i].validity().is_valid() {
-            return Err(format!("certificate at index {} has expired or is not yet valid", i).into());
+            return Err(format!(
+                "certificate at index {} has expired or is not yet valid",
+                i
+            ));
         }
     }
 
@@ -588,7 +586,10 @@ fn verify_apple_cert_chain(x5c: &[Vec<u8>]) -> Result<(), String> {
         .map_err(|e| format!("intermediate not signed by Apple root: {e}"))?;
 
     if !last.validity().is_valid() {
-        return Err(format!("certificate at index {} has expired or is not yet valid", last_idx).into());
+        return Err(format!(
+            "certificate at index {} has expired or is not yet valid",
+            last_idx
+        ));
     }
 
     Ok(())
@@ -607,8 +608,8 @@ fn verify_attestation_nonce(
     use x509_parser::der_parser::parse_der;
 
     // Apple App Attest nonce OID: 1.2.840.113635.100.8.2
-    let nonce_oid = x509_parser::oid_registry::Oid::from(&[1, 2, 840, 113635, 100, 8, 2])
-        .expect("invalid OID");
+    let nonce_oid =
+        x509_parser::oid_registry::Oid::from(&[1, 2, 840, 113635, 100, 8, 2]).expect("invalid OID");
 
     let ext = cert
         .get_extension_unique(&nonce_oid)
@@ -618,15 +619,15 @@ fn verify_attestation_nonce(
     let ext_value = ext.value;
 
     // Parse the DER-encoded extension value
-    let (_, parsed) = parse_der(ext_value)
-        .map_err(|e| format!("failed to parse nonce extension ASN.1: {e}"))?;
+    let (_, parsed) =
+        parse_der(ext_value).map_err(|e| format!("failed to parse nonce extension ASN.1: {e}"))?;
 
     // Walk the ASN.1 structure to extract the OCTET STRING containing the nonce.
     // Expected: SEQUENCE { SET/SEQUENCE { ... OCTET STRING } }
     // We recursively descend into constructed types (SEQUENCE/SET/context-tagged)
     // until we find the first OCTET STRING.
-    let nonce_from_cert = find_octet_string(&parsed)
-        .ok_or("nonce extension does not contain an OCTET STRING")?;
+    let nonce_from_cert =
+        find_octet_string(&parsed).ok_or("nonce extension does not contain an OCTET STRING")?;
 
     if nonce_from_cert != expected_nonce {
         return Err("attestation nonce mismatch".into());
@@ -722,7 +723,11 @@ fn get_cbor_array_of_bytes(
                         match item {
                             ciborium::Value::Bytes(b) => certs.push(b.clone()),
                             _ => {
-                                tracing::error!(index = i, key = key, "x5c element is not bytes, rejecting");
+                                tracing::error!(
+                                    index = i,
+                                    key = key,
+                                    "x5c element is not bytes, rejecting"
+                                );
                                 return None;
                             }
                         }

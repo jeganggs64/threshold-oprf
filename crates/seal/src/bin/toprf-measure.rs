@@ -105,9 +105,7 @@ async fn main() {
         println!("chip_id:     {chip_id_hex}");
         println!("version:     {}", report.version);
         println!("vmpl:        {}", report.vmpl);
-        println!(
-            "tcb:         bl={bl} tee={tee} snp={snp} ucode={ucode}"
-        );
+        println!("tcb:         bl={bl} tee={tee} snp={snp} ucode={ucode}");
         println!(
             "build:       {}.{}.{}",
             report.current_major, report.current_minor, report.current_build

@@ -24,13 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use axum::extract::DefaultBodyLimit;
 use axum::{Json, Router};
-use subtle::ConstantTimeEq;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -98,8 +98,12 @@ impl Default for RateLimitConfig {
     }
 }
 
-fn default_per_hour() -> u32 { 10 }
-fn default_per_day() -> u32 { 30 }
+fn default_per_hour() -> u32 {
+    10
+}
+fn default_per_day() -> u32 {
+    30
+}
 
 // -- Application state --
 
@@ -400,11 +404,10 @@ async fn evaluate(
     }
 
     // -- 3. Validate blinded point --
-    let blinded_point = hex_to_point(&req.blinded_point)
-        .map_err(|e| {
-            warn!(error = %e, "invalid blinded_point from client");
-            (StatusCode::BAD_REQUEST, "invalid blinded_point".to_string())
-        })?;
+    let blinded_point = hex_to_point(&req.blinded_point).map_err(|e| {
+        warn!(error = %e, "invalid blinded_point from client");
+        (StatusCode::BAD_REQUEST, "invalid blinded_point".to_string())
+    })?;
 
     let threshold = state.config.threshold as usize;
 
@@ -428,15 +431,13 @@ async fn evaluate(
                 .await;
 
             match resp {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<PartialEvaluation>().await {
-                        Ok(partial) => Ok((node_id, partial)),
-                        Err(e) => {
-                            eprintln!("node {node_id}: bad response: {e}");
-                            Err((node_id, "bad response from node".to_string()))
-                        }
+                Ok(r) if r.status().is_success() => match r.json::<PartialEvaluation>().await {
+                    Ok(partial) => Ok((node_id, partial)),
+                    Err(e) => {
+                        eprintln!("node {node_id}: bad response: {e}");
+                        Err((node_id, "bad response from node".to_string()))
                     }
-                }
+                },
                 Ok(r) => {
                     let status = r.status();
                     let body = r.bytes().await.unwrap_or_default();
@@ -462,10 +463,17 @@ async fn evaluate(
         match result {
             Ok(Ok((expected_node_id, partial))) => {
                 if partial.node_id != expected_node_id {
-                    warn!(expected = expected_node_id, got = partial.node_id, "node returned wrong node_id");
+                    warn!(
+                        expected = expected_node_id,
+                        got = partial.node_id,
+                        "node returned wrong node_id"
+                    );
                     errors.push((expected_node_id, "node_id mismatch in response".into()));
                 } else if !seen_node_ids.insert(partial.node_id) {
-                    warn!(node_id = partial.node_id, "duplicate node_id in partials, skipping");
+                    warn!(
+                        node_id = partial.node_id,
+                        "duplicate node_id in partials, skipping"
+                    );
                 } else {
                     info!(node_id = partial.node_id, "received partial evaluation");
                     partials.push(partial);
@@ -510,7 +518,10 @@ async fn evaluate(
             .iter()
             .find(|n| n.node_id == partial.node_id)
             .ok_or_else(|| {
-                error!(node_id = partial.node_id, "received partial from unknown node");
+                error!(
+                    node_id = partial.node_id,
+                    "received partial from unknown node"
+                );
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal configuration error".to_string(),
@@ -663,14 +674,12 @@ async fn main() {
     }
 
     // Build HTTP client for node communication — with optional mTLS
-    let mut client_builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10));
+    let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
 
     if let Some(ca_cert_path) = &config.node_ca_cert {
         let ca_pem = std::fs::read(ca_cert_path)
             .unwrap_or_else(|e| panic!("failed to read CA cert {ca_cert_path}: {e}"));
-        let ca_cert = reqwest::Certificate::from_pem(&ca_pem)
-            .expect("invalid CA certificate PEM");
+        let ca_cert = reqwest::Certificate::from_pem(&ca_pem).expect("invalid CA certificate PEM");
         client_builder = client_builder
             .add_root_certificate(ca_cert)
             .tls_built_in_root_certs(false); // Only trust our CA for node connections
@@ -754,10 +763,9 @@ async fn main() {
             let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
                 .collect::<Result<Vec<_>, _>>()
                 .expect("failed to parse server certificate PEM");
-            let private_key =
-                rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
-                    .expect("failed to parse server private key PEM")
-                    .expect("no private key found in PEM file");
+            let private_key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+                .expect("failed to parse server private key PEM")
+                .expect("no private key found in PEM file");
 
             let mut rustls_config = rustls::ServerConfig::builder()
                 .with_no_client_auth()

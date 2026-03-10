@@ -24,13 +24,16 @@ use crate::TOPRFError;
 /// Hash an identity input (nationality + personalNumber) to a secp256k1 curve point.
 ///
 /// Matches the JS `hashToCurve(nationality, personalNumber)` function exactly.
-pub fn hash_to_curve(nationality: &str, personal_number: &str) -> Result<ProjectivePoint, TOPRFError> {
+pub fn hash_to_curve(
+    nationality: &str,
+    personal_number: &str,
+) -> Result<ProjectivePoint, TOPRFError> {
     for ctr in 0u8..=255 {
         let mut hasher = Sha256::new();
         hasher.update(b"RuonOPRF-v1");
         let nat_len = u32::try_from(nationality.len())
             .map_err(|_| TOPRFError::InvalidInput("nationality too long".into()))?;
-        hasher.update(&nat_len.to_be_bytes());
+        hasher.update(nat_len.to_be_bytes());
         hasher.update(nationality.as_bytes());
         hasher.update(personal_number.as_bytes());
         hasher.update([ctr]);
@@ -41,7 +44,7 @@ pub fn hash_to_curve(nationality: &str, personal_number: &str) -> Result<Project
         compressed[0] = 0x02;
         compressed[1..].copy_from_slice(&hash);
 
-        let encoded = match EncodedPoint::from_bytes(&compressed) {
+        let encoded = match EncodedPoint::from_bytes(compressed) {
             Ok(ep) => ep,
             Err(_) => continue,
         };

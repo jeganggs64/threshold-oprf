@@ -11,8 +11,8 @@ use k256::elliptic_curve::ops::Reduce;
 use k256::elliptic_curve::Group;
 use k256::{ProjectivePoint, Scalar, U256};
 
-use crate::types::{NodeId, PartialEvaluation, TOPRFError};
 use crate::hex_to_point;
+use crate::types::{NodeId, PartialEvaluation, TOPRFError};
 
 /// Compute the Lagrange coefficient for node `node_id` given the set of
 /// participating node IDs, evaluated at x=0.
@@ -23,8 +23,11 @@ use crate::hex_to_point;
 ///   λ_i = ∏_{j∈S,j≠i} (-j) / (i-j) = ∏ j/(j-i)
 ///
 /// All arithmetic is modulo the secp256k1 curve order.
-pub fn lagrange_coefficient(node_id: NodeId, participant_ids: &[NodeId]) -> Result<Scalar, TOPRFError> {
-    if node_id == 0 || participant_ids.iter().any(|&id| id == 0) {
+pub fn lagrange_coefficient(
+    node_id: NodeId,
+    participant_ids: &[NodeId],
+) -> Result<Scalar, TOPRFError> {
+    if node_id == 0 || participant_ids.contains(&0) {
         return Err(TOPRFError::InvalidInput("node_id must be nonzero".into()));
     }
     let xi = scalar_from_u16(node_id);
@@ -43,7 +46,9 @@ pub fn lagrange_coefficient(node_id: NodeId, participant_ids: &[NodeId]) -> Resu
         // den_inv = den^{-1} mod order
         let den_inv = den.invert();
         if bool::from(den_inv.is_none()) {
-            return Err(TOPRFError::InvalidInput("duplicate node IDs cause zero denominator".into()));
+            return Err(TOPRFError::InvalidInput(
+                "duplicate node IDs cause zero denominator".into(),
+            ));
         }
 
         coeff = coeff * num * den_inv.unwrap();
@@ -69,7 +74,10 @@ pub fn combine_partials(
             return Err(TOPRFError::InvalidInput("node_id must be nonzero".into()));
         }
         if !seen_ids.insert(p.node_id) {
-            return Err(TOPRFError::InvalidInput(format!("duplicate node_id: {}", p.node_id)));
+            return Err(TOPRFError::InvalidInput(format!(
+                "duplicate node_id: {}",
+                p.node_id
+            )));
         }
     }
 
@@ -85,9 +93,7 @@ pub fn combine_partials(
         let vs = verification_shares
             .iter()
             .find(|(id, _)| *id == partial.node_id)
-            .ok_or_else(|| {
-                TOPRFError::DLEQVerificationFailed(partial.node_id)
-            })?;
+            .ok_or(TOPRFError::DLEQVerificationFailed(partial.node_id))?;
 
         crate::partial_eval::verify_partial(partial, blinded_point, &vs.1)?;
     }
@@ -101,11 +107,13 @@ pub fn combine_partials(
     for partial in partials {
         let lambda = lagrange_coefficient(partial.node_id, &participant_ids)?;
         let partial_point = hex_to_point(&partial.partial_point)?;
-        result = result + (partial_point * lambda);
+        result += partial_point * lambda;
     }
 
     if bool::from(result.is_identity()) {
-        return Err(TOPRFError::InvalidInput("combined result is identity point".into()));
+        return Err(TOPRFError::InvalidInput(
+            "combined result is identity point".into(),
+        ));
     }
 
     Ok(result)
@@ -223,7 +231,7 @@ mod tests {
             .collect();
 
         // Use shares 0, 2, 4 (nodes 1, 3, 5)
-        let subset = vec![0usize, 2, 4];
+        let subset = [0usize, 2, 4];
         let partials: Vec<PartialEvaluation> = subset
             .iter()
             .map(|&i| {
@@ -250,7 +258,7 @@ mod tests {
 
         // Use a known secret
         let secret = Scalar::from(12345u64);
-        let expected = &blinded_point * &secret;
+        let expected = blinded_point * secret;
 
         // Split into 2-of-3
         // Use a deterministic polynomial: f(x) = secret + coeff*x
@@ -264,34 +272,49 @@ mod tests {
         let share3 = secret + coeff * Scalar::from(3u64);
 
         // Partial evaluations: E_i = share_i * B
-        let e1 = &blinded_point * &share1;
-        let e2 = &blinded_point * &share2;
-        let e3 = &blinded_point * &share3;
+        let e1 = blinded_point * share1;
+        let e2 = blinded_point * share2;
+        let e3 = blinded_point * share3;
 
         // Combine nodes {1, 2}
         let ids_12: Vec<u16> = vec![1, 2];
         let l1_12 = lagrange_coefficient(1, &ids_12).unwrap();
         let l2_12 = lagrange_coefficient(2, &ids_12).unwrap();
         let combined_12 = e1 * l1_12 + e2 * l2_12;
-        assert_eq!(point_to_hex(&combined_12), point_to_hex(&expected), "nodes 1,2 mismatch");
+        assert_eq!(
+            point_to_hex(&combined_12),
+            point_to_hex(&expected),
+            "nodes 1,2 mismatch"
+        );
 
         // Combine nodes {1, 3}
         let ids_13: Vec<u16> = vec![1, 3];
         let l1_13 = lagrange_coefficient(1, &ids_13).unwrap();
         let l3_13 = lagrange_coefficient(3, &ids_13).unwrap();
         let combined_13 = e1 * l1_13 + e3 * l3_13;
-        assert_eq!(point_to_hex(&combined_13), point_to_hex(&expected), "nodes 1,3 mismatch");
+        assert_eq!(
+            point_to_hex(&combined_13),
+            point_to_hex(&expected),
+            "nodes 1,3 mismatch"
+        );
 
         // Combine nodes {2, 3}
         let ids_23: Vec<u16> = vec![2, 3];
         let l2_23 = lagrange_coefficient(2, &ids_23).unwrap();
         let l3_23 = lagrange_coefficient(3, &ids_23).unwrap();
         let combined_23 = e2 * l2_23 + e3 * l3_23;
-        assert_eq!(point_to_hex(&combined_23), point_to_hex(&expected), "nodes 2,3 mismatch");
+        assert_eq!(
+            point_to_hex(&combined_23),
+            point_to_hex(&expected),
+            "nodes 2,3 mismatch"
+        );
 
         // Print test vectors for TypeScript verification
         println!("\n=== CROSS-LANGUAGE TEST VECTORS ===");
-        println!("hash_to_curve(\"SG\", \"S1234567A\") = {}", point_to_hex(&h));
+        println!(
+            "hash_to_curve(\"SG\", \"S1234567A\") = {}",
+            point_to_hex(&h)
+        );
         println!("blinded_point (42 * H) = {}", point_to_hex(&blinded_point));
         println!("expected (secret * B) = {}", point_to_hex(&expected));
         println!("partial_1 (node 1) = {}", point_to_hex(&e1));

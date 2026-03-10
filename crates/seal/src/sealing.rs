@@ -52,7 +52,11 @@ const AAD_SIZE: usize = 100;
 ///   info = "snp-seal-v1-aes256gcm-key"
 /// )
 /// ```
-pub fn derive_sealing_key(measurement: &[u8; 48], policy: u64, salt: &[u8; SALT_SIZE]) -> Zeroizing<[u8; 32]> {
+pub fn derive_sealing_key(
+    measurement: &[u8; 48],
+    policy: u64,
+    salt: &[u8; SALT_SIZE],
+) -> Zeroizing<[u8; 32]> {
     let mut ikm = Vec::with_capacity(56);
     ikm.extend_from_slice(measurement);
     ikm.extend_from_slice(&policy.to_le_bytes());
@@ -68,11 +72,7 @@ pub fn derive_sealing_key(measurement: &[u8; 48], policy: u64, salt: &[u8; SALT_
 ///
 /// Returns the full sealed blob: header (112 bytes) + ciphertext (includes
 /// the 16-byte GCM authentication tag).
-pub fn seal(
-    plaintext: &[u8],
-    measurement: &[u8; 48],
-    policy: u64,
-) -> Result<Vec<u8>, SealError> {
+pub fn seal(plaintext: &[u8], measurement: &[u8; 48], policy: u64) -> Result<Vec<u8>, SealError> {
     // Generate a random 32-byte salt for HKDF
     let mut salt = [0u8; SALT_SIZE];
     OsRng.fill_bytes(&mut salt);
@@ -87,11 +87,11 @@ pub fn seal(
 
     // Build the AAD header (everything except nonce and ciphertext)
     let mut header = Vec::with_capacity(AAD_SIZE);
-    header.extend_from_slice(MAGIC);                        // 8 bytes
-    header.extend_from_slice(&SEAL_VERSION.to_le_bytes());  // 4 bytes
-    header.extend_from_slice(measurement);                  // 48 bytes
-    header.extend_from_slice(&policy.to_le_bytes());        // 8 bytes
-    header.extend_from_slice(&salt);                        // 32 bytes
+    header.extend_from_slice(MAGIC); // 8 bytes
+    header.extend_from_slice(&SEAL_VERSION.to_le_bytes()); // 4 bytes
+    header.extend_from_slice(measurement); // 48 bytes
+    header.extend_from_slice(&policy.to_le_bytes()); // 8 bytes
+    header.extend_from_slice(&salt); // 32 bytes
     debug_assert_eq!(header.len(), AAD_SIZE);
 
     // Encrypt with AAD binding the header to the ciphertext
@@ -107,9 +107,9 @@ pub fn seal(
 
     // Assemble the sealed blob: header + nonce + ciphertext
     let mut blob = Vec::with_capacity(HEADER_SIZE + ciphertext.len());
-    blob.extend_from_slice(&header);       // 100 bytes (AAD)
-    blob.extend_from_slice(&nonce_bytes);  // 12 bytes
-    blob.extend_from_slice(&ciphertext);   // variable
+    blob.extend_from_slice(&header); // 100 bytes (AAD)
+    blob.extend_from_slice(&nonce_bytes); // 12 bytes
+    blob.extend_from_slice(&ciphertext); // variable
 
     debug_assert_eq!(blob.len(), HEADER_SIZE + ciphertext.len());
     Ok(blob)
@@ -170,7 +170,9 @@ pub fn unseal(
     let aad = &sealed_blob[..AAD_SIZE];
 
     // Extract nonce (at offset 100, length 12)
-    let nonce_bytes: [u8; NONCE_SIZE] = sealed_blob[AAD_SIZE..AAD_SIZE + NONCE_SIZE].try_into().unwrap();
+    let nonce_bytes: [u8; NONCE_SIZE] = sealed_blob[AAD_SIZE..AAD_SIZE + NONCE_SIZE]
+        .try_into()
+        .unwrap();
 
     // Ciphertext is everything after the header
     let ciphertext = &sealed_blob[HEADER_SIZE..];
@@ -193,9 +195,12 @@ pub fn unseal(
                 aad,
             },
         )
-        .map_err(|_| SealError::UnsealingFailed(
-            "AES-GCM decryption failed — measurement or policy mismatch, or data corrupted".into(),
-        ))?;
+        .map_err(|_| {
+            SealError::UnsealingFailed(
+                "AES-GCM decryption failed — measurement or policy mismatch, or data corrupted"
+                    .into(),
+            )
+        })?;
 
     Ok(plaintext)
 }
@@ -245,7 +250,11 @@ const V2_AAD_SIZE: usize = 20;
 ///
 /// The sealed blob can ONLY be decrypted on the SAME physical chip
 /// running the SAME software stack.
-pub fn seal_derived(plaintext: &[u8], derived_key: &[u8; 32], field_select: u64) -> Result<Vec<u8>, SealError> {
+pub fn seal_derived(
+    plaintext: &[u8],
+    derived_key: &[u8; 32],
+    field_select: u64,
+) -> Result<Vec<u8>, SealError> {
     let key = Key::<Aes256Gcm>::from_slice(derived_key);
     let cipher = Aes256Gcm::new(key);
 
@@ -255,9 +264,9 @@ pub fn seal_derived(plaintext: &[u8], derived_key: &[u8; 32], field_select: u64)
 
     // Build the AAD header: magic + version + field_select
     let mut aad = Vec::with_capacity(V2_AAD_SIZE);
-    aad.extend_from_slice(MAGIC);                             // 8 bytes
-    aad.extend_from_slice(&V2_SEAL_VERSION.to_le_bytes());    // 4 bytes
-    aad.extend_from_slice(&field_select.to_le_bytes());       // 8 bytes
+    aad.extend_from_slice(MAGIC); // 8 bytes
+    aad.extend_from_slice(&V2_SEAL_VERSION.to_le_bytes()); // 4 bytes
+    aad.extend_from_slice(&field_select.to_le_bytes()); // 8 bytes
     debug_assert_eq!(aad.len(), V2_AAD_SIZE);
 
     // Encrypt with AAD binding the header to the ciphertext
@@ -273,9 +282,9 @@ pub fn seal_derived(plaintext: &[u8], derived_key: &[u8; 32], field_select: u64)
 
     // Assemble the sealed blob: aad(20) + nonce(12) + ciphertext
     let mut blob = Vec::with_capacity(V2_HEADER_SIZE + ciphertext.len());
-    blob.extend_from_slice(&aad);          // 20 bytes (AAD)
-    blob.extend_from_slice(&nonce_bytes);  // 12 bytes
-    blob.extend_from_slice(&ciphertext);   // variable
+    blob.extend_from_slice(&aad); // 20 bytes (AAD)
+    blob.extend_from_slice(&nonce_bytes); // 12 bytes
+    blob.extend_from_slice(&ciphertext); // variable
 
     debug_assert_eq!(blob.len(), V2_HEADER_SIZE + ciphertext.len());
     Ok(blob)
@@ -337,9 +346,11 @@ pub fn unseal_derived(sealed_blob: &[u8], derived_key: &[u8; 32]) -> Result<Vec<
                 aad,
             },
         )
-        .map_err(|_| SealError::UnsealingFailed(
-            "AES-GCM decryption failed — derived key mismatch or data corrupted".into(),
-        ))?;
+        .map_err(|_| {
+            SealError::UnsealingFailed(
+                "AES-GCM decryption failed — derived key mismatch or data corrupted".into(),
+            )
+        })?;
 
     Ok(plaintext)
 }

@@ -25,17 +25,22 @@ const TRANSFER_TIMEOUT_SECS: u64 = 30;
 
 enum StorageUrl {
     File(String),
-    Gcs { bucket: String, object: String },
-    S3 { bucket: String, key: String },
+    Gcs {
+        bucket: String,
+        object: String,
+    },
+    S3 {
+        bucket: String,
+        key: String,
+    },
     /// Azure Blob or plain HTTPS — distinguished at request time by hostname.
     Https(String),
 }
 
 fn classify_url(url: &str) -> Result<StorageUrl, Box<dyn Error>> {
-    if url.starts_with("file://") {
-        Ok(StorageUrl::File(url[7..].to_string()))
-    } else if url.starts_with("gs://") {
-        let path = &url[5..];
+    if let Some(path) = url.strip_prefix("file://") {
+        Ok(StorageUrl::File(path.to_string()))
+    } else if let Some(path) = url.strip_prefix("gs://") {
         let (bucket, object) = path
             .split_once('/')
             .ok_or("gs:// URL must be gs://bucket/object")?;
@@ -46,8 +51,7 @@ fn classify_url(url: &str) -> Result<StorageUrl, Box<dyn Error>> {
             bucket: bucket.to_string(),
             object: object.to_string(),
         })
-    } else if url.starts_with("s3://") {
-        let path = &url[5..];
+    } else if let Some(path) = url.strip_prefix("s3://") {
         let (bucket, key) = path
             .split_once('/')
             .ok_or("s3:// URL must be s3://bucket/key")?;
@@ -136,11 +140,7 @@ async fn gcp_access_token() -> Result<String, Box<dyn Error>> {
         .await?;
 
     if !resp.status().is_success() {
-        return Err(format!(
-            "GCP metadata token request failed: HTTP {}",
-            resp.status()
-        )
-        .into());
+        return Err(format!("GCP metadata token request failed: HTTP {}", resp.status()).into());
     }
 
     let body: serde_json::Value = resp.json().await?;
@@ -156,9 +156,7 @@ async fn gcs_download(bucket: &str, object: &str) -> Result<Vec<u8>, Box<dyn Err
 
     // URL-encode the object name for the JSON API path
     let encoded = object.replace('/', "%2F");
-    let url = format!(
-        "https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded}?alt=media"
-    );
+    let url = format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded}?alt=media");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS))
@@ -295,7 +293,11 @@ async fn azure_download(url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
 }
 
 async fn azure_upload(url: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
-    info!(url = display_url(url), size = data.len(), "azure: uploading blob");
+    info!(
+        url = display_url(url),
+        size = data.len(),
+        "azure: uploading blob"
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -335,8 +337,7 @@ struct AwsCredentials {
 }
 
 /// Fetch temporary credentials and region from EC2 instance metadata (IMDSv2).
-async fn aws_get_credentials_and_region(
-) -> Result<(AwsCredentials, String), Box<dyn Error>> {
+async fn aws_get_credentials_and_region() -> Result<(AwsCredentials, String), Box<dyn Error>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(METADATA_TIMEOUT_SECS))
         .build()?;
@@ -475,10 +476,7 @@ fn sigv4_headers(
     // Build canonical headers (must be sorted by header name)
     let mut signed = BTreeMap::new();
     signed.insert("host".to_string(), host.to_string());
-    signed.insert(
-        "x-amz-content-sha256".to_string(),
-        payload_hash.clone(),
-    );
+    signed.insert("x-amz-content-sha256".to_string(), payload_hash.clone());
     signed.insert("x-amz-date".to_string(), amz_date.clone());
     if let Some(ref token) = creds.session_token {
         signed.insert("x-amz-security-token".to_string(), token.clone());
@@ -486,8 +484,7 @@ fn sigv4_headers(
 
     let signed_headers_str: String = signed.keys().cloned().collect::<Vec<_>>().join(";");
 
-    let canonical_headers: String =
-        signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
+    let canonical_headers: String = signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
 
     let canonical_request = format!(
         "{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers_str}\n{payload_hash}"
@@ -522,8 +519,7 @@ fn sigv4_headers(
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC can accept any key length");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can accept any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
@@ -755,7 +751,9 @@ mod tests {
 
     #[test]
     fn test_sas_token_detection() {
-        assert!(has_sas_token("https://a.blob.core.windows.net/c/b?sig=abc&se=2025"));
+        assert!(has_sas_token(
+            "https://a.blob.core.windows.net/c/b?sig=abc&se=2025"
+        ));
         assert!(!has_sas_token("https://a.blob.core.windows.net/c/b"));
     }
 

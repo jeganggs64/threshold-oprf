@@ -15,7 +15,9 @@ use std::process;
 use toprf_seal::sealing;
 
 fn print_help() {
-    eprintln!("Usage: toprf-seal --share <PATH> --measurement <HEX> --policy <U64> --output <PATH>");
+    eprintln!(
+        "Usage: toprf-seal --share <PATH> --measurement <HEX> --policy <U64> --output <PATH>"
+    );
     eprintln!();
     eprintln!("Seals a node key share file (as produced by toprf-keygen) so it can");
     eprintln!("only be decrypted by a VM with the given measurement.");
@@ -181,7 +183,11 @@ fn main() {
         process::exit(1);
     }
 
-    eprintln!("sealed {} bytes -> {} bytes", share_bytes.len(), sealed.len());
+    eprintln!(
+        "sealed {} bytes -> {} bytes",
+        share_bytes.len(),
+        sealed.len()
+    );
     eprintln!("measurement: {measurement_hex}");
     eprintln!("policy:      {policy}");
     eprintln!("output:      {output_path}");

@@ -191,7 +191,7 @@ mod tests {
         // current_tcb per AMD spec (Table 3, TCB_VERSION):
         //   byte 0 = bl=0x03, byte 1 = tee=0x00, bytes 2-5 = reserved,
         //   byte 6 = snp=0x14, byte 7 = ucode=0x93
-        let tcb: u64 = 0x03 | (0x00 << 8) | (0x14_u64 << 48) | (0x93_u64 << 56);
+        let tcb: u64 = 0x03 | (0x14_u64 << 48) | (0x93_u64 << 56);
         report[0x038..0x040].copy_from_slice(&tcb.to_le_bytes());
         // platform_info
         report[0x040..0x048].copy_from_slice(&0x01u64.to_le_bytes());

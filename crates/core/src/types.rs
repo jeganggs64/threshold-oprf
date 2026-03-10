@@ -136,13 +136,15 @@ pub fn point_to_hex(point: &ProjectivePoint) -> String {
 /// Decode a compressed hex point (66 hex chars) to ProjectivePoint.
 pub fn hex_to_point(h: &str) -> Result<ProjectivePoint, TOPRFError> {
     let bytes = hex::decode(h).map_err(|e| TOPRFError::InvalidPoint(e.to_string()))?;
-    let encoded = EncodedPoint::from_bytes(&bytes)
-        .map_err(|e| TOPRFError::InvalidPoint(e.to_string()))?;
+    let encoded =
+        EncodedPoint::from_bytes(&bytes).map_err(|e| TOPRFError::InvalidPoint(e.to_string()))?;
     let affine = AffinePoint::from_encoded_point(&encoded);
     if affine.is_some().into() {
         let point = ProjectivePoint::from(affine.unwrap());
         if bool::from(point.is_identity()) {
-            return Err(TOPRFError::InvalidInput("identity point not allowed".into()));
+            return Err(TOPRFError::InvalidInput(
+                "identity point not allowed".into(),
+            ));
         }
         Ok(point)
     } else {
@@ -154,7 +156,7 @@ pub fn hex_to_point(h: &str) -> Result<ProjectivePoint, TOPRFError> {
 pub fn scalar_to_hex(s: &Scalar) -> String {
     use zeroize::Zeroizing;
     let bytes = Zeroizing::new(s.to_bytes());
-    hex::encode(bytes.as_slice())
+    hex::encode(&bytes[..])
 }
 
 /// Decode a hex string (64 hex chars) to Scalar.

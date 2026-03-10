@@ -24,12 +24,12 @@ use zeroize::Zeroizing;
 /// Other fields (GUEST_POLICY, IMAGE_ID, FAMILY_ID, GUEST_SVN)
 /// may change between boots or deployments, causing the derived
 /// key to change and sealed blobs to become undecryptable.
-pub const FIELD_GUEST_POLICY: u64  = 1 << 0;
-pub const FIELD_IMAGE_ID: u64      = 1 << 1;
-pub const FIELD_FAMILY_ID: u64     = 1 << 2;
-pub const FIELD_MEASUREMENT: u64   = 1 << 3;
-pub const FIELD_GUEST_SVN: u64     = 1 << 4;
-pub const FIELD_TCB_VERSION: u64   = 1 << 5;
+pub const FIELD_GUEST_POLICY: u64 = 1 << 0;
+pub const FIELD_IMAGE_ID: u64 = 1 << 1;
+pub const FIELD_FAMILY_ID: u64 = 1 << 2;
+pub const FIELD_MEASUREMENT: u64 = 1 << 3;
+pub const FIELD_GUEST_SVN: u64 = 1 << 4;
+pub const FIELD_TCB_VERSION: u64 = 1 << 5;
 
 /// Safe field selector for sealing: MEASUREMENT + TCB_VERSION only.
 /// These are stable across reboots on the same chip with the same image.
@@ -90,14 +90,14 @@ pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealErr
 
     #[repr(C)]
     struct SnpDerivedKeyReq {
-        root_key_select: u32,    // 0 = VCEK (chip-specific), 1 = VMRK
+        root_key_select: u32, // 0 = VCEK (chip-specific), 1 = VMRK
         reserved: u32,
         guest_field_select: u64, // Bitmask of fields to mix into key derivation
     }
 
     #[repr(C)]
     struct SnpDerivedKeyResp {
-        data: [u8; 64],          // Derived key (we use first 32 bytes for AES-256)
+        data: [u8; 64], // Derived key (we use first 32 bytes for AES-256)
     }
 
     #[repr(C)]
@@ -120,9 +120,7 @@ pub fn get_derived_key(field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealErr
             reserved: 0,
             guest_field_select: field_select,
         },
-        resp: SnpDerivedKeyResp {
-            data: [0u8; 64],
-        },
+        resp: SnpDerivedKeyResp { data: [0u8; 64] },
         fw_err: 0,
     };
 
@@ -304,7 +302,8 @@ async fn get_report_gcp_metadata(report_data: Option<&[u8; 64]>) -> Result<SnpRe
         .map_err(|e| SealError::ProviderError(format!("failed to read GCP response: {e}")))?;
 
     // Try JSON first: {"report": "<base64>"}
-    let raw_report = if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+    let raw_report = if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+    {
         if let Some(report_b64) = json_val.get("report").and_then(|v| v.as_str()) {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD

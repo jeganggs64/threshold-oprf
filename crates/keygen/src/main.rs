@@ -6,19 +6,23 @@
 //!    admin shares (3-of-5) for offline vault storage AND node shares
 //!    (2-of-3) for loading into TEEs.
 //!
+//!    ```sh
 //!    toprf-keygen init \
-//!      --admin-threshold 3 --admin-shares 5 \
-//!      --node-threshold 2 --node-shares 3 \
-//!      --output-dir ./ceremony
+//!        --admin-threshold 3 --admin-shares 5 \
+//!        --node-threshold 2 --node-shares 3 \
+//!        --output-dir ./ceremony
+//!    ```
 //!
 //! 2. **Node-shares ceremony** — admins bring their shares, reconstruct
 //!    the key, and produce new node shares for new TEEs. Used for
 //!    infrastructure migration.
 //!
+//!    ```sh
 //!    toprf-keygen node-shares \
-//!      --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
-//!      --node-threshold 2 --node-shares 3 \
-//!      --output-dir ./new-node-shares
+//!        --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
+//!        --node-threshold 2 --node-shares 3 \
+//!        --output-dir ./new-node-shares
+//!    ```
 //!
 //! SECURITY:
 //!   - Run on an air-gapped machine.
@@ -41,8 +45,8 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use toprf_core::shamir::{split_key, share_to_scalar};
 use toprf_core::combine::lagrange_coefficient;
+use toprf_core::shamir::{share_to_scalar, split_key};
 use toprf_core::{point_to_hex, NodeKeyShare};
 
 /// Write a file containing secret key material with restrictive permissions (0600).
@@ -103,11 +107,26 @@ fn cmd_init(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--admin-threshold" => { i += 1; admin_threshold = args[i].parse().expect("invalid admin-threshold"); }
-            "--admin-shares" => { i += 1; admin_total = args[i].parse().expect("invalid admin-shares"); }
-            "--node-threshold" => { i += 1; node_threshold = args[i].parse().expect("invalid node-threshold"); }
-            "--node-shares" => { i += 1; node_total = args[i].parse().expect("invalid node-shares"); }
-            "--output-dir" | "-o" => { i += 1; output_dir = args[i].to_string(); }
+            "--admin-threshold" => {
+                i += 1;
+                admin_threshold = args[i].parse().expect("invalid admin-threshold");
+            }
+            "--admin-shares" => {
+                i += 1;
+                admin_total = args[i].parse().expect("invalid admin-shares");
+            }
+            "--node-threshold" => {
+                i += 1;
+                node_threshold = args[i].parse().expect("invalid node-threshold");
+            }
+            "--node-shares" => {
+                i += 1;
+                node_total = args[i].parse().expect("invalid node-shares");
+            }
+            "--output-dir" | "-o" => {
+                i += 1;
+                output_dir = args[i].to_string();
+            }
             "--existing-key-file" => {
                 i += 1;
                 let path = &args[i];
@@ -145,9 +164,15 @@ fn cmd_init(args: &[String]) {
     }
 
     assert!(admin_threshold >= 2, "admin threshold must be >= 2");
-    assert!(admin_total >= admin_threshold, "admin shares must be >= admin threshold");
+    assert!(
+        admin_total >= admin_threshold,
+        "admin shares must be >= admin threshold"
+    );
     assert!(node_threshold >= 2, "node threshold must be >= 2");
-    assert!(node_total >= node_threshold, "node shares must be >= node threshold");
+    assert!(
+        node_total >= node_threshold,
+        "node shares must be >= node threshold"
+    );
 
     // Generate or use existing key
     let secret = Zeroizing::new(match existing_key {
@@ -176,8 +201,8 @@ fn cmd_init(args: &[String]) {
 
     // -- Admin shares (3-of-5) --
     eprintln!("[*] Splitting into {admin_threshold}-of-{admin_total} admin shares...");
-    let admin_result = split_key(&*secret, admin_threshold, admin_total)
-        .expect("admin key split failed");
+    let admin_result =
+        split_key(&secret, admin_threshold, admin_total).expect("admin key split failed");
 
     let admin_dir = out_path.join("admin-shares");
     fs::create_dir_all(&admin_dir).expect("failed to create admin-shares directory");
@@ -198,8 +223,8 @@ fn cmd_init(args: &[String]) {
 
     // -- Node shares (2-of-3) --
     eprintln!("[*] Splitting into {node_threshold}-of-{node_total} node shares...");
-    let node_result = split_key(&*secret, node_threshold, node_total)
-        .expect("node key split failed");
+    let node_result =
+        split_key(&secret, node_threshold, node_total).expect("node key split failed");
 
     let node_dir = out_path.join("node-shares");
     fs::create_dir_all(&node_dir).expect("failed to create node-shares directory");
@@ -247,8 +272,12 @@ fn cmd_init(args: &[String]) {
 
     eprintln!();
     eprintln!("[*] Ceremony fingerprint: {fingerprint}");
-    eprintln!("[*] Admin shares: {admin_threshold}-of-{admin_total} — store in physically secure vaults");
-    eprintln!("[*] Node shares: {node_threshold}-of-{node_total} — load into TEEs over attested TLS");
+    eprintln!(
+        "[*] Admin shares: {admin_threshold}-of-{admin_total} — store in physically secure vaults"
+    );
+    eprintln!(
+        "[*] Node shares: {node_threshold}-of-{node_total} — load into TEEs over attested TLS"
+    );
     eprintln!();
     eprintln!("[!] DESTROY THIS MACHINE. The secret key existed in memory during this process.");
 }
@@ -263,18 +292,34 @@ fn cmd_node_shares(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--admin-share" | "-a" => { i += 1; admin_share_files.push(args[i].to_string()); }
-            "--node-threshold" => { i += 1; node_threshold = args[i].parse().expect("invalid node-threshold"); }
-            "--node-shares" => { i += 1; node_total = args[i].parse().expect("invalid node-shares"); }
-            "--output-dir" | "-o" => { i += 1; output_dir = args[i].to_string(); }
+            "--admin-share" | "-a" => {
+                i += 1;
+                admin_share_files.push(args[i].to_string());
+            }
+            "--node-threshold" => {
+                i += 1;
+                node_threshold = args[i].parse().expect("invalid node-threshold");
+            }
+            "--node-shares" => {
+                i += 1;
+                node_total = args[i].parse().expect("invalid node-shares");
+            }
+            "--output-dir" | "-o" => {
+                i += 1;
+                output_dir = args[i].to_string();
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: toprf-keygen node-shares [OPTIONS]");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -a, --admin-share <F>   Path to an admin share JSON (repeat for each share)");
+                eprintln!(
+                    "  -a, --admin-share <F>   Path to an admin share JSON (repeat for each share)"
+                );
                 eprintln!("  --node-threshold <N>    Node quorum threshold (default: 2)");
                 eprintln!("  --node-shares <N>       Total node shares (default: 3)");
-                eprintln!("  -o, --output-dir <DIR>  Output directory (default: ./new-node-shares)");
+                eprintln!(
+                    "  -o, --output-dir <DIR>  Output directory (default: ./new-node-shares)"
+                );
                 eprintln!("  -h, --help              Show this help");
                 return;
             }
@@ -294,11 +339,14 @@ fn cmd_node_shares(args: &[String]) {
     // Load admin shares
     let mut admin_shares: Vec<NodeKeyShare> = Vec::new();
     for path in &admin_share_files {
-        let json = fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
-        let share: NodeKeyShare = serde_json::from_str(&json)
-            .unwrap_or_else(|e| panic!("failed to parse {path}: {e}"));
-        eprintln!("[*] Loaded admin share {} (node_id={})", path, share.node_id);
+        let json =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        let share: NodeKeyShare =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("failed to parse {path}: {e}"));
+        eprintln!(
+            "[*] Loaded admin share {} (node_id={})",
+            path, share.node_id
+        );
         admin_shares.push(share);
     }
 
@@ -315,23 +363,30 @@ fn cmd_node_shares(args: &[String]) {
     if admin_shares.len() < admin_threshold as usize {
         eprintln!(
             "Error: need at least {} admin shares (got {})",
-            admin_threshold, admin_shares.len()
+            admin_threshold,
+            admin_shares.len()
         );
         std::process::exit(1);
     }
 
     // Reconstruct the secret key via Lagrange interpolation
-    eprintln!("[*] Reconstructing key from {} admin shares (threshold={})...",
-        admin_shares.len(), admin_threshold);
+    eprintln!(
+        "[*] Reconstructing key from {} admin shares (threshold={})...",
+        admin_shares.len(),
+        admin_threshold
+    );
 
     let node_ids: Vec<u16> = admin_shares.iter().map(|s| s.node_id).collect();
     let mut secret = Zeroizing::new(Scalar::ZERO);
     for share in &admin_shares {
-        let scalar = Zeroizing::new(share_to_scalar(share)
-            .unwrap_or_else(|e| panic!("invalid share for admin {}: {e}", share.node_id)));
-        let lambda = lagrange_coefficient(share.node_id, &node_ids)
-            .unwrap_or_else(|e| panic!("lagrange coefficient error for node {}: {e}", share.node_id));
-        *secret = *secret + lambda * *scalar;
+        let scalar = Zeroizing::new(
+            share_to_scalar(share)
+                .unwrap_or_else(|e| panic!("invalid share for admin {}: {e}", share.node_id)),
+        );
+        let lambda = lagrange_coefficient(share.node_id, &node_ids).unwrap_or_else(|e| {
+            panic!("lagrange coefficient error for node {}: {e}", share.node_id)
+        });
+        *secret += lambda * *scalar;
     }
 
     // Verify reconstruction by checking against expected group public key
@@ -342,7 +397,9 @@ fn cmd_node_shares(args: &[String]) {
         eprintln!("FATAL: reconstructed key does not match expected group public key!");
         eprintln!("  Expected: {expected_gpk}");
         eprintln!("  Got:      {reconstructed_pk_hex}");
-        eprintln!("  This likely means the admin shares are corrupted or from different ceremonies.");
+        eprintln!(
+            "  This likely means the admin shares are corrupted or from different ceremonies."
+        );
         std::process::exit(1);
     }
 
@@ -350,11 +407,14 @@ fn cmd_node_shares(args: &[String]) {
 
     // Split into new node shares
     assert!(node_threshold >= 2, "node threshold must be >= 2");
-    assert!(node_total >= node_threshold, "node shares must be >= node threshold");
+    assert!(
+        node_total >= node_threshold,
+        "node shares must be >= node threshold"
+    );
 
     eprintln!("[*] Splitting into {node_threshold}-of-{node_total} node shares...");
-    let node_result = split_key(&*secret, node_threshold, node_total)
-        .expect("node key split failed");
+    let node_result =
+        split_key(&secret, node_threshold, node_total).expect("node key split failed");
 
     // Verify the new split produces the same group public key
     assert_eq!(

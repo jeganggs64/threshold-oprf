@@ -103,7 +103,10 @@ impl AttestationVerifier {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SealError::NetworkError(e.to_string()))?;
-        let resp = client.get(&url).send().await
+        let resp = client
+            .get(&url)
+            .send()
+            .await
             .map_err(|e| SealError::NetworkError(e.to_string()))?;
 
         if !resp.status().is_success() {
@@ -114,7 +117,9 @@ impl AttestationVerifier {
             )));
         }
 
-        let pem_data = resp.bytes().await
+        let pem_data = resp
+            .bytes()
+            .await
             .map_err(|e| SealError::NetworkError(e.to_string()))?;
         if pem_data.len() > 65536 {
             return Err(SealError::NetworkError("response too large (>64KB)".into()));
@@ -137,14 +142,12 @@ impl AttestationVerifier {
 
     /// Verify that `cert_der` was signed by the issuer whose public key is in
     /// `issuer_der`.
-    fn verify_cert_signature(
-        cert_der: &[u8],
-        issuer_der: &[u8],
-    ) -> Result<(), SealError> {
+    fn verify_cert_signature(cert_der: &[u8], issuer_der: &[u8]) -> Result<(), SealError> {
         let (_, cert) = X509Certificate::from_der(cert_der)
             .map_err(|e| SealError::AttestationFailed(format!("failed to parse cert: {e}")))?;
-        let (_, issuer) = X509Certificate::from_der(issuer_der)
-            .map_err(|e| SealError::AttestationFailed(format!("failed to parse issuer cert: {e}")))?;
+        let (_, issuer) = X509Certificate::from_der(issuer_der).map_err(|e| {
+            SealError::AttestationFailed(format!("failed to parse issuer cert: {e}"))
+        })?;
 
         // Verify the certificate is within its validity period
         let now = ASN1Time::now();
@@ -157,7 +160,9 @@ impl AttestationVerifier {
         // Use x509-parser's built-in verify_signature which handles the TBS
         // extraction and signature algorithm correctly
         cert.verify_signature(Some(&issuer.tbs_certificate.subject_pki))
-            .map_err(|e| SealError::AttestationFailed(format!("cert signature verification failed: {e}")))?;
+            .map_err(|e| {
+                SealError::AttestationFailed(format!("cert signature verification failed: {e}"))
+            })?;
 
         Ok(())
     }
@@ -181,10 +186,7 @@ impl AttestationVerifier {
 
     /// Verify the ECDSA-P384-SHA384 signature over the report body using
     /// the VCEK public key.
-    fn verify_signature(
-        report: &SnpReport,
-        vcek_pubkey_bytes: &[u8],
-    ) -> Result<(), SealError> {
+    fn verify_signature(report: &SnpReport, vcek_pubkey_bytes: &[u8]) -> Result<(), SealError> {
         // Parse the P-384 verifying key from the uncompressed point
         let verifying_key = VerifyingKey::from_sec1_bytes(vcek_pubkey_bytes)
             .map_err(|e| SealError::AttestationFailed(format!("invalid VCEK public key: {e}")))?;
@@ -208,7 +210,9 @@ impl AttestationVerifier {
         // the `verify` method with the message (not pre-hashed).
         verifying_key
             .verify(&report.body_bytes, &signature)
-            .map_err(|e| SealError::AttestationFailed(format!("signature verification failed: {e}")))?;
+            .map_err(|e| {
+                SealError::AttestationFailed(format!("signature verification failed: {e}"))
+            })?;
 
         tracing::info!("SNP report signature verified successfully");
         Ok(())

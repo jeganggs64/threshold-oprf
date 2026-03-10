@@ -50,26 +50,26 @@ impl DeviceKeyStore {
     pub fn new_persistent(path: &str) -> Self {
         let path_buf = PathBuf::from(path);
         let store = match std::fs::read_to_string(&path_buf) {
-            Ok(contents) => match serde_json::from_str::<HashMap<String, DeviceKeyEntry>>(
-                &contents,
-            ) {
-                Ok(map) => {
-                    info!(
-                        path = %path_buf.display(),
-                        entries = map.len(),
-                        "loaded device key store from disk"
-                    );
-                    map
+            Ok(contents) => {
+                match serde_json::from_str::<HashMap<String, DeviceKeyEntry>>(&contents) {
+                    Ok(map) => {
+                        info!(
+                            path = %path_buf.display(),
+                            entries = map.len(),
+                            "loaded device key store from disk"
+                        );
+                        map
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %path_buf.display(),
+                            error = %e,
+                            "failed to parse device key store file, starting empty"
+                        );
+                        HashMap::new()
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        path = %path_buf.display(),
-                        error = %e,
-                        "failed to parse device key store file, starting empty"
-                    );
-                    HashMap::new()
-                }
-            },
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 info!(
                     path = %path_buf.display(),
@@ -93,9 +93,17 @@ impl DeviceKeyStore {
         }
     }
 
-    pub fn save_key(&mut self, key_id: &str, public_key_pem: &str, counter: u32) -> Result<(), String> {
+    pub fn save_key(
+        &mut self,
+        key_id: &str,
+        public_key_pem: &str,
+        counter: u32,
+    ) -> Result<(), String> {
         if self.store.len() >= MAX_DEVICES {
-            warn!(max = MAX_DEVICES, "device key store is full, rejecting registration");
+            warn!(
+                max = MAX_DEVICES,
+                "device key store is full, rejecting registration"
+            );
             return Err("device key store capacity exceeded".to_string());
         }
 
