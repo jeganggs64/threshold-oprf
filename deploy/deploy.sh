@@ -15,6 +15,9 @@
 # =============================================================================
 set -euo pipefail
 
+# Add gcloud to PATH if installed via google-cloud-sdk
+[[ -d "$HOME/google-cloud-sdk/bin" ]] && export PATH="$HOME/google-cloud-sdk/bin:$PATH"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -79,6 +82,15 @@ node_ip() {
         2) echo "$NODE2_IP" ;;
         3) echo "$NODE3_IP" ;;
     esac
+}
+
+# Returns space-separated list of node IDs that have an IP configured.
+active_nodes() {
+    local nodes=""
+    [[ -n "${NODE1_IP:-}" ]] && nodes="$nodes 1"
+    [[ -n "${NODE2_IP:-}" ]] && nodes="$nodes 2"
+    [[ -n "${NODE3_IP:-}" ]] && nodes="$nodes 3"
+    echo $nodes
 }
 
 node_snp_provider() {
@@ -152,7 +164,7 @@ step_pull() {
     echo ""
     info "Pulling node image on each VM: ${NODE_IMAGE}"
 
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
@@ -227,7 +239,7 @@ step_setup_vms() {
     echo ""
     info "Setting up VMs (Docker)"
 
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
@@ -274,7 +286,7 @@ step_certs() {
         -days 1095 -subj "/CN=toprf-ca/O=Threshold OPRF/OU=CA" -sha256
 
     # Node certs — SANs include real public IPs so the proxy can verify them
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i cert (SAN: $ip)..."
@@ -335,7 +347,7 @@ EXTEOF
 
     # Distribute certs to VMs
     echo "  Distributing certs to VMs..."
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         echo "    Node $i..."
         scp_to_node "$i" \
             "$CA_DIR/ca.pem" \
@@ -397,7 +409,7 @@ step_init_seal() {
 
     load_ceremony
 
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip provider vs url share
         ip=$(node_ip "$i")
         provider=$(node_snp_provider "$i")
@@ -417,6 +429,7 @@ step_init_seal() {
             -e SNP_PROVIDER=${provider} \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             --device /dev/sev-guest:/dev/sev-guest \
+            --privileged \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --init-seal \
@@ -488,7 +501,7 @@ step_start() {
 
     load_ceremony
 
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip provider vs url
         ip=$(node_ip "$i")
         provider=$(node_snp_provider "$i")
@@ -505,6 +518,7 @@ step_start() {
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             -e SNP_PROVIDER=${provider} \
             --device /dev/sev-guest:/dev/sev-guest \
+            --privileged \
             -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
             ${NODE_IMAGE} \
@@ -529,6 +543,22 @@ step_proxy_config() {
 
     local out="$REPO_ROOT/docker/proxy-config.production.json"
 
+    # Build nodes array dynamically from active nodes
+    local nodes_json=""
+    local first=true
+    for i in $(active_nodes); do
+        local ip=$(node_ip "$i")
+        local vs=$(node_vs "$i")
+        $first || nodes_json+=","
+        nodes_json+="
+    {
+      \"node_id\": $i,
+      \"endpoint\": \"https://${ip}:3001\",
+      \"verification_share\": \"${vs}\"
+    }"
+        first=false
+    done
+
     cat > "$out" <<CFGEOF
 {
   "group_public_key": "${GROUP_PUBLIC_KEY}",
@@ -538,22 +568,7 @@ step_proxy_config() {
   "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
   "proxy_client_cert": "/etc/toprf/certs/proxy/proxy-client.pem",
   "proxy_client_key": "/etc/toprf/certs/proxy/proxy-client.key",
-  "nodes": [
-    {
-      "node_id": 1,
-      "endpoint": "https://${NODE1_IP}:3001",
-      "verification_share": "${VS_1}"
-    },
-    {
-      "node_id": 2,
-      "endpoint": "https://${NODE2_IP}:3001",
-      "verification_share": "${VS_2}"
-    },
-    {
-      "node_id": 3,
-      "endpoint": "https://${NODE3_IP}:3001",
-      "verification_share": "${VS_3}"
-    }
+  "nodes": [${nodes_json}
   ]
 }
 CFGEOF
@@ -576,7 +591,7 @@ step_verify() {
         die "Certs not found at $certs_dir. Run './deploy.sh certs' first."
     fi
 
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
@@ -739,7 +754,7 @@ step_redeploy() {
     echo ""
     info "Redeploying (pull latest image → restart)"
     step_pull
-    for i in 1 2 3; do
+    for i in $(active_nodes); do
         echo "  Restarting node $i..."
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
     done
