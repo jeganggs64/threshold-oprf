@@ -8,10 +8,10 @@
 # Prerequisites:
 #   - Docker installed and running
 #   - nitro-cli installed (available on Nitro-capable EC2 instances)
-#   - Run from the repository root: ./deploy/nitro/build-enclave.sh
+#   - Run from the repository root: ./docker/nitro/build-enclave.sh
 #
 # Usage:
-#   ./deploy/nitro/build-enclave.sh [--tag TAG] [--output DIR]
+#   ./docker/nitro/build-enclave.sh [--tag TAG] [--output DIR]
 # =============================================================================
 set -euo pipefail
 
