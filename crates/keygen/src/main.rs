@@ -12,7 +12,7 @@
 //!    ```
 //!
 //!    Output:
-//!      ceremony/admin-{1..5}.json   ← store in physically secure vaults
+//!    ceremony/admin-{1..5}.json   ← store in physically secure vaults
 //!
 //! 2. **`node-shares`** — repeatable. Admins bring their shares, reconstruct
 //!    the key, and produce node shares (2-of-3) for TEE deployment. Run this
@@ -26,8 +26,8 @@
 //!    ```
 //!
 //!    Output:
-//!      node-shares/node-{1..3}-share.json  ← deploy to TEEs
-//!      node-shares/public-config.json       ← consumed by deploy.sh
+//!    node-shares/node-{1..3}-share.json  ← deploy to TEEs
+//!    node-shares/public-config.json       ← consumed by deploy.sh
 //!
 //! SECURITY:
 //!   - Run on an air-gapped machine.
@@ -143,7 +143,9 @@ fn cmd_init(args: &[String]) {
                 eprintln!("Options:");
                 eprintln!("  --admin-threshold <N>      Admin quorum threshold (default: 3)");
                 eprintln!("  --admin-shares <N>         Total admin shares (default: 5)");
-                eprintln!("  -o, --output-dir <DIR>     Output directory (default: ./admin-shares)");
+                eprintln!(
+                    "  -o, --output-dir <DIR>     Output directory (default: ./admin-shares)"
+                );
                 eprintln!("  --existing-key-file <PATH> Read existing key (hex) from file");
                 eprintln!("  -k, --existing-key <HEX>   Split an existing key (INSECURE — use --existing-key-file)");
                 eprintln!("  -h, --help                 Show this help");

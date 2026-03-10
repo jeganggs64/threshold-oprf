@@ -123,7 +123,7 @@ Three TEE VMs (one per cloud provider) run the node binary. An ECS Fargate servi
 
 ### TEE Node Deployment (`deploy/deploy.sh`)
 
-Builds Docker images on each VM (native amd64), creates storage buckets, generates mTLS certs, handles init-seal key injection, and starts nodes.
+Pulls the node image from ghcr.io (built by CI), creates storage buckets, generates mTLS certs, handles init-seal key injection, and starts nodes.
 
 ```bash
 cd deploy
@@ -134,8 +134,8 @@ cp config.env.example config.env
 ./deploy.sh all           # Full deployment
 
 # Or step by step
-./deploy.sh setup-vms     # Install Docker + Git on VMs
-./deploy.sh build          # Clone repo + docker build on each VM
+./deploy.sh setup-vms     # Install Docker on VMs
+./deploy.sh pull           # Pull node image from ghcr.io
 ./deploy.sh storage        # Create sealed blob storage buckets
 ./deploy.sh certs          # Generate mTLS certs + distribute to VMs
 ./deploy.sh init-seal      # Interactive: inject key shares via attested TLS
@@ -146,7 +146,7 @@ cp config.env.example config.env
 
 # Utilities
 ./deploy.sh show-ips       # Fetch VM IPs from all 3 providers
-./deploy.sh redeploy       # Git pull + rebuild + restart (code update, no reseal)
+./deploy.sh redeploy       # Pull latest image + restart nodes
 ```
 
 ### ECS Fargate + ALB (`deploy/setup-ecs.sh`)
