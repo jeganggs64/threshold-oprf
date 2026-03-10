@@ -799,20 +799,19 @@ async fn main() {
         }
         (None, None) => {
             // -- Plain HTTP mode --
-            // Note: `axum::serve` with a `TcpListener` automatically provides
-            // `ConnectInfo<SocketAddr>` to handlers, so we do not need to call
-            // `into_make_service_with_connect_info` here (unlike the TLS path
-            // which uses `axum_server`).
             info!(addr = %bind_addr, "starting toprf-proxy (plain HTTP)");
 
             let listener = TcpListener::bind(&bind_addr)
                 .await
                 .unwrap_or_else(|e| panic!("failed to bind to {bind_addr}: {e}"));
 
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .unwrap_or_else(|e| error!("server error: {e}"));
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .unwrap_or_else(|e| error!("server error: {e}"));
         }
         _ => {
             eprintln!("Error: --tls-cert and --tls-key must both be provided (or neither)");

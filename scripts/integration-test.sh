@@ -255,11 +255,17 @@ echo "--- Test 6d: POST /oprf/evaluate ---"
 # 02 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 TEST_BLINDED_POINT="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
-EVAL_HTTP_CODE=$(curl -sf -o "$TMPDIR/eval_resp.json" -w "%{http_code}" \
+EVAL_HTTP_CODE=$(curl -s -o "$TMPDIR/eval_resp.json" -w "%{http_code}" \
     -X POST "http://127.0.0.1:$PROXY_PORT/oprf/evaluate" \
     -H "Content-Type: application/json" \
     -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}")
 
+if [[ "$EVAL_HTTP_CODE" != "200" ]]; then
+    echo "  DEBUG: evaluate returned HTTP $EVAL_HTTP_CODE"
+    echo "  DEBUG: response body: $(cat "$TMPDIR/eval_resp.json" 2>/dev/null)"
+    echo "  DEBUG: proxy log (last 20 lines):"
+    tail -20 "$TMPDIR/proxy.log" 2>/dev/null || echo "(no log)"
+fi
 assert_eq "evaluate returns 200" "200" "$EVAL_HTTP_CODE"
 
 if [[ -f "$TMPDIR/eval_resp.json" ]]; then
