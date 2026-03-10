@@ -646,12 +646,15 @@ async fn main() {
     // Defense-in-depth: validate that all node endpoints use HTTPS.
     // This prevents accidental deployment with plain HTTP node connections,
     // which would expose OPRF traffic to network-level attackers.
-    for node in &config.nodes {
-        if !node.endpoint.starts_with("https://") {
-            panic!(
-                "node {} endpoint must use https:// (got: {})",
-                node.node_id, node.endpoint
-            );
+    // Skip when attestation is disabled (local/CI testing).
+    if config.require_attestation {
+        for node in &config.nodes {
+            if !node.endpoint.starts_with("https://") {
+                panic!(
+                    "node {} endpoint must use https:// (got: {})",
+                    node.node_id, node.endpoint
+                );
+            }
         }
     }
 
