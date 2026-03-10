@@ -299,19 +299,16 @@ fn get_report_tsm_configfs(report_data: Option<&[u8; 64]>) -> Result<SnpReport, 
     // Step 2: Write report_data (64 bytes) to inblob
     let inblob_path = format!("{report_dir}/inblob");
     let blob_data = report_data.map(|d| d.as_slice()).unwrap_or(&[0u8; 64]);
-    let mut f = fs::File::create(&inblob_path).map_err(|e| {
-        SealError::ProviderError(format!("failed to open {inblob_path}: {e}"))
-    })?;
-    f.write_all(blob_data).map_err(|e| {
-        SealError::ProviderError(format!("failed to write inblob: {e}"))
-    })?;
+    let mut f = fs::File::create(&inblob_path)
+        .map_err(|e| SealError::ProviderError(format!("failed to open {inblob_path}: {e}")))?;
+    f.write_all(blob_data)
+        .map_err(|e| SealError::ProviderError(format!("failed to write inblob: {e}")))?;
     drop(f);
 
     // Step 3: Read the attestation report from outblob
     let outblob_path = format!("{report_dir}/outblob");
-    let report_bytes = fs::read(&outblob_path).map_err(|e| {
-        SealError::ProviderError(format!("failed to read {outblob_path}: {e}"))
-    })?;
+    let report_bytes = fs::read(&outblob_path)
+        .map_err(|e| SealError::ProviderError(format!("failed to read {outblob_path}: {e}")))?;
 
     tracing::info!(
         report_size = report_bytes.len(),
@@ -333,9 +330,7 @@ fn get_report_tsm_configfs(report_data: Option<&[u8; 64]>) -> Result<SnpReport, 
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-fn get_report_dev_sev_guest_ioctl(
-    report_data: Option<&[u8; 64]>,
-) -> Result<SnpReport, SealError> {
+fn get_report_dev_sev_guest_ioctl(report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealError> {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
 
