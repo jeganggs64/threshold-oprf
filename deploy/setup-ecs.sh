@@ -40,7 +40,7 @@ CONFIG_FILE="${SCRIPT_DIR}/config.env"
 # Load these from config.env or set here
 REGION="${ECR_REGION:-eu-west-2}"
 AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:?Set AWS_ACCOUNT_ID in config.env}"
-PROJECT="${PROJECT_NAME:-toprf}"
+PROJECT="${PROJECT_NAME:-ruonid}"
 CLUSTER_NAME="${ECS_CLUSTER_NAME:-${PROJECT}}"
 SERVICE_NAME="${ECS_SERVICE_NAME:-${PROJECT}-api}"
 DOMAIN="${DOMAIN:?Set DOMAIN in config.env (e.g. api.example.com)}"

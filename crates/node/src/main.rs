@@ -342,10 +342,9 @@ async fn run_init_seal(port: &str, upload_url: String) {
     report_data[..32].copy_from_slice(&tls_pubkey_hash);
     // Remaining 32 bytes are zeros
 
-    let provider = match env::var("SNP_PROVIDER").as_deref() {
-        Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
-        _ => toprf_seal::provider::SnpProvider::DevSevGuest,
-    };
+    // Provider selection is now auto-detected (TSM configfs → ioctl fallback).
+    // SNP_PROVIDER env var is kept for backwards compatibility but ignored.
+    let provider = toprf_seal::provider::SnpProvider::DevSevGuest;
 
     info!("init-seal: requesting attestation report with TLS pubkey hash as REPORT_DATA");
     let report = toprf_seal::provider::get_attestation_report(provider, Some(&report_data))
@@ -676,10 +675,7 @@ async fn main() {
                 info!("auto-unseal: v1 blob detected, using HKDF-based unseal (legacy)");
 
                 // Get attestation measurement for v1 unseal
-                let provider = match env::var("SNP_PROVIDER").as_deref() {
-                    Ok("gcp") => toprf_seal::provider::SnpProvider::GcpMetadata,
-                    _ => toprf_seal::provider::SnpProvider::DevSevGuest,
-                };
+                let provider = toprf_seal::provider::SnpProvider::DevSevGuest;
                 let report = toprf_seal::provider::get_attestation_report(provider, None)
                     .await
                     .expect("failed to get attestation report");

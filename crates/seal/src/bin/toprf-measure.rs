@@ -28,26 +28,15 @@ async fn main() {
 
     let args: Vec<String> = env::args().collect();
 
-    let mut provider = SnpProvider::DevSevGuest;
+    let provider = SnpProvider::DevSevGuest;
     let mut json_output = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--provider" => {
+                // Kept for backwards compatibility; value is ignored (auto-detected).
                 i += 1;
-                if i >= args.len() {
-                    eprintln!("Error: --provider requires a value (gcp or raw)");
-                    process::exit(1);
-                }
-                provider = match args[i].as_str() {
-                    "gcp" => SnpProvider::GcpMetadata,
-                    "raw" => SnpProvider::DevSevGuest,
-                    other => {
-                        eprintln!("Error: unknown provider '{other}' (expected gcp or raw)");
-                        process::exit(1);
-                    }
-                };
             }
             "--json" => {
                 json_output = true;
