@@ -25,9 +25,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
 Usage: deploy.sh <step> [step...]
 
 Steps (run in order for fresh deployment):
-  build         Clone repo + build Docker image on each VM (native amd64)
+  pull          Pull node image from ghcr.io on each VM
   storage       Create storage buckets + bind VM identities
-  setup-vms     Install Docker + Git on all 3 VMs
+  setup-vms     Install Docker on all 3 VMs
   certs         Generate mTLS certs (with real IPs) + distribute
   firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
@@ -40,10 +40,10 @@ Utilities:
   show-ips      Fetch public IPs from all 3 providers
 
 Shortcuts:
-  pre-seal      setup-vms → build → storage → certs
+  pre-seal      setup-vms → pull → storage → certs
   post-seal     start → firewall → proxy-config → verify
   all           pre-seal → init-seal → post-seal
-  redeploy      git pull → rebuild → restart nodes (code update, no reseal)
+  redeploy      pull latest image → restart nodes
 EOF
     }
     usage
@@ -64,9 +64,8 @@ source "$CONFIG_FILE"
 # ─── Derived values ──────────────────────────────────────────────────────────
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com"
-NODE_IMAGE="toprf-node:latest"
+NODE_IMAGE="${NODE_IMAGE:-ghcr.io/${GHCR_OWNER:-jeganggs64}/toprf-node:latest}"
 PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-toprf/toprf-proxy}:latest"
-REPO_URL="${REPO_URL:?Set REPO_URL in config.env}"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -147,26 +146,17 @@ node_vs() {
 # Steps
 # =============================================================================
 
-# ─── 1. Build Docker images ─────────────────────────────────────────────────
+# ─── 1. Pull Docker image ──────────────────────────────────────────────────
 
-step_build() {
+step_pull() {
     echo ""
-    info "Cloning repo + building Docker image on each VM (native amd64)"
+    info "Pulling node image on each VM: ${NODE_IMAGE}"
 
     for i in 1 2 3; do
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
-
-        ssh_node "$i" "set -e; \
-            if [ -d threshold-oprf ]; then \
-                cd threshold-oprf && sudo git pull; \
-            else \
-                sudo apt-get update -qq && sudo apt-get install -y -qq git > /dev/null; \
-                git clone ${REPO_URL} threshold-oprf && cd threshold-oprf; \
-            fi; \
-            cd ~/threshold-oprf && sudo docker build -f docker/sev/Dockerfile.sev -t toprf-node:latest .; \
-            echo '    Build complete.'"
+        ssh_node "$i" "sudo docker pull ${NODE_IMAGE}"
     done
 
     echo "  Done."
@@ -235,7 +225,7 @@ step_storage() {
 
 step_setup_vms() {
     echo ""
-    info "Setting up VMs (Docker + Git)"
+    info "Setting up VMs (Docker)"
 
     for i in 1 2 3; do
         local ip
@@ -252,14 +242,6 @@ if ! command -v docker &>/dev/null; then
     sudo usermod -aG docker $USER
 else
     echo "    Docker already installed."
-fi
-
-# Git
-if ! command -v git &>/dev/null; then
-    echo "    Installing Git..."
-    sudo apt-get update -qq && sudo apt-get install -y -qq git >/dev/null
-else
-    echo "    Git already installed."
 fi
 
 echo "    Done."
@@ -751,12 +733,12 @@ step_auto_config() {
     echo "  Done. Review config.env and fill in any remaining empty fields."
 }
 
-# ─── 13. Redeploy (build + push + pull + restart) ───────────────────────────
+# ─── 13. Redeploy (pull latest image + restart) ─────────────────────────────
 
 step_redeploy() {
     echo ""
-    info "Redeploying (git pull → rebuild → restart)"
-    step_build
+    info "Redeploying (pull latest image → restart)"
+    step_pull
     for i in 1 2 3; do
         echo "  Restarting node $i..."
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
@@ -773,9 +755,9 @@ usage() {
 Usage: deploy.sh <step> [step...]
 
 Steps (run in order for fresh deployment):
-  build         Clone repo + build Docker image on each VM (native amd64)
+  pull          Pull node image from ghcr.io on each VM
   storage       Create storage buckets + bind VM identities
-  setup-vms     Install Docker + Git on all 3 VMs
+  setup-vms     Install Docker on all 3 VMs
   certs         Generate mTLS certs (with real IPs) + distribute
   firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
@@ -788,10 +770,10 @@ Utilities:
   show-ips      Fetch public IPs from all 3 providers
 
 Shortcuts:
-  pre-seal      setup-vms → build → storage → certs
+  pre-seal      setup-vms → pull → storage → certs
   post-seal     start → firewall → proxy-config → verify
   all           pre-seal → init-seal → post-seal
-  redeploy      git pull → rebuild → restart nodes (code update, no reseal)
+  redeploy      pull latest image → restart nodes
 EOF
 }
 
@@ -802,7 +784,7 @@ fi
 
 for step in "$@"; do
     case "$step" in
-        build)        step_build ;;
+        pull)         step_pull ;;
         storage)      step_storage ;;
         setup-vms)    step_setup_vms ;;
         certs)        step_certs ;;
@@ -816,7 +798,7 @@ for step in "$@"; do
         redeploy)     step_redeploy ;;
         pre-seal)
             step_setup_vms
-            step_build
+            step_pull
             step_storage
             step_certs
             ;;
@@ -828,7 +810,7 @@ for step in "$@"; do
             ;;
         all)
             step_setup_vms
-            step_build
+            step_pull
             step_storage
             step_certs
             echo ""
