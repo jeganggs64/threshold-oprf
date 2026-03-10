@@ -428,8 +428,10 @@ step_init_seal() {
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e SNP_PROVIDER=${provider} \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
+            -e TSM_REPORT_PATH=/run/tsm/report \
             --device /dev/sev-guest:/dev/sev-guest \
-            --privileged \
+            --privileged --user root \
+            -v /sys/kernel/config/tsm/report:/run/tsm/report \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --init-seal \
@@ -517,8 +519,10 @@ step_start() {
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             -e SNP_PROVIDER=${provider} \
+            -e TSM_REPORT_PATH=/run/tsm/report \
             --device /dev/sev-guest:/dev/sev-guest \
-            --privileged \
+            --privileged --user root \
+            -v /sys/kernel/config/tsm/report:/run/tsm/report \
             -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
             ${NODE_IMAGE} \

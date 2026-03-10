@@ -232,15 +232,20 @@ pub fn get_derived_key(_field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealEr
 // ---------------------------------------------------------------------------
 
 /// TSM configfs base path (available on Linux kernel 6.7+).
+/// Override via TSM_REPORT_PATH env var for containers where the host
+/// configfs is bind-mounted to a different path.
 #[cfg(target_os = "linux")]
-const TSM_REPORT_PATH: &str = "/sys/kernel/config/tsm/report";
+fn tsm_report_path() -> String {
+    std::env::var("TSM_REPORT_PATH").unwrap_or_else(|_| "/sys/kernel/config/tsm/report".to_string())
+}
 
 #[cfg(target_os = "linux")]
 fn get_report_auto(report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealError> {
     // Try TSM configfs first (kernel 6.7+)
-    if std::path::Path::new(TSM_REPORT_PATH).exists() {
+    let tsm_path = tsm_report_path();
+    if std::path::Path::new(&tsm_path).exists() {
         tracing::info!("Using TSM configfs interface for attestation report");
-        match get_report_tsm_configfs(report_data) {
+        match get_report_tsm_configfs(report_data, &tsm_path) {
             Ok(report) => return Ok(report),
             Err(e) => {
                 tracing::warn!("TSM configfs failed ({e}), falling back to /dev/sev-guest ioctl");
@@ -272,7 +277,10 @@ fn get_report_auto(_report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealErr
 ///   3. Read binary attestation report from <name>/outblob
 ///   4. rmdir <name>
 #[cfg(target_os = "linux")]
-fn get_report_tsm_configfs(report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealError> {
+fn get_report_tsm_configfs(
+    report_data: Option<&[u8; 64]>,
+    tsm_path: &str,
+) -> Result<SnpReport, SealError> {
     use std::fs;
     use std::io::Write;
 
@@ -284,7 +292,7 @@ fn get_report_tsm_configfs(report_data: Option<&[u8; 64]>) -> Result<SnpReport, 
             .unwrap_or_default()
             .as_nanos()
     );
-    let report_dir = format!("{TSM_REPORT_PATH}/{name}");
+    let report_dir = format!("{tsm_path}/{name}");
 
     // Step 1: Create the report entry
     fs::create_dir(&report_dir).map_err(|e| {
