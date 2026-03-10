@@ -1,3 +1,6 @@
+# OS files
+.DS_Store
+
 # Generated TLS certificates
 certs/
 
@@ -12,6 +15,9 @@ node-shares/
 # Environment files
 .env
 .env.*
+scripts/deploy/config.env
+scripts/deploy/ecs-state.env
 
 # Private keys
 *.key
+*.pem
