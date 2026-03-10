@@ -423,7 +423,7 @@ step_init_seal() {
         echo "  Starting init-seal container..."
 
         # Clean up any previous init-seal container
-        ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true"
+        ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e SNP_PROVIDER=${provider} \
@@ -436,11 +436,11 @@ step_init_seal() {
             ${NODE_IMAGE} \
             --init-seal \
             --upload-url '${url}' \
-            --port 3001"
+            --port 3001" < /dev/null
 
         echo "  Waiting for attestation endpoint..."
         local waited=0
-        while ! curl -sk "https://${ip}:3001/attest" > /dev/null 2>&1; do
+        while ! ssh_node "$i" "curl -sk https://localhost:3001/attest > /dev/null 2>&1" < /dev/null; do
             sleep 2
             waited=$((waited + 1))
             if [[ $waited -ge 60 ]]; then
@@ -460,21 +460,25 @@ step_init_seal() {
         echo "    # Check: REPORT_DATA[0..32] == SHA-256(TLS pubkey)"
         echo ""
         echo "  Press Enter to send key share, or 'skip' to skip this node:"
-        read -r response
+        read -r response < /dev/tty
 
         if [[ "$response" == "skip" ]]; then
             echo "  Skipping node $i."
-            ssh_node "$i" "sudo docker rm -f toprf-init-seal" || true
+            ssh_node "$i" "sudo docker rm -f toprf-init-seal" < /dev/null || true
             echo ""
             continue
         fi
 
         echo "  Sending key share to node $i..."
+        # Copy key share to node, then curl localhost from inside the VM
+        scp_to_node "$i" "$share" < /dev/null
+        local share_filename
+        share_filename=$(basename "$share")
         local http_code body
-        body=$(curl -sk "https://${ip}:3001/init-key" \
-            -X POST -H "Content-Type: application/json" \
-            -d @"$share" \
-            -w "\n%{http_code}" 2>&1)
+        body=$(ssh_node "$i" "curl -sk https://localhost:3001/init-key \
+            -X POST -H 'Content-Type: application/json' \
+            -d @/tmp/${share_filename} \
+            -w '\n%{http_code}' 2>&1 ; rm -f /tmp/${share_filename}" < /dev/null)
 
         http_code=$(echo "$body" | tail -1)
         body=$(echo "$body" | sed '$d')
@@ -488,7 +492,7 @@ step_init_seal() {
 
         # Container exits after sealing; give it a moment then clean up
         sleep 3
-        ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true"
+        ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
         echo ""
     done
 
