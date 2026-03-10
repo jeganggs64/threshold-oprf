@@ -433,6 +433,9 @@ async fn run_init_seal(port: &str, upload_url: String) {
 
 #[tokio::main]
 async fn main() {
+    // Install the default rustls crypto provider (ring via reqwest's rustls-tls)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = env::args().collect();
