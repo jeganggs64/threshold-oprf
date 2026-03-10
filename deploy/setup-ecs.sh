@@ -29,7 +29,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Load shared config if available
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
@@ -497,7 +497,7 @@ step_upload_config() {
     echo ""
     info "Uploading proxy config + certs to S3"
 
-    local proxy_config="$REPO_ROOT/deploy/proxy-config.production.json"
+    local proxy_config="$REPO_ROOT/docker/proxy-config.production.json"
     local certs_dir="$REPO_ROOT/certs"
 
     if [[ ! -f "$proxy_config" ]]; then
@@ -822,7 +822,7 @@ step_status() {
     if [[ -n "${NAT_EIP:-}" ]]; then
         echo "  ┌──────────────────────────────────────────────┐"
         echo "  │  PROXY_IP=${NAT_EIP}  │"
-        echo "  │  Add this to scripts/deploy/config.env       │"
+        echo "  │  Add this to deploy/config.env                │"
         echo "  └──────────────────────────────────────────────┘"
         echo ""
     fi

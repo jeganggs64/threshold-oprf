@@ -16,7 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Show help without requiring config
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
@@ -32,12 +32,11 @@ Steps (run in order for fresh deployment):
   firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
-  proxy-config  Generate deploy/proxy-config.production.json
+  proxy-config  Generate docker/proxy-config.production.json
   verify        Health check all nodes via mTLS
 
 Utilities:
   show-ips      Fetch public IPs from all 3 providers
-
 Shortcuts:
   pre-seal      setup-vms → build → storage → certs
   post-seal     start → firewall → proxy-config → verify
@@ -54,7 +53,7 @@ fi
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "ERROR: config.env not found at $CONFIG_FILE"
-    echo "  cp scripts/deploy/config.env.example scripts/deploy/config.env"
+    echo "  cp deploy/config.env.example deploy/config.env"
     echo "  # then fill in your values"
     exit 1
 fi
@@ -164,7 +163,7 @@ step_build() {
                 sudo apt-get update -qq && sudo apt-get install -y -qq git > /dev/null; \
                 git clone ${REPO_URL} threshold-oprf && cd threshold-oprf; \
             fi; \
-            cd ~/threshold-oprf && sudo docker build -f deploy/sev/Dockerfile.sev -t toprf-node:latest .; \
+            cd ~/threshold-oprf && sudo docker build -f docker/sev/Dockerfile.sev -t toprf-node:latest .; \
             echo '    Build complete.'"
     done
 
@@ -544,7 +543,7 @@ step_proxy_config() {
 
     load_ceremony
 
-    local out="$REPO_ROOT/deploy/proxy-config.production.json"
+    local out="$REPO_ROOT/docker/proxy-config.production.json"
 
     cat > "$out" <<CFGEOF
 {
@@ -688,12 +687,11 @@ Steps (run in order for fresh deployment):
   firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
-  proxy-config  Generate deploy/proxy-config.production.json
+  proxy-config  Generate docker/proxy-config.production.json
   verify        Health check all nodes via mTLS
 
 Utilities:
   show-ips      Fetch public IPs from all 3 providers
-
 Shortcuts:
   pre-seal      setup-vms → build → storage → certs
   post-seal     start → firewall → proxy-config → verify

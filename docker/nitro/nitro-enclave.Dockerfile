@@ -62,7 +62,7 @@ RUN groupadd --gid 1001 toprf && \
 COPY --from=builder /build/target/release/toprf-node /usr/local/bin/toprf-node
 
 # Copy the vsock proxy entry script
-COPY deploy/nitro/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/nitro/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Directory for TLS certificates

@@ -15,8 +15,8 @@ node-shares/
 # Environment files
 .env
 .env.*
-scripts/deploy/config.env
-scripts/deploy/ecs-state.env
+deploy/config.env
+deploy/ecs-state.env
 
 # Private keys
 *.key

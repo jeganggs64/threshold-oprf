@@ -64,7 +64,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/toprf-node /app/toprf-node
 
 # Copy the Gramine manifest template
-COPY deploy/sgx/toprf-node.manifest.template /app/toprf-node.manifest.template
+COPY docker/sgx/toprf-node.manifest.template /app/toprf-node.manifest.template
 
 # Directory for TLS certificates
 RUN mkdir -p /etc/toprf/certs && chown -R toprf:toprf /etc/toprf

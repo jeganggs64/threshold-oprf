@@ -23,18 +23,21 @@ Rust TOPRF Proxy (port 3000)   ← fans out to TEE nodes, DLEQ verification
 
 The proxy collects partial evaluations from any 2 of 3 nodes, verifies DLEQ proofs, and returns verified partials to the client. The client performs Lagrange interpolation and unblinding locally — the proxy never sees the unblinded result.
 
+Each node's sealed key blob is stored on the same cloud provider where the VM runs, encrypted with a hardware-derived key via `MSG_KEY_REQ` — even the cloud provider cannot decrypt it.
+
 ## Repository Structure
 
 ```
 crates/
-  core/      Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine)
-  node/      Stateless TEE node server — loads key share, serves /partial-evaluate
-  proxy/     Orchestrator — fans out to nodes, verifies DLEQ proofs, rate limits
-  keygen/    Offline ceremony tool — generates OPRF key, splits into admin + node shares
-  seal/      AMD SEV-SNP key sealing/unsealing via hardware-derived keys
-  monitor/   GCP maintenance event monitor with webhook alerts
-deploy/      Dockerfiles, docker-compose for local dev, TEE-specific configs
-scripts/     Integration tests, deployment automation
+  core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine)
+  node/       Stateless TEE node server — loads key share, serves /partial-evaluate
+  proxy/      Orchestrator — fans out to nodes, verifies DLEQ proofs, rate limits
+  keygen/     Offline ceremony tool — generates OPRF key, splits into shares
+  seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
+  monitor/    GCP maintenance event monitor with webhook alerts
+docker/       Dockerfiles, docker-compose, TEE-specific configs (sev, sgx, nitro)
+deploy/       Deployment automation scripts (deploy.sh, setup-ecs.sh)
+scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
 ```
 
 ### Crates
@@ -73,7 +76,7 @@ bash scripts/integration-test.sh
 bash scripts/gen-certs.sh
 
 # Start 3 nodes + proxy with Docker Compose
-docker compose -f deploy/docker-compose.yml up --build
+docker compose -f docker/docker-compose.yml up --build
 ```
 
 Proxy available at `https://localhost:3000`. Nodes are only reachable within the Docker network.
@@ -104,24 +107,72 @@ Three TEE VMs (one per cloud provider) run the node binary. An ECS Fargate servi
 
 - 3 AMD SEV-SNP VMs provisioned (GCP Confidential VM, Azure DCasv5, AWS C6a)
 - IAM roles / managed identities / instance profiles attached
-- Key ceremony completed
+- SSH access to all 3 VMs
 - `gcloud`, `az`, `aws` CLIs authenticated locally
+- `jq`, `openssl`, `curl` installed locally
+- Key ceremony completed
 
-### Deploy
+### TEE Node Deployment (`deploy/deploy.sh`)
+
+Builds Docker images on each VM (native amd64), creates storage buckets, generates mTLS certs, handles init-seal key injection, and starts nodes.
 
 ```bash
-cd scripts/deploy
+cd deploy
 cp config.env.example config.env
 # Fill in VM IPs, bucket names, regions, etc.
 
-# Full TEE node deployment
-./deploy.sh all
+./deploy.sh all           # Full deployment
 
-# ECS Fargate + ALB for the API proxy
-./setup-ecs.sh all
+# Or step by step
+./deploy.sh setup-vms     # Install Docker + Git on VMs
+./deploy.sh build          # Clone repo + docker build on each VM
+./deploy.sh storage        # Create sealed blob storage buckets
+./deploy.sh certs          # Generate mTLS certs + distribute to VMs
+./deploy.sh init-seal      # Interactive: inject key shares via attested TLS
+./deploy.sh start          # Start nodes in normal mode
+./deploy.sh firewall       # Open port 3001 from proxy to nodes
+./deploy.sh proxy-config   # Generate proxy-config.production.json
+./deploy.sh verify         # Health check all nodes via mTLS
+
+# Utilities
+./deploy.sh show-ips       # Fetch VM IPs from all 3 providers
+./deploy.sh redeploy       # Git pull + rebuild + restart (code update, no reseal)
 ```
 
-See [scripts/deploy/README.md](scripts/deploy/README.md) for step-by-step usage and [DEPLOYMENT.md](DEPLOYMENT.md) for the full deployment guide.
+### ECS Fargate + ALB (`deploy/setup-ecs.sh`)
+
+Provisions the API proxy infrastructure: VPC with NAT Gateway (stable outbound IP for node firewall rules), ALB, ECS Fargate cluster.
+
+```bash
+./setup-ecs.sh all          # Full infrastructure setup
+
+# Or step by step
+./setup-ecs.sh vpc          # VPC, subnets, IGW, NAT Gateway
+./setup-ecs.sh security     # Security groups
+./setup-ecs.sh alb          # Application Load Balancer
+./setup-ecs.sh cert         # ACM certificate request
+./setup-ecs.sh roles        # IAM roles
+./setup-ecs.sh config-bucket # S3 bucket for proxy config
+./setup-ecs.sh ecr          # ECR repo for API server
+./setup-ecs.sh cluster      # ECS Fargate cluster
+./setup-ecs.sh task         # Task definition
+./setup-ecs.sh service      # ECS service
+
+# Operations
+./setup-ecs.sh upload-config # Upload proxy config + certs to S3
+./setup-ecs.sh status        # Show NAT EIP, ALB DNS, service health
+./setup-ecs.sh redeploy      # Force new deployment
+```
+
+### Key Rotation
+
+To rotate OPRF key shares, deploy to fresh nodes rather than resealing existing ones:
+
+1. Run a new ceremony with admin shares (`toprf-keygen node-shares`)
+2. Provision 3 new VMs
+3. Run `./deploy.sh all` with the new ceremony output and new VM IPs
+4. Update proxy config to point to the new nodes, upload to S3, redeploy ECS
+5. Decommission old VMs and delete old sealed blobs
 
 ## Security Properties
 
