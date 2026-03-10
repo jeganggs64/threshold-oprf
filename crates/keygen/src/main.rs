@@ -1,28 +1,33 @@
 //! Offline ceremony tool for OPRF key management.
 //!
-//! Two modes of operation:
+//! Two commands, run separately:
 //!
-//! 1. **Initial ceremony** — generates a new OPRF key, splits it into
-//!    admin shares (3-of-5) for offline vault storage AND node shares
-//!    (2-of-3) for loading into TEEs.
+//! 1. **`init`** — one-time. Generates a new OPRF key and splits it into
+//!    admin shares (3-of-5) for offline vault storage.
 //!
 //!    ```sh
 //!    toprf-keygen init \
 //!        --admin-threshold 3 --admin-shares 5 \
-//!        --node-threshold 2 --node-shares 3 \
 //!        --output-dir ./ceremony
 //!    ```
 //!
-//! 2. **Node-shares ceremony** — admins bring their shares, reconstruct
-//!    the key, and produce new node shares for new TEEs. Used for
-//!    infrastructure migration.
+//!    Output:
+//!      ceremony/admin-{1..5}.json   ← store in physically secure vaults
+//!
+//! 2. **`node-shares`** — repeatable. Admins bring their shares, reconstruct
+//!    the key, and produce node shares (2-of-3) for TEE deployment. Run this
+//!    for every deployment or key rotation.
 //!
 //!    ```sh
 //!    toprf-keygen node-shares \
 //!        --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
 //!        --node-threshold 2 --node-shares 3 \
-//!        --output-dir ./new-node-shares
+//!        --output-dir ./node-shares
 //!    ```
+//!
+//!    Output:
+//!      node-shares/node-{1..3}-share.json  ← deploy to TEEs
+//!      node-shares/public-config.json       ← consumed by deploy.sh
 //!
 //! SECURITY:
 //!   - Run on an air-gapped machine.
@@ -89,19 +94,18 @@ fn print_usage() {
     eprintln!("Usage: toprf-keygen <COMMAND> [OPTIONS]");
     eprintln!();
     eprintln!("Commands:");
-    eprintln!("  init          Initial ceremony — generate key + admin shares + node shares");
-    eprintln!("  node-shares   Migration ceremony — reconstruct from admin shares, produce new node shares");
+    eprintln!("  init          One-time — generate OPRF key + admin shares");
+    eprintln!("  node-shares   Repeatable — reconstruct from admin shares, produce node shares");
     eprintln!();
     eprintln!("Run `toprf-keygen <COMMAND> --help` for details.");
 }
 
-/// Initial ceremony: generate a new OPRF key and split into admin + node shares.
+/// Initial ceremony: generate a new OPRF key and split into admin shares only.
+/// Node shares are produced separately via `toprf-keygen node-shares`.
 fn cmd_init(args: &[String]) {
     let mut admin_threshold = 3u16;
     let mut admin_total = 5u16;
-    let mut node_threshold = 2u16;
-    let mut node_total = 3u16;
-    let mut output_dir = String::from("./ceremony");
+    let mut output_dir = String::from("./admin-shares");
     let mut existing_key: Option<String> = None;
 
     let mut i = 0;
@@ -114,14 +118,6 @@ fn cmd_init(args: &[String]) {
             "--admin-shares" => {
                 i += 1;
                 admin_total = args[i].parse().expect("invalid admin-shares");
-            }
-            "--node-threshold" => {
-                i += 1;
-                node_threshold = args[i].parse().expect("invalid node-threshold");
-            }
-            "--node-shares" => {
-                i += 1;
-                node_total = args[i].parse().expect("invalid node-shares");
             }
             "--output-dir" | "-o" => {
                 i += 1;
@@ -147,9 +143,7 @@ fn cmd_init(args: &[String]) {
                 eprintln!("Options:");
                 eprintln!("  --admin-threshold <N>      Admin quorum threshold (default: 3)");
                 eprintln!("  --admin-shares <N>         Total admin shares (default: 5)");
-                eprintln!("  --node-threshold <N>       Node quorum threshold (default: 2)");
-                eprintln!("  --node-shares <N>          Total node shares (default: 3)");
-                eprintln!("  -o, --output-dir <DIR>     Output directory (default: ./ceremony)");
+                eprintln!("  -o, --output-dir <DIR>     Output directory (default: ./admin-shares)");
                 eprintln!("  --existing-key-file <PATH> Read existing key (hex) from file");
                 eprintln!("  -k, --existing-key <HEX>   Split an existing key (INSECURE — use --existing-key-file)");
                 eprintln!("  -h, --help                 Show this help");
@@ -167,11 +161,6 @@ fn cmd_init(args: &[String]) {
     assert!(
         admin_total >= admin_threshold,
         "admin shares must be >= admin threshold"
-    );
-    assert!(node_threshold >= 2, "node threshold must be >= 2");
-    assert!(
-        node_total >= node_threshold,
-        "node shares must be >= node threshold"
     );
 
     // Generate or use existing key
@@ -199,73 +188,22 @@ fn cmd_init(args: &[String]) {
             .expect("failed to set output directory permissions");
     }
 
-    // -- Admin shares (3-of-5) --
+    // Split into admin shares
     eprintln!("[*] Splitting into {admin_threshold}-of-{admin_total} admin shares...");
     let admin_result =
         split_key(&secret, admin_threshold, admin_total).expect("admin key split failed");
 
-    let admin_dir = out_path.join("admin-shares");
-    fs::create_dir_all(&admin_dir).expect("failed to create admin-shares directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&admin_dir, std::fs::Permissions::from_mode(0o700))
-            .expect("failed to set admin-shares directory permissions");
-    }
-
     for share in &admin_result.shares {
         let filename = format!("admin-{}.json", share.node_id);
-        let filepath = admin_dir.join(&filename);
+        let filepath = out_path.join(&filename);
         let json = serde_json::to_string_pretty(share).expect("failed to serialize");
         write_secret_file(&filepath, &json).expect("failed to write admin share");
         eprintln!("[+] Wrote {}", filepath.display());
     }
 
-    // -- Node shares (2-of-3) --
-    eprintln!("[*] Splitting into {node_threshold}-of-{node_total} node shares...");
-    let node_result =
-        split_key(&secret, node_threshold, node_total).expect("node key split failed");
-
-    let node_dir = out_path.join("node-shares");
-    fs::create_dir_all(&node_dir).expect("failed to create node-shares directory");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&node_dir, std::fs::Permissions::from_mode(0o700))
-            .expect("failed to set node-shares directory permissions");
-    }
-
-    for share in &node_result.shares {
-        let filename = format!("node-{}-share.json", share.node_id);
-        let filepath = node_dir.join(&filename);
-        let json = serde_json::to_string_pretty(share).expect("failed to serialize");
-        write_secret_file(&filepath, &json).expect("failed to write node share");
-        eprintln!("[+] Wrote {}", filepath.display());
-    }
-
-    // -- Public config (node verification shares for coordinator) --
-    let public_config = serde_json::json!({
-        "group_public_key": node_result.group_public_key,
-        "threshold": node_result.threshold,
-        "total_shares": node_result.total_shares,
-        "verification_shares": node_result.shares.iter().map(|s| {
-            serde_json::json!({
-                "node_id": s.node_id,
-                "verification_share": s.verification_share,
-            })
-        }).collect::<Vec<_>>(),
-    });
-    let config_path = out_path.join("public-config.json");
-    let json = serde_json::to_string_pretty(&public_config).expect("failed to serialize config");
-    fs::write(&config_path, &json).expect("failed to write config");
-    eprintln!("[+] Wrote {}", config_path.display());
-
     // Fingerprint
     let mut hasher = Sha256::new();
     for share in &admin_result.shares {
-        hasher.update(&share.verification_share);
-    }
-    for share in &node_result.shares {
         hasher.update(&share.verification_share);
     }
     let fingerprint = hex::encode(hasher.finalize());
@@ -275,10 +213,8 @@ fn cmd_init(args: &[String]) {
     eprintln!(
         "[*] Admin shares: {admin_threshold}-of-{admin_total} — store in physically secure vaults"
     );
-    eprintln!(
-        "[*] Node shares: {node_threshold}-of-{node_total} — load into TEEs over attested TLS"
-    );
     eprintln!();
+    eprintln!("[*] Next: run `toprf-keygen node-shares` to produce node shares for deployment.");
     eprintln!("[!] DESTROY THIS MACHINE. The secret key existed in memory during this process.");
 }
 

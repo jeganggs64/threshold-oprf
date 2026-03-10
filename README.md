@@ -81,23 +81,32 @@ docker compose -f docker/docker-compose.yml up --build
 
 Proxy available at `https://localhost:3000`. Nodes are only reachable within the Docker network.
 
-## Key Ceremony
+## Key Management
 
-Run on an air-gapped machine. After the ceremony, destroy the machine.
+Key management has two separate steps: creating admin shares (one-time) and deriving node shares (repeatable). Both should be run on an air-gapped machine.
+
+### 1. Create admin shares (one-time)
+
+Generates the OPRF key and splits it into 5 admin shares with a 3-of-5 threshold. Store these in physically separate secure locations (bank vaults, safes, etc).
 
 ```bash
-# Generate OPRF key → admin shares (3-of-5) + node shares (2-of-3)
 cargo run --release -p toprf-keygen -- init \
     --admin-threshold 3 --admin-shares 5 \
-    --node-threshold 2 --node-shares 3 \
-    --output-dir ./ceremony
+    --output-dir ./admin-shares
+```
 
-# Re-derive node shares from admin shares (infrastructure migration)
+### 2. Derive node shares (per deployment)
+
+Bring 3 of the 5 admin shares together to produce 2-of-3 node shares for TEE deployment. Run this for every fresh deployment or key rotation.
+
+```bash
 cargo run --release -p toprf-keygen -- node-shares \
     --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
     --node-threshold 2 --node-shares 3 \
-    --output-dir ./new-node-shares
+    --output-dir ./node-shares
 ```
+
+Output: `node-shares/node-{1,2,3}-share.json` + `node-shares/public-config.json`. Point `NODE_SHARES_DIR` in `deploy/config.env` to this directory.
 
 ## Deployment
 
@@ -119,7 +128,8 @@ Builds Docker images on each VM (native amd64), creates storage buckets, generat
 ```bash
 cd deploy
 cp config.env.example config.env
-# Fill in VM IPs, bucket names, regions, etc.
+# Fill in the [manual] fields, then auto-populate the rest:
+./deploy.sh auto-config
 
 ./deploy.sh all           # Full deployment
 
@@ -164,15 +174,41 @@ Provisions the API proxy infrastructure: VPC with NAT Gateway (stable outbound I
 ./setup-ecs.sh redeploy      # Force new deployment
 ```
 
-### Key Rotation
+### Zero-Downtime Key Rotation
 
-To rotate OPRF key shares, deploy to fresh nodes rather than resealing existing ones:
+Key rotation deploys to fresh nodes rather than resealing existing ones. The old nodes keep serving traffic until the new ones are verified, so there is no downtime.
 
-1. Run a new ceremony with admin shares (`toprf-keygen node-shares`)
-2. Provision 3 new VMs
-3. Run `./deploy.sh all` with the new ceremony output and new VM IPs
-4. Update proxy config to point to the new nodes, upload to S3, redeploy ECS
-5. Decommission old VMs and delete old sealed blobs
+1. **Derive new node shares** (air-gapped machine):
+   ```bash
+   toprf-keygen node-shares \
+       --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
+       --node-threshold 2 --node-shares 3 \
+       --output-dir ./node-shares-v2
+   ```
+
+2. **Provision 3 new VMs** across GCP, Azure, and AWS (same as initial setup).
+
+3. **Update `deploy/config.env`** with the new VM IPs and `NODE_SHARES_DIR=./node-shares-v2`. Run `./deploy.sh auto-config` to fill in IPs automatically.
+
+4. **Deploy to new nodes**:
+   ```bash
+   ./deploy.sh all
+   ```
+
+5. **Verify new nodes** are healthy:
+   ```bash
+   ./deploy.sh verify
+   ```
+
+6. **Switch proxy to new nodes** — regenerate and upload the proxy config, then redeploy ECS:
+   ```bash
+   ./deploy.sh proxy-config
+   ./setup-ecs.sh upload-config
+   ./setup-ecs.sh redeploy
+   ```
+   Traffic switches to new nodes instantly on ECS redeploy.
+
+7. **Decommission old VMs** and delete their sealed blobs from cloud storage.
 
 ## Security Properties
 

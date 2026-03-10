@@ -99,16 +99,24 @@ done
 echo ""
 echo "=== Step 2: Generating keys (2-of-3 threshold) ==="
 
-CEREMONY_DIR="$TMPDIR/ceremony"
+ADMIN_DIR="$TMPDIR/admin-shares"
+NODE_SHARES_DIR="$TMPDIR/node-shares"
+
 "$KEYGEN" init \
     --admin-threshold 3 --admin-shares 5 \
+    --output-dir "$ADMIN_DIR" 2>&1
+
+"$KEYGEN" node-shares \
+    --admin-share "$ADMIN_DIR/admin-1.json" \
+    --admin-share "$ADMIN_DIR/admin-2.json" \
+    --admin-share "$ADMIN_DIR/admin-3.json" \
     --node-threshold 2 --node-shares 3 \
-    --output-dir "$CEREMONY_DIR" 2>&1
+    --output-dir "$NODE_SHARES_DIR" 2>&1
 
 echo "  Key generation complete."
 
 # Parse the public config
-PUBLIC_CONFIG="$CEREMONY_DIR/public-config.json"
+PUBLIC_CONFIG="$NODE_SHARES_DIR/public-config.json"
 if [[ ! -f "$PUBLIC_CONFIG" ]]; then
     echo "  FATAL: public-config.json not found at $PUBLIC_CONFIG"
     exit 1
@@ -134,22 +142,22 @@ echo ""
 echo "=== Step 3: Starting 3 node servers ==="
 
 for i in 1 2 3; do
-    SHARE_FILE="$CEREMONY_DIR/node-shares/node-${i}-share.json"
+    SHARE_FILE="$NODE_SHARES_DIR/node-${i}-share.json"
     if [[ ! -f "$SHARE_FILE" ]]; then
         echo "  FATAL: share file not found: $SHARE_FILE"
         exit 1
     fi
 done
 
-"$NODE" --port $NODE1_PORT --key-file "$CEREMONY_DIR/node-shares/node-1-share.json" > "$TMPDIR/node1.log" 2>&1 &
+"$NODE" --port $NODE1_PORT --key-file "$NODE_SHARES_DIR/node-1-share.json" > "$TMPDIR/node1.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 1 started (PID $!, port $NODE1_PORT)"
 
-"$NODE" --port $NODE2_PORT --key-file "$CEREMONY_DIR/node-shares/node-2-share.json" > "$TMPDIR/node2.log" 2>&1 &
+"$NODE" --port $NODE2_PORT --key-file "$NODE_SHARES_DIR/node-2-share.json" > "$TMPDIR/node2.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 2 started (PID $!, port $NODE2_PORT)"
 
-"$NODE" --port $NODE3_PORT --key-file "$CEREMONY_DIR/node-shares/node-3-share.json" > "$TMPDIR/node3.log" 2>&1 &
+"$NODE" --port $NODE3_PORT --key-file "$NODE_SHARES_DIR/node-3-share.json" > "$TMPDIR/node3.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 3 started (PID $!, port $NODE3_PORT)"
 
