@@ -25,16 +25,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
     usage() {
         cat <<'EOF'
-Usage: deploy.sh <step> [step...]
+Usage: deploy.sh [--nodes 1,2,3] <step> [step...]
+
+Options:
+  --nodes N     Operate on specific node(s) only (comma-separated)
 
 Steps (run in order for fresh deployment):
+  setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create storage buckets + bind VM identities
-  setup-vms     Install Docker on all 3 VMs
   certs         Generate mTLS certs (with real IPs) + distribute
-  firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
+  firewall      Open port 3001 from proxy IP to each node
   proxy-config  Generate docker/proxy-config.production.json
   verify        Health check all nodes via mTLS
 
@@ -47,6 +50,11 @@ Shortcuts:
   post-seal     start → firewall → proxy-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
+
+Examples:
+  ./deploy.sh all                     # Full deployment, all nodes
+  ./deploy.sh --nodes 2 init-seal     # Init-seal node 2 only
+  ./deploy.sh --nodes 1,3 start       # Start nodes 1 and 3
 EOF
     }
     usage
@@ -84,8 +92,16 @@ node_ip() {
     esac
 }
 
-# Returns space-separated list of node IDs that have an IP configured.
+# Node filter: set via --nodes flag (e.g. --nodes 1,3)
+_NODE_FILTER=""
+
+# Returns space-separated list of node IDs to operate on.
+# Respects --nodes filter; otherwise returns all nodes with IPs configured.
 active_nodes() {
+    if [[ -n "$_NODE_FILTER" ]]; then
+        echo "$_NODE_FILTER"
+        return
+    fi
     local nodes=""
     [[ -n "${NODE1_IP:-}" ]] && nodes="$nodes 1"
     [[ -n "${NODE2_IP:-}" ]] && nodes="$nodes 2"
@@ -425,13 +441,30 @@ step_init_seal() {
         # Clean up any previous init-seal container
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
+        # Build device/volume flags conditionally per cloud provider
+        local dev_flags=""
+        if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
+            dev_flags="--device /dev/sev-guest:/dev/sev-guest"
+        fi
+        local tsm_flags=""
+        if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
+            tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
+        fi
+        # Azure vTPM: pass TPM device for HCL report reading
+        local tpm_flags=""
+        if ssh_node "$i" "test -e /dev/tpmrm0" < /dev/null 2>/dev/null; then
+            tpm_flags="--device /dev/tpmrm0:/dev/tpmrm0"
+        elif ssh_node "$i" "test -e /dev/tpm0" < /dev/null 2>/dev/null; then
+            tpm_flags="--device /dev/tpm0:/dev/tpm0"
+        fi
+
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e SNP_PROVIDER=${provider} \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
-            -e TSM_REPORT_PATH=/run/tsm/report \
-            --device /dev/sev-guest:/dev/sev-guest \
+            ${tsm_flags} \
+            ${dev_flags} \
+            ${tpm_flags} \
             --privileged --user root \
-            -v /sys/kernel/config/tsm/report:/run/tsm/report \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --init-seal \
@@ -441,6 +474,18 @@ step_init_seal() {
         echo "  Waiting for attestation endpoint..."
         local waited=0
         while ! ssh_node "$i" "curl -sk https://localhost:3001/attest > /dev/null 2>&1" < /dev/null; do
+            # Check if the container has exited (early failure detection)
+            local running
+            running=$(ssh_node "$i" "sudo docker inspect -f '{{.State.Running}}' toprf-init-seal 2>/dev/null || echo false" < /dev/null)
+            if [[ "$running" != "true" ]]; then
+                echo "  Container exited prematurely. Logs:"
+                ssh_node "$i" "sudo docker logs --tail 20 toprf-init-seal 2>&1" < /dev/null || true
+                echo ""
+                echo "  Press Enter to skip this node and continue, or Ctrl-C to abort:"
+                read -r _ < /dev/tty
+                ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
+                continue 2
+            fi
             sleep 2
             waited=$((waited + 1))
             if [[ $waited -ge 60 ]]; then
@@ -519,14 +564,30 @@ step_start() {
         # Stop old container if running
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
 
+        # Build device/volume flags conditionally
+        local dev_flags=""
+        if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
+            dev_flags="--device /dev/sev-guest:/dev/sev-guest"
+        fi
+        local tsm_flags=""
+        if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
+            tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
+        fi
+        local tpm_flags=""
+        if ssh_node "$i" "test -e /dev/tpmrm0" < /dev/null 2>/dev/null; then
+            tpm_flags="--device /dev/tpmrm0:/dev/tpmrm0"
+        elif ssh_node "$i" "test -e /dev/tpm0" < /dev/null 2>/dev/null; then
+            tpm_flags="--device /dev/tpm0:/dev/tpm0"
+        fi
+
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             -e SNP_PROVIDER=${provider} \
-            -e TSM_REPORT_PATH=/run/tsm/report \
-            --device /dev/sev-guest:/dev/sev-guest \
+            ${tsm_flags} \
+            ${dev_flags} \
+            ${tpm_flags} \
             --privileged --user root \
-            -v /sys/kernel/config/tsm/report:/run/tsm/report \
             -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
             ${NODE_IMAGE} \
@@ -775,16 +836,19 @@ step_redeploy() {
 
 usage() {
     cat <<'EOF'
-Usage: deploy.sh <step> [step...]
+Usage: deploy.sh [--nodes 1,2,3] <step> [step...]
+
+Options:
+  --nodes N     Operate on specific node(s) only (comma-separated)
 
 Steps (run in order for fresh deployment):
+  setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create storage buckets + bind VM identities
-  setup-vms     Install Docker on all 3 VMs
   certs         Generate mTLS certs (with real IPs) + distribute
-  firewall      Open port 3001 from proxy IP to each node
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
+  firewall      Open port 3001 from proxy IP to each node
   proxy-config  Generate docker/proxy-config.production.json
   verify        Health check all nodes via mTLS
 
@@ -797,6 +861,11 @@ Shortcuts:
   post-seal     start → firewall → proxy-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
+
+Examples:
+  ./deploy.sh all                     # Full deployment, all nodes
+  ./deploy.sh --nodes 2 init-seal     # Init-seal node 2 only
+  ./deploy.sh --nodes 1,3 start       # Start nodes 1 and 3
 EOF
 }
 
@@ -805,7 +874,33 @@ if [[ $# -eq 0 ]]; then
     exit 0
 fi
 
-for step in "$@"; do
+# Parse --nodes flag before processing steps
+steps=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nodes|-n)
+            shift
+            # Accept comma-separated (1,3) or space-separated
+            _NODE_FILTER=$(echo "$1" | tr ',' ' ')
+            shift
+            ;;
+        *)
+            steps+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#steps[@]} -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+if [[ -n "$_NODE_FILTER" ]]; then
+    info "Operating on node(s): $_NODE_FILTER"
+fi
+
+for step in "${steps[@]}"; do
     case "$step" in
         pull)         step_pull ;;
         storage)      step_storage ;;

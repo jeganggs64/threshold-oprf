@@ -203,6 +203,10 @@ struct InitSealState {
     upload_url: String,
     /// Raw attestation report bytes (for /attest endpoint).
     attestation_report_bytes: Vec<u8>,
+    /// Measurement from the attestation report (for v1 sealing fallback).
+    measurement: [u8; 48],
+    /// Policy from the attestation report (for v1 sealing fallback).
+    policy: u64,
     /// Shutdown signal sender — triggers server exit after /init-key completes.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
@@ -235,28 +239,36 @@ async fn init_key_handler(
     })?;
     info!("init-seal: key share JSON parsed successfully");
 
-    // Step 1: Get hardware-derived key via MSG_KEY_REQ
-    info!("init-seal: requesting hardware-derived key via MSG_KEY_REQ (SAFE_FIELD_SELECT)");
-    let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT).map_err(|e| {
-        error!("init-seal: failed to get derived key: {e}");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to get derived key: {e}"),
-        )
-    })?;
-    info!("init-seal: hardware-derived key obtained successfully");
-
-    // Step 2: Seal the key share
-    info!("init-seal: sealing key share with derived key");
-    let sealed_blob =
-        toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
-            .map_err(|e| {
-                error!("init-seal: sealing failed: {e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("sealing failed: {e}"),
-                )
-            })?;
+    // Step 1+2: Seal the key share.
+    // Try v2 (hardware-derived key via MSG_KEY_REQ) first; fall back to v1
+    // (HKDF from measurement) on platforms without /dev/sev-guest (e.g. Azure).
+    let sealed_blob = match toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT) {
+        Ok(derived_key) => {
+            info!("init-seal: hardware-derived key obtained (v2 sealing)");
+            toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
+                .map_err(|e| {
+                    error!("init-seal: v2 sealing failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("sealing failed: {e}"),
+                    )
+                })?
+        }
+        Err(e) => {
+            warn!(
+                "init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing (HKDF from measurement)"
+            );
+            toprf_seal::sealing::seal(&share_bytes, &state.measurement, state.policy).map_err(
+                |e| {
+                    error!("init-seal: v1 sealing failed: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("sealing failed: {e}"),
+                    )
+                },
+            )?
+        }
+    };
     info!(
         sealed_blob_size = sealed_blob.len(),
         "init-seal: key share sealed successfully"
@@ -376,6 +388,8 @@ async fn run_init_seal(port: &str, upload_url: String) {
     let init_state = Arc::new(InitSealState {
         upload_url,
         attestation_report_bytes: attestation_bytes,
+        measurement: report.measurement,
+        policy: report.policy,
         shutdown_tx,
     });
 

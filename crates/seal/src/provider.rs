@@ -189,7 +189,7 @@ pub fn get_derived_key(_field_select: u64) -> Result<Zeroizing<[u8; 32]>, SealEr
 }
 
 // ---------------------------------------------------------------------------
-// Auto-detect provider: TSM configfs (kernel 6.7+) → /dev/sev-guest fallback
+// Auto-detect provider: TSM configfs (kernel 6.7+) → /dev/sev-guest → vTPM
 // ---------------------------------------------------------------------------
 
 /// TSM configfs base path (available on Linux kernel 6.7+).
@@ -214,9 +214,21 @@ fn get_report_auto(report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealErro
         }
     }
 
-    // Fallback: legacy /dev/sev-guest ioctl (kernel < 6.7)
-    tracing::info!("Using /dev/sev-guest ioctl for attestation report");
-    get_report_dev_sev_guest_ioctl(report_data)
+    // Fallback 1: legacy /dev/sev-guest ioctl (kernel < 6.7)
+    if std::path::Path::new("/dev/sev-guest").exists() {
+        tracing::info!("Using /dev/sev-guest ioctl for attestation report");
+        match get_report_dev_sev_guest_ioctl(report_data) {
+            Ok(report) => return Ok(report),
+            Err(e) => {
+                tracing::warn!("/dev/sev-guest ioctl failed ({e}), falling back to vTPM");
+            }
+        }
+    }
+
+    // Fallback 2: Azure vTPM — reads pre-generated SNP report from HCL blob
+    // in TPM NV index 0x01400001.  Custom report_data is NOT supported.
+    tracing::info!("Trying vTPM (Azure HCL) for attestation report");
+    get_report_vtpm(report_data)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -377,6 +389,199 @@ fn get_report_dev_sev_guest_ioctl(report_data: Option<&[u8; 64]>) -> Result<SnpR
     }
 
     SnpReport::from_bytes(&resp.data[..REPORT_TOTAL_SIZE])
+}
+
+// ---------------------------------------------------------------------------
+// Azure vTPM provider — reads SNP report from HCL blob in TPM NV index
+// ---------------------------------------------------------------------------
+
+/// Azure Confidential VMs don't expose /dev/sev-guest or functional TSM configfs.
+/// Instead, the SNP attestation report is available through the vTPM: the
+/// hypervisor stores an HCL (Host Compatibility Layer) report in TPM NV index
+/// 0x01400001.  The HCL report wraps a standard AMD SNP attestation report.
+///
+/// Limitations:
+/// - The report is pre-generated at boot; custom report_data is NOT embedded.
+///   (report_data contains a hash of the HCL runtime JSON, not user-supplied data.)
+/// - MSG_KEY_REQ (get_derived_key) is NOT available on Azure — use v1 sealing
+///   (HKDF from measurement) instead of v2 (hardware-derived key).
+#[cfg(target_os = "linux")]
+fn get_report_vtpm(report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealError> {
+    if report_data.is_some() {
+        tracing::warn!(
+            "vTPM attestation: custom report_data is NOT supported on Azure; \
+             the returned report contains the HCL runtime data hash instead"
+        );
+    }
+
+    // Try /dev/tpmrm0 (resource manager) first, then /dev/tpm0
+    let tpm_path = if std::path::Path::new("/dev/tpmrm0").exists() {
+        "/dev/tpmrm0"
+    } else if std::path::Path::new("/dev/tpm0").exists() {
+        "/dev/tpm0"
+    } else {
+        return Err(SealError::ProviderError(
+            "no TPM device found (/dev/tpmrm0 or /dev/tpm0)".into(),
+        ));
+    };
+
+    tracing::info!(
+        path = tpm_path,
+        "vTPM: reading HCL report from NV index 0x01400001"
+    );
+
+    const HCL_NV_INDEX: u32 = 0x01400001;
+    const HCL_HEADER_SIZE: usize = 32;
+
+    // Read the HCL report from the TPM NV index (2600 bytes on Azure)
+    let hcl_data = tpm2_nv_read_all(tpm_path, HCL_NV_INDEX, 2600)?;
+
+    if hcl_data.len() < HCL_HEADER_SIZE + REPORT_TOTAL_SIZE {
+        return Err(SealError::ProviderError(format!(
+            "HCL report too small: {} bytes (need at least {})",
+            hcl_data.len(),
+            HCL_HEADER_SIZE + REPORT_TOTAL_SIZE
+        )));
+    }
+
+    // Validate HCL header: magic "HCLA", report_type == 2 (SNP)
+    if &hcl_data[0..4] != b"HCLA" {
+        return Err(SealError::ProviderError(format!(
+            "invalid HCL report magic: {:02x}{:02x}{:02x}{:02x}",
+            hcl_data[0], hcl_data[1], hcl_data[2], hcl_data[3]
+        )));
+    }
+
+    let report_type = u32::from_le_bytes(hcl_data[12..16].try_into().unwrap());
+    if report_type != 2 {
+        return Err(SealError::ProviderError(format!(
+            "HCL report type {report_type} is not SNP (expected 2)"
+        )));
+    }
+
+    // SNP report is embedded at offset 32 (after the HCL header)
+    let snp_data = &hcl_data[HCL_HEADER_SIZE..HCL_HEADER_SIZE + REPORT_TOTAL_SIZE];
+
+    tracing::info!(
+        hcl_size = hcl_data.len(),
+        snp_offset = HCL_HEADER_SIZE,
+        "vTPM: extracted SNP report from HCL blob"
+    );
+
+    SnpReport::from_bytes(snp_data)
+}
+
+/// Read an NV index from the TPM, chunking if necessary (max 1024 bytes/read).
+#[cfg(target_os = "linux")]
+fn tpm2_nv_read_all(
+    tpm_path: &str,
+    nv_index: u32,
+    total_size: usize,
+) -> Result<Vec<u8>, SealError> {
+    const MAX_CHUNK: usize = 1024;
+
+    let mut result = Vec::with_capacity(total_size);
+    while result.len() < total_size {
+        let remaining = total_size - result.len();
+        let chunk_size = remaining.min(MAX_CHUNK) as u16;
+        let offset = result.len() as u16;
+
+        let chunk = tpm2_nv_read_chunk(tpm_path, nv_index, chunk_size, offset)?;
+        if chunk.is_empty() {
+            break; // No more data
+        }
+        result.extend_from_slice(&chunk);
+    }
+
+    Ok(result)
+}
+
+/// Send a single TPM2_NV_Read command with owner auth (empty password).
+///
+/// Writes a raw TPM2 command to the device and reads the response.
+/// This avoids any dependency on tpm2-tss or tpm2-tools.
+#[cfg(target_os = "linux")]
+fn tpm2_nv_read_chunk(
+    tpm_path: &str,
+    nv_index: u32,
+    size: u16,
+    offset: u16,
+) -> Result<Vec<u8>, SealError> {
+    use std::fs::OpenOptions;
+    use std::io::{Read, Write};
+
+    let mut tpm = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tpm_path)
+        .map_err(|e| SealError::ProviderError(format!("failed to open {tpm_path}: {e}")))?;
+
+    // TPM2_NV_Read command with password session (owner auth, empty password)
+    //
+    // Layout (35 bytes total):
+    //   Header (10):  tag(2) + commandSize(4) + commandCode(4)
+    //   Handles (8):  authHandle(4) + nvIndex(4)
+    //   Auth area:    authAreaSize(4) + session(9)
+    //   Parameters:   size(2) + offset(2)
+    const CMD_SIZE: u32 = 35;
+
+    let mut cmd = Vec::with_capacity(CMD_SIZE as usize);
+    cmd.extend_from_slice(&0x8002u16.to_be_bytes()); // TPM_ST_SESSIONS
+    cmd.extend_from_slice(&CMD_SIZE.to_be_bytes());
+    cmd.extend_from_slice(&0x0000_014Eu32.to_be_bytes()); // TPM2_CC_NV_Read
+    cmd.extend_from_slice(&0x4000_0001u32.to_be_bytes()); // TPM_RH_OWNER
+    cmd.extend_from_slice(&nv_index.to_be_bytes());
+    cmd.extend_from_slice(&9u32.to_be_bytes()); // auth area size
+    cmd.extend_from_slice(&0x4000_0009u32.to_be_bytes()); // TPM_RS_PW
+    cmd.extend_from_slice(&0u16.to_be_bytes()); // nonce: empty
+    cmd.push(0x01); // session attributes: continueSession
+    cmd.extend_from_slice(&0u16.to_be_bytes()); // hmac: empty
+    cmd.extend_from_slice(&size.to_be_bytes());
+    cmd.extend_from_slice(&offset.to_be_bytes());
+
+    debug_assert_eq!(cmd.len(), CMD_SIZE as usize);
+
+    tpm.write_all(&cmd)
+        .map_err(|e| SealError::ProviderError(format!("TPM2_NV_Read write failed: {e}")))?;
+
+    // Read response (generous buffer)
+    let mut resp = vec![0u8; 10 + 4 + 2 + size as usize + 64];
+    let n = tpm
+        .read(&mut resp)
+        .map_err(|e| SealError::ProviderError(format!("TPM2_NV_Read read failed: {e}")))?;
+    resp.truncate(n);
+
+    if resp.len() < 10 {
+        return Err(SealError::ProviderError(format!(
+            "TPM2_NV_Read response too short: {n} bytes"
+        )));
+    }
+
+    // Parse response header
+    let response_code = u32::from_be_bytes(resp[6..10].try_into().unwrap());
+    if response_code != 0 {
+        return Err(SealError::ProviderError(format!(
+            "TPM2_NV_Read failed: response code 0x{response_code:08X}"
+        )));
+    }
+
+    // Response body: parameterSize(4) + TPM2B_MAX_NV_BUFFER { size(2) + data[] }
+    if resp.len() < 16 {
+        return Err(SealError::ProviderError(
+            "TPM2_NV_Read response too short for data".into(),
+        ));
+    }
+
+    let data_size = u16::from_be_bytes(resp[14..16].try_into().unwrap()) as usize;
+    if resp.len() < 16 + data_size {
+        return Err(SealError::ProviderError(format!(
+            "TPM2_NV_Read response truncated: expected {} data bytes, got {}",
+            data_size,
+            resp.len() - 16
+        )));
+    }
+
+    Ok(resp[16..16 + data_size].to_vec())
 }
 
 #[cfg(test)]
