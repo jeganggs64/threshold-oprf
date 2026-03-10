@@ -24,6 +24,7 @@ pem = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+jsonwebtoken = { workspace = true }
 subtle = "2"
 
 [dev-dependencies]
