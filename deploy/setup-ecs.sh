@@ -54,8 +54,8 @@ AZ_1="${REGION}a"
 AZ_2="${REGION}b"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-API_IMAGE="${ECR_URI}/${API_ECR_REPO:-toprf/api-server}:latest"
-PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-toprf/toprf-proxy}:latest"
+API_IMAGE="${ECR_URI}/${API_ECR_REPO:-ruonid/frontend}:latest"
+PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-ruonid/proxy}:latest"
 CONFIG_BUCKET="${ECS_CONFIG_BUCKET:-${CLUSTER_NAME}-ecs-config}"
 
 # State file — tracks created resource IDs for idempotency
@@ -522,7 +522,7 @@ step_ecr() {
     echo ""
     info "Creating ECR repo for api-server"
 
-    local ecr_repo="${API_ECR_REPO:-toprf/api-server}"
+    local ecr_repo="${API_ECR_REPO:-ruonid/frontend}"
     aws ecr create-repository --region "$REGION" \
         --repository-name "$ecr_repo" 2>/dev/null \
         || warn "repo may already exist"
