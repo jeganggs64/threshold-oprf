@@ -1,6 +1,6 @@
 # Threshold OPRF
 
-A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF key is split into 3 shares using 2-of-3 Shamir secret sharing, with each share running inside an AMD SEV-SNP Trusted Execution Environment on a different cloud provider (GCP, Azure, AWS). No single provider holds enough shares to evaluate the function.
+A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF key is split into 3 shares using 2-of-3 Shamir secret sharing, with each share running inside an AMD SEV-SNP Trusted Execution Environment on a separate AWS region. No single region holds enough shares to evaluate the function.
 
 ## Architecture
 
@@ -15,15 +15,15 @@ Express API (port 3002)        ← device attestation, rate limiting
     |  HTTP (internal)
     v
 Rust TOPRF Proxy (port 3000)   ← fans out to TEE nodes, DLEQ verification
-    |  mTLS
-    +── Node 1 (GCP,   Confidential VM, SEV-SNP)
-    +── Node 2 (Azure, Confidential VM, SEV-SNP)
-    +── Node 3 (AWS,   SEV-SNP instance)
+    |  TLS (VPC peering)
+    +── Node 1 (AWS ap-southeast-1, SEV-SNP)
+    +── Node 2 (AWS us-east-1, SEV-SNP)
+    +── Node 3 (AWS eu-west-1, SEV-SNP)
 ```
 
 The proxy collects partial evaluations from any 2 of 3 nodes, verifies DLEQ proofs, and returns verified partials to the client. The client performs Lagrange interpolation and unblinding locally — the proxy never sees the unblinded result.
 
-Each node's sealed key blob is stored on the same cloud provider where the VM runs, encrypted with a hardware-derived key via `MSG_KEY_REQ` — even the cloud provider cannot decrypt it.
+Each node's sealed key blob is stored in S3, encrypted with a hardware-derived key via `MSG_KEY_REQ` — even AWS cannot decrypt it.
 
 ## Repository Structure
 
@@ -34,7 +34,7 @@ crates/
   proxy/      Orchestrator — fans out to nodes, verifies DLEQ proofs, rate limits
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
-  monitor/    GCP maintenance event monitor with webhook alerts
+  monitor/    Maintenance event monitor with webhook alerts
 docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation scripts (deploy.sh, setup-ecs.sh)
 scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
@@ -45,11 +45,11 @@ scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
 | Crate | Description |
 |-------|-------------|
 | **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination. Built on FROST secp256k1 and k256. |
-| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Supports three key loading modes: init-seal (attested TLS injection), auto-unseal (hardware-sealed blob from cloud storage), and key-file (dev/test). |
-| **toprf-proxy** | Single entry point for clients. Issues challenge nonces, validates device attestation (Apple App Attest / Google Play Integrity), fans out to nodes over mTLS, verifies DLEQ proofs, enforces per-device rate limits. |
+| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Supports three key loading modes: init-seal (attested TLS injection), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
+| **toprf-proxy** | Single entry point for clients. Issues challenge nonces, validates device attestation (Apple App Attest / Google Play Integrity), fans out to nodes over TLS, verifies DLEQ proofs, enforces per-device rate limits. |
 | **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (2-of-3 for TEE deployment). Also supports re-deriving node shares from admin shares. |
 | **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes attestation report fetching and verification. |
-| **toprf-monitor** | Daemon that polls GCP metadata for scheduled host maintenance events and sends webhook alerts. Critical for `TERMINATE_ON_HOST_MAINTENANCE` Confidential VMs. |
+| **toprf-monitor** | Daemon that polls for scheduled host maintenance events and sends webhook alerts. |
 
 ## Quick Start
 
@@ -72,14 +72,14 @@ bash scripts/integration-test.sh
 ### Local Development
 
 ```bash
-# Generate mTLS certificates
+# Generate TLS certificates
 bash scripts/gen-certs.sh
 
 # Start 3 nodes + proxy with Docker Compose
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Proxy available at `https://localhost:3000`. Nodes are only reachable within the Docker network.
+Proxy available at `http://localhost:3000`. Nodes are only reachable within the Docker network.
 
 ## Key Management
 
@@ -110,20 +110,20 @@ Output: `node-shares/node-{1,2,3}-share.json` + `node-shares/public-config.json`
 
 ## Deployment
 
-Three TEE VMs (one per cloud provider) run the node binary. An ECS Fargate service runs the Express API + Rust proxy behind an ALB.
+Three TEE VMs (one per AWS region) run the node binary. An ECS Fargate service runs the Express API + Rust proxy behind an ALB. The proxy connects to nodes via VPC peering over private IPs.
 
 ### Prerequisites
 
-- 3 AMD SEV-SNP VMs provisioned (GCP Confidential VM, Azure DCasv5, AWS C6a)
-- IAM roles / managed identities / instance profiles attached
+- 3 AWS SEV-SNP instances provisioned (c6a.large or m6a.large) across regions
+- IAM instance profiles attached with S3 access
 - SSH access to all 3 VMs
-- `gcloud`, `az`, `aws` CLIs authenticated locally
+- `aws` CLI authenticated locally
 - `jq`, `openssl`, `curl` installed locally
 - Key ceremony completed
 
 ### TEE Node Deployment (`deploy/deploy.sh`)
 
-Pulls the node image from ghcr.io (built by CI), creates storage buckets, generates mTLS certs, handles init-seal key injection, and starts nodes.
+Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates TLS certs, handles init-seal key injection, and starts nodes.
 
 ```bash
 cd deploy
@@ -136,22 +136,23 @@ cp config.env.example config.env
 # Or step by step
 ./deploy.sh setup-vms     # Install Docker on VMs
 ./deploy.sh pull           # Pull node image from ghcr.io
-./deploy.sh storage        # Create sealed blob storage buckets
-./deploy.sh certs          # Generate mTLS certs + distribute to VMs
+./deploy.sh storage        # Create S3 buckets for sealed blobs
+./deploy.sh certs          # Generate TLS certs + distribute to VMs
 ./deploy.sh init-seal      # Interactive: inject key shares via attested TLS
 ./deploy.sh start          # Start nodes in normal mode
-./deploy.sh firewall       # Open port 3001 from proxy to nodes
+./deploy.sh firewall       # Allow port 3001 from proxy VPC CIDR
+./deploy.sh peering        # Set up VPC peering (proxy ↔ node VPCs)
 ./deploy.sh proxy-config   # Generate proxy-config.production.json
-./deploy.sh verify         # Health check all nodes via mTLS
+./deploy.sh verify         # Health check all nodes
 
 # Utilities
-./deploy.sh show-ips       # Fetch VM IPs from all 3 providers
+./deploy.sh show-ips       # Fetch VM IPs from all regions
 ./deploy.sh redeploy       # Pull latest image + restart nodes
 ```
 
 ### ECS Fargate + ALB (`deploy/setup-ecs.sh`)
 
-Provisions the API proxy infrastructure: VPC with NAT Gateway (stable outbound IP for node firewall rules), ALB, ECS Fargate cluster.
+Provisions the API proxy infrastructure: VPC with NAT Gateway, ALB, ECS Fargate cluster.
 
 ```bash
 ./setup-ecs.sh all          # Full infrastructure setup
@@ -169,7 +170,7 @@ Provisions the API proxy infrastructure: VPC with NAT Gateway (stable outbound I
 ./setup-ecs.sh service      # ECS service
 
 # Operations
-./setup-ecs.sh upload-config # Upload proxy config + certs to S3
+./setup-ecs.sh upload-config # Upload proxy config + CA cert to S3
 ./setup-ecs.sh status        # Show NAT EIP, ALB DNS, service health
 ./setup-ecs.sh redeploy      # Force new deployment
 ```
@@ -186,7 +187,7 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
        --output-dir ./node-shares-v2
    ```
 
-2. **Provision 3 new VMs** across GCP, Azure, and AWS (same as initial setup).
+2. **Provision 3 new VMs** across AWS regions.
 
 3. **Update `deploy/config.env`** with the new VM IPs and `NODE_SHARES_DIR=./node-shares-v2`. Run `./deploy.sh auto-config` to fill in IPs automatically.
 
@@ -208,14 +209,15 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
    ```
    Traffic switches to new nodes instantly on ECS redeploy.
 
-7. **Decommission old VMs** and delete their sealed blobs from cloud storage.
+7. **Decommission old VMs** and delete their sealed blobs from S3.
 
 ## Security Properties
 
-- **No single point of compromise** — key shares split across 3 cloud providers, each below the 2-of-3 threshold
-- **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP measurement-derived keys; cloud providers cannot decrypt
+- **No single point of compromise** — key shares split across 3 AWS regions, each below the 2-of-3 threshold
+- **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP measurement-derived keys; AWS cannot decrypt
 - **TEE attestation** — key injection verified against hardware attestation reports
-- **mTLS** — proxy-to-node communication authenticated with mutual TLS
+- **Network isolation** — nodes only reachable from proxy VPC via VPC peering; security groups restrict port 3001
+- **Server TLS** — proxy-to-node communication encrypted with CA-signed TLS certificates
 - **Device attestation** — Apple App Attest and Google Play Integrity validation before OPRF evaluation
 - **Proxy-blind** — proxy verifies DLEQ proofs but never sees unblinded points or final output
 

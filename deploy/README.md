@@ -1,23 +1,39 @@
 # TEE Node Deployment Guide
 
-Deploy threshold OPRF nodes across 3 cloud providers, each running inside an AMD SEV-SNP Trusted Execution Environment.
+Deploy threshold OPRF nodes across 3 AWS regions, each running inside an AMD SEV-SNP Trusted Execution Environment. Nodes communicate with the proxy over VPC peering using server-side TLS.
 
 ## Overview
 
-Each node runs in a Docker container on a Confidential VM. During init-seal, the node's key share is encrypted with a hardware-bound key and uploaded to cloud storage. On subsequent boots, the node downloads the sealed blob and decrypts it using the same hardware key — the cloud provider cannot read it.
+Each node runs in a Docker container on a Confidential VM. During init-seal, the node's key share is encrypted with a hardware-bound key and uploaded to S3. On subsequent boots, the node downloads the sealed blob and decrypts it using the same hardware key — AWS cannot read it.
 
-| Node | Cloud | VM Type | Attestation | Sealing |
-|------|-------|---------|-------------|---------|
-| 1 | GCP | C2D (SEV-SNP) | TSM configfs | v2 (MSG_KEY_REQ) |
-| 2 | Azure | DCasv5 (SEV-SNP) | vTPM (HCL report) | v1 (HKDF from measurement) |
-| 3 | AWS | C6a/M6a (SEV-SNP) | TSM configfs | v2 (MSG_KEY_REQ) |
+| Node | Region | VM Type | Sealing |
+|------|--------|---------|---------|
+| 1 | ap-southeast-1 (Singapore) | C6a/M6a (SEV-SNP) | v2 (MSG_KEY_REQ) |
+| 2 | us-east-1 (Virginia) | C6a/M6a (SEV-SNP) | v2 (MSG_KEY_REQ) |
+| 3 | eu-west-1 (Ireland) | C6a/M6a (SEV-SNP) | v2 (MSG_KEY_REQ) |
 
-Azure doesn't expose `/dev/sev-guest`, so it uses the vTPM for attestation and HKDF-based sealing instead of hardware-derived keys. GCP and AWS use the standard kernel interfaces.
+## Architecture
+
+```
+Internet → ALB (443) → ECS Fargate (eu-west-2):
+  ├── toprf-proxy (Rust, port 3000)
+  └── api-server (Node.js, port 3002)
+         ↓ VPC Peering (private IPs)
+  ├── Node 1 (ap-southeast-1, :3001, TLS)
+  ├── Node 2 (us-east-1, :3001, TLS)
+  └── Node 3 (eu-west-1, :3001, TLS)
+```
+
+**Security model:**
+- Nodes are only reachable from the proxy VPC via VPC peering
+- Security groups restrict port 3001 to the proxy VPC CIDR
+- Server-side TLS with CA-signed certificates for encryption in transit
+- No mTLS required — network isolation via VPC peering replaces client auth
 
 ## Prerequisites
 
 **Local machine:**
-- `gcloud`, `az`, `aws` CLIs authenticated
+- `aws` CLI authenticated
 - `jq`, `openssl`, `curl` installed
 - SSH access to all 3 VMs
 - Key ceremony completed (see main README)
@@ -29,80 +45,19 @@ Azure doesn't expose `/dev/sev-guest`, so it uses the vTPM for attestation and H
 
 ## 1. Provision VMs
 
-### Node 1: GCP Confidential VM
+Launch a `c6a.large` (or `m6a.large`) instance in each region with an AMD SEV-SNP AMI (Ubuntu 24.04).
 
-```bash
-gcloud compute instances create toprf-node-1 \
-    --project=<PROJECT> \
-    --zone=<ZONE> \
-    --machine-type=n2d-standard-2 \
-    --confidential-compute-type=SEV_SNP \
-    --min-cpu-platform="AMD Milan" \
-    --maintenance-policy=TERMINATE \
-    --image-family=ubuntu-2404-lts-amd64 \
-    --image-project=ubuntu-os-cloud \
-    --boot-disk-size=30GB \
-    --scopes=default,storage-read-write \
-    --service-account=<SA_EMAIL>
-```
+**Critical for each node:**
 
-**Critical:** Include `storage-read-write` in `--scopes`. If you forget, you must stop the VM and run:
-```bash
-gcloud compute instances set-service-account toprf-node-1 \
-    --zone=<ZONE> --project=<PROJECT> \
-    --scopes=default,storage-read-write
-gcloud compute instances start toprf-node-1 --zone=<ZONE> --project=<PROJECT>
-```
-The VM IP will change after restart — update `config.env`.
-
-### Node 2: Azure Confidential VM
-
-```bash
-az vm create \
-    --resource-group <RG> \
-    --name toprf-node-2 \
-    --size Standard_DC2as_v5 \
-    --image Canonical:ubuntu-24_04-lts:cvm:latest \
-    --security-type ConfidentialVM \
-    --os-disk-security-encryption-type VMGuestStateOnly \
-    --admin-username azureuser \
-    --generate-ssh-keys \
-    --public-ip-sku Standard
-```
-
-Assign a managed identity for blob storage access:
-```bash
-az vm identity assign --resource-group <RG> --name toprf-node-2
-```
-
-### Node 3: AWS SEV-SNP Instance
-
-Launch a `c6a.large` (or `m6a.large`) instance with an AMD SEV-SNP AMI (Ubuntu 24.04).
-
-**Critical:** Attach an IAM instance profile at launch. If you forget:
-```bash
-aws ec2 associate-iam-instance-profile \
-    --instance-id <INSTANCE_ID> \
-    --iam-instance-profile Name=<PROFILE_NAME> \
-    --region <REGION>
-```
-
-The IAM role needs:
-```json
-{
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject"],
-    "Resource": "arn:aws:s3:::<BUCKET>/node-3-sealed.bin"
-}
-```
-
-Set the IMDS hop limit to 2 (required for Docker containers to reach IMDS):
-```bash
-aws ec2 modify-instance-metadata-options \
-    --instance-id <INSTANCE_ID> \
-    --http-put-response-hop-limit 2 \
-    --region <REGION>
-```
+1. Attach an IAM instance profile with S3 read/write for its sealed blob bucket
+2. Set IMDS hop limit to 2 (required for Docker containers):
+   ```bash
+   aws ec2 modify-instance-metadata-options \
+       --instance-id <INSTANCE_ID> \
+       --http-put-response-hop-limit 2 \
+       --region <REGION>
+   ```
+3. Tag the instance `Name=toprf-node-<N>` for auto-config discovery
 
 ---
 
@@ -113,7 +68,7 @@ cd deploy
 cp config.env.example config.env
 ```
 
-Fill in the `[manual]` fields in `config.env`, then auto-populate IPs and other derived fields:
+Fill in the `[manual]` fields, then auto-populate IPs, SGs, and VPC IDs:
 
 ```bash
 ./deploy.sh auto-config
@@ -129,17 +84,15 @@ Fill in the `[manual]` fields in `config.env`, then auto-populate IPs and other 
 ./deploy.sh all
 ```
 
-This runs: `setup-vms` → `pull` → `storage` → `certs` → `init-seal` → `start` → `firewall` → `proxy-config` → `verify`
+This runs: `setup-vms` → `pull` → `storage` → `certs` → `init-seal` → `start` → `firewall` → `peering` → `proxy-config` → `verify`
 
 ### Per-node deployment
 
-Use `--nodes` to target specific nodes. This is useful when one node fails and you need to retry without rerunning everything:
-
 ```bash
 # Deploy only node 2
-./deploy.sh --nodes 2 setup-vms pull storage certs init-seal start firewall
+./deploy.sh --nodes 2 setup-vms pull storage certs init-seal start
 
-# Init-seal just node 3 (e.g. after fixing IAM)
+# Init-seal just node 3
 ./deploy.sh --nodes 3 init-seal
 
 # Restart nodes 1 and 3
@@ -158,10 +111,10 @@ Use `--nodes` to target specific nodes. This is useful when one node fails and y
 # 2. Pull the node image from ghcr.io
 ./deploy.sh pull
 
-# 3. Create storage buckets and bind IAM identities
+# 3. Create S3 buckets for sealed key blobs
 ./deploy.sh storage
 
-# 4. Generate mTLS certs and distribute to VMs
+# 4. Generate TLS certs and distribute to VMs
 ./deploy.sh certs
 
 # 5. Interactive key injection (per-node recommended)
@@ -169,16 +122,19 @@ Use `--nodes` to target specific nodes. This is useful when one node fails and y
 ./deploy.sh --nodes 2 init-seal
 ./deploy.sh --nodes 3 init-seal
 
-# 6. Start nodes in normal mode (auto-unseal from cloud storage)
+# 6. Start nodes in normal mode (auto-unseal from S3)
 ./deploy.sh start
 
-# 7. Open port 3001 from proxy IP to each node
+# 7. Open port 3001 from proxy VPC CIDR
 ./deploy.sh firewall
 
-# 8. Generate proxy config for ECS
+# 8. Set up VPC peering between proxy and node VPCs
+./deploy.sh peering
+
+# 9. Generate proxy config (uses private IPs)
 ./deploy.sh proxy-config
 
-# 9. Health check
+# 10. Health check
 ./deploy.sh verify
 ```
 
@@ -193,99 +149,75 @@ Installs Docker on each VM via `curl -fsSL https://get.docker.com | sudo sh`.
 Runs `docker pull ghcr.io/<owner>/toprf-node:latest` on each VM.
 
 ### `storage`
-Creates sealed blob storage (GCS bucket, Azure blob container, S3 bucket) and grants the VM's identity read/write access.
+Creates S3 buckets for sealed key blobs in each node's region.
 
 ### `certs`
-Generates a CA + per-node TLS certificates with the node's public IP as a SAN. Also generates a proxy client certificate for mTLS. Distributes certs to each VM at `/etc/toprf/certs/`.
+Generates a CA and per-node TLS server certificates with both public and private IPs as SANs. Distributes certs to each VM at `/etc/toprf/certs/`.
 
 ### `init-seal`
 For each node:
-1. Starts a temporary container in init-seal mode (ephemeral TLS, `/attest` and `/init-key` endpoints)
+1. Starts a temporary container in init-seal mode
 2. Waits for the attestation endpoint to be ready
 3. Pauses for you to verify the attestation report
 4. Sends the key share via `/init-key`
-5. The node seals the key share and uploads the sealed blob to cloud storage
+5. The node seals the key share and uploads to S3
 6. Container exits
 
-The deploy script automatically detects available hardware interfaces per VM:
-- `/dev/sev-guest` → passed as `--device` for MSG_KEY_REQ (GCP, AWS)
-- `/sys/kernel/config/tsm/report` → bind-mounted for TSM configfs attestation (GCP, AWS)
-- `/dev/tpmrm0` or `/dev/tpm0` → passed as `--device` for vTPM attestation (Azure)
-
-If the container exits prematurely (e.g. Azure without the code changes), the script detects it and offers to skip.
-
 ### `start`
-Starts each node in normal mode with `SEALED_KEY_URL` pointing to its sealed blob. The node auto-unseals on boot.
+Starts each node in normal mode with `SEALED_KEY_URL` pointing to its S3 sealed blob. The node auto-unseals on boot and serves HTTPS on port 3001.
 
 ### `firewall`
-Opens port 3001 on each node's firewall, restricted to the proxy IP only.
+Adds a security group rule allowing TCP 3001 from the proxy VPC CIDR.
+
+### `peering`
+Creates VPC peering connections between the proxy VPC (eu-west-2) and each node's VPC, with routes in both directions.
+
+### `proxy-config`
+Generates `docker/proxy-config.production.json` using private IPs for node endpoints.
 
 ### `verify`
-Runs an mTLS health check against each node.
+Health-checks each node via HTTPS with CA cert verification.
 
 ---
 
-## 5. Sealing modes
+## 5. VPC Peering
 
-### v2: Hardware-derived key (GCP, AWS)
-Uses AMD SEV-SNP `MSG_KEY_REQ` to request a key from the CPU's secure processor. The key is unique to the physical chip + software measurement. Even with access to the sealed blob and cloud storage, the data cannot be decrypted without the same physical CPU running the same code.
+The proxy connects to nodes over VPC peering using private IPs. This provides:
 
-### v1: HKDF from measurement (Azure)
-Azure doesn't expose `/dev/sev-guest`, so `MSG_KEY_REQ` is unavailable. Instead, the sealing key is derived via HKDF from the SNP measurement (firmware + kernel + initrd hash) plus a random salt. The measurement binds the sealed blob to the specific VM image. The sealed blob is protected by Azure managed identity + blob storage IAM.
+- **Network isolation**: Nodes are not publicly accessible on port 3001
+- **No mTLS needed**: Security groups + VPC peering replace client certificate auth
+- **Lower latency**: Direct AWS backbone instead of public internet
+- **Stable addressing**: Private IPs don't change on restart
 
-The auto-unseal code detects the blob version automatically and uses the correct unseal path.
-
----
-
-## 6. Adding a new node
-
-1. **Provision the VM** following the instructions in section 1 for the relevant cloud provider
-2. **Key requirement:** The VM must have:
-   - SSH access from your deploy machine
-   - IAM permissions to read/write its sealed blob storage
-   - AMD SEV-SNP enabled
-3. **Add to `config.env`:** Set the node's IP, bucket, and provider fields
-4. **Run auto-config** to fill in derived fields: `./deploy.sh auto-config`
-5. **Deploy the single node:**
-   ```bash
-   ./deploy.sh --nodes <N> setup-vms pull storage certs init-seal start firewall
-   ```
-6. **Verify:** `./deploy.sh --nodes <N> verify`
-7. **Update proxy config** if the proxy needs to know about the new node:
-   ```bash
-   ./deploy.sh proxy-config
-   ```
+The `peering` step creates cross-region VPC peering connections and configures route tables automatically.
 
 ---
 
-## 7. Common issues
+## 6. Common issues
 
-### "error decoding response body" on init-key (AWS)
-**Cause:** No IAM instance profile attached. The IMDS returns 404 for credentials, and the code fails parsing HTML as JSON.
+### "error decoding response body" on init-key
+**Cause:** No IAM instance profile attached. IMDS returns 404.
 **Fix:** `aws ec2 associate-iam-instance-profile --instance-id <ID> --iam-instance-profile Name=<PROFILE>`
 
-### GCS upload 403 Forbidden (GCP)
-**Cause:** VM has `devstorage.read_only` scope instead of `devstorage.read_write`.
-**Fix:** Stop the VM, change scopes with `gcloud compute instances set-service-account`, restart. Update the IP in `config.env` (it changes on restart).
+### S3 upload denied during seal
+**Cause:** IAM role missing S3 write permissions for the sealed blob bucket.
+**Fix:** Update the instance profile's IAM role with `s3:PutObject` on `arn:aws:s3:::<BUCKET>/*`.
 
 ### "Container exited prematurely" on init-seal
-**Cause:** The node container couldn't start (missing device) or crashed during attestation.
-**Fix:** Check container logs: `ssh <node> "sudo docker logs toprf-init-seal"`. Common causes:
-- Missing `/dev/sev-guest` on Azure → expected, code falls back to vTPM
-- TSM configfs mkdir ENXIO → expected on Azure, code falls back
-- If all providers fail, check that the VM is actually SEV-SNP enabled
+**Cause:** The node container couldn't start or crashed during attestation.
+**Fix:** Check logs: `ssh <node> "sudo docker logs toprf-init-seal"`.
 
-### "Waiting for attestation endpoint" timeout
-**Cause:** The container is running but not serving HTTPS yet, or it crashed.
-**Fix:** SSH to the node and check `sudo docker logs toprf-init-seal`. The script checks for container exit during the wait, so if it's truly stuck, there may be a network issue.
+### VPC peering "already exists" error
+**Cause:** A peering connection was already created (possibly from a previous run).
+**Fix:** Check existing peering connections in the AWS console and delete stale ones.
 
-### Sealed blob version mismatch on auto-unseal
-**Cause:** The node was sealed with v1 but is now trying to unseal with v2 (or vice versa).
-**Fix:** The auto-unseal code detects the version automatically. If you see this error, the sealed blob may be corrupted. Re-run init-seal: `./deploy.sh --nodes <N> init-seal`
+### Proxy can't reach nodes after peering
+**Cause:** Route tables not updated, or security group missing.
+**Fix:** Verify routes exist in both the proxy private RT and node VPC RT. Check SG allows TCP 3001 from `10.0.0.0/16`.
 
 ---
 
-## 8. Redeployment
+## 7. Redeployment
 
 ### Update node binary (code change)
 ```bash
@@ -295,9 +227,4 @@ The auto-unseal code detects the blob version automatically and uses the correct
 ```
 
 ### Key rotation
-See "Zero-Downtime Key Rotation" in the main README. Summary:
-1. Derive new node shares from admin shares
-2. Provision 3 new VMs
-3. Deploy to new VMs with `./deploy.sh all`
-4. Switch proxy to new nodes
-5. Decommission old VMs
+See "Zero-Downtime Key Rotation" in the main README.

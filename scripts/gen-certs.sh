@@ -5,7 +5,6 @@
 # Creates:
 #   - A self-signed CA (toprf-ca)
 #   - Node server certificates for node1, node2, node3 (signed by the CA)
-#   - A proxy client certificate for mTLS (signed by the CA)
 #
 # All output goes into certs/ relative to the project root.
 
@@ -18,7 +17,6 @@ CERTS_DIR="$PROJECT_ROOT/certs"
 
 CA_DIR="$CERTS_DIR/ca"
 NODES_DIR="$CERTS_DIR/nodes"
-PROXY_DIR="$CERTS_DIR/proxy"
 
 CA_VALIDITY=1095
 CERT_VALIDITY=365
@@ -39,7 +37,7 @@ info() {
 
 info "Cleaning and creating certificate directories under $CERTS_DIR"
 rm -rf "$CERTS_DIR"
-mkdir -p "$CA_DIR" "$NODES_DIR" "$PROXY_DIR"
+mkdir -p "$CA_DIR" "$NODES_DIR"
 
 # ---------------------------------------------------------------------------
 # 1. Self-signed CA
@@ -105,41 +103,6 @@ EXTEOF
     rm -f "$NODES_DIR/$node.csr" "$NODES_DIR/$node.ext"
 done
 
-# ---------------------------------------------------------------------------
-# 3. Proxy client certificate (for mTLS)
-# ---------------------------------------------------------------------------
-
-info "Generating key and certificate for proxy client"
-
-openssl ecparam -genkey -name "$KEY_TYPE" -noout \
-    -out "$PROXY_DIR/proxy-client.key" 2>/dev/null
-chmod 600 "$PROXY_DIR/proxy-client.key"
-
-openssl req -new \
-    -key "$PROXY_DIR/proxy-client.key" \
-    -out "$PROXY_DIR/proxy-client.csr" \
-    -subj "/CN=toprf-proxy/O=Threshold OPRF/OU=Proxy" \
-    -sha256
-
-cat > "$PROXY_DIR/proxy-client.ext" <<EXTEOF
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature
-extendedKeyUsage=clientAuth
-EXTEOF
-
-openssl x509 -req \
-    -in "$PROXY_DIR/proxy-client.csr" \
-    -CA "$CA_DIR/ca.pem" \
-    -CAkey "$CA_DIR/ca.key" \
-    -CAcreateserial \
-    -out "$PROXY_DIR/proxy-client.pem" \
-    -days "$CERT_VALIDITY" \
-    -sha256 \
-    -extfile "$PROXY_DIR/proxy-client.ext" 2>/dev/null
-
-rm -f "$PROXY_DIR/proxy-client.csr" "$PROXY_DIR/proxy-client.ext"
-
 # Clean up CA serial file
 rm -f "$CA_DIR/ca.srl"
 
@@ -162,9 +125,8 @@ for node in "${NODES[@]}"; do
     echo "  $NODES_DIR/$node.pem"
 done
 echo ""
-echo "Proxy client cert (valid $CERT_VALIDITY days, mTLS):"
-echo "  $PROXY_DIR/proxy-client.key"
-echo "  $PROXY_DIR/proxy-client.pem"
-echo ""
 echo "All certificates use P-256 (prime256v1) keys."
+echo ""
+echo "NOTE: For production, use './deploy.sh certs' which adds"
+echo "real node IPs as SANs and distributes certs to VMs."
 echo "============================================"

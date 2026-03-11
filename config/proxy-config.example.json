@@ -26,8 +26,6 @@
   "apple_app_id": "TEAMID.com.example.app",
   "android_package_name": "com.example.app",
   "node_ca_cert": "certs/ca/ca.pem",
-  "proxy_client_cert": "certs/proxy/proxy-client.pem",
-  "proxy_client_key": "certs/proxy/proxy-client.key",
   "device_keys_path": "data/device-keys.json",
   "rate_limit_path": "data/rate-limits.json"
 }

@@ -7,8 +7,6 @@
     "per_day": 1000
   },
   "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
-  "proxy_client_cert": "/etc/toprf/certs/proxy/proxy-client.pem",
-  "proxy_client_key": "/etc/toprf/certs/proxy/proxy-client.key",
   "nodes": [
     {
       "node_id": 1,

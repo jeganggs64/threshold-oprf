@@ -1,0 +1,24 @@
+{
+  "group_public_key": "029ccbc03c94074cd5d272b222328f25a7e2f68a568e10b52496fb19f8d9abb5e9",
+  "threshold": 2,
+  "require_attestation": false,
+  "rate_limit": { "per_hour": 1000, "per_day": 10000 },
+  "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
+  "nodes": [
+    {
+      "node_id": 1,
+      "endpoint": "https://NODE1_PRIVATE_IP:3001",
+      "verification_share": "02a8f227986ba47401fdc02242c91994e3fff1bd2c10a923b8cedf7ecc171a1a53"
+    },
+    {
+      "node_id": 2,
+      "endpoint": "https://NODE2_PRIVATE_IP:3001",
+      "verification_share": "020745a5c776af84a56fbf6fa5edd0828084c249282781108144dafe795e13bea7"
+    },
+    {
+      "node_id": 3,
+      "endpoint": "https://NODE3_PRIVATE_IP:3001",
+      "verification_share": "037b4f6e68c7351f1b7814b4e1b1245e2f640e3fd2da56f98fe854f733e9d398b9"
+    }
+  ]
+}
