@@ -228,7 +228,7 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
     // Step 2: Compute SHA-256(pubkey) for REPORT_DATA binding
     let pubkey_hash = {
         let mut hasher = Sha256::new();
-        hasher.update(&pubkey_bytes);
+        hasher.update(pubkey_bytes);
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
