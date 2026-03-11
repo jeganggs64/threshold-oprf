@@ -63,6 +63,70 @@ node_s3_bucket() {
     esac
 }
 
+# ─── Ensure IAM instance profile exists ─────────────────────────────────────
+
+ensure_iam_profile() {
+    local profile_name="${IAM_INSTANCE_PROFILE:-}"
+    [[ -n "$profile_name" ]] || die "IAM_INSTANCE_PROFILE not set in config.env"
+
+    local role_name="${profile_name%-profile}-role"
+
+    # Create role if it doesn't exist
+    if ! aws iam get-role --role-name "$role_name" > /dev/null 2>&1; then
+        echo "  Creating IAM role: $role_name..."
+        aws iam create-role --role-name "$role_name" \
+            --assume-role-policy-document '{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"Service": "ec2.amazonaws.com"},
+                    "Action": "sts:AssumeRole"
+                }]
+            }' > /dev/null
+
+        # Grant S3 access to all sealed-key buckets
+        local resources=""
+        local first=true
+        for n in 1 2 3; do
+            local bucket
+            bucket=$(node_s3_bucket "$n" 2>/dev/null) || continue
+            [[ -n "$bucket" ]] || continue
+            $first || resources+=","
+            resources+="\"arn:aws:s3:::${bucket}/*\""
+            first=false
+        done
+
+        if [[ -n "$resources" ]]; then
+            aws iam put-role-policy --role-name "$role_name" \
+                --policy-name sealed-s3-access \
+                --policy-document "{
+                    \"Version\": \"2012-10-17\",
+                    \"Statement\": [{
+                        \"Effect\": \"Allow\",
+                        \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                        \"Resource\": [${resources}]
+                    }]
+                }"
+            echo "  S3 policy attached for sealed-key buckets"
+        fi
+    else
+        echo "  IAM role $role_name already exists"
+    fi
+
+    # Create instance profile if it doesn't exist
+    if ! aws iam get-instance-profile --instance-profile-name "$profile_name" > /dev/null 2>&1; then
+        echo "  Creating instance profile: $profile_name..."
+        aws iam create-instance-profile --instance-profile-name "$profile_name" > /dev/null
+        aws iam add-role-to-instance-profile \
+            --instance-profile-name "$profile_name" \
+            --role-name "$role_name"
+        echo "  Waiting for instance profile to propagate..."
+        sleep 10
+    else
+        echo "  Instance profile $profile_name already exists"
+    fi
+}
+
 # ─── Find running instance by tag ────────────────────────────────────────────
 
 find_instance() {
@@ -85,6 +149,9 @@ provision_node() {
     instance_type="${INSTANCE_TYPE:-c6a.large}"
 
     info "Provisioning node $n in $region"
+
+    # Ensure IAM role + instance profile exist (idempotent)
+    ensure_iam_profile
 
     # Check for existing instance
     local existing
@@ -163,17 +230,12 @@ provision_node() {
             || warn "SSH rule may already exist"
     fi
 
-    # Attach IAM instance profile if configured
-    local iam_profile="${IAM_INSTANCE_PROFILE:-}"
-    if [[ -n "$iam_profile" ]]; then
-        echo "  Attaching IAM instance profile: $iam_profile..."
-        aws ec2 associate-iam-instance-profile \
-            --region "$region" \
-            --instance-id "$instance_id" \
-            --iam-instance-profile "Name=$iam_profile" > /dev/null
-    else
-        warn "IAM_INSTANCE_PROFILE not set — attach manually for S3 access"
-    fi
+    # Attach IAM instance profile (created by ensure_iam_profile above)
+    echo "  Attaching IAM instance profile: ${IAM_INSTANCE_PROFILE}..."
+    aws ec2 associate-iam-instance-profile \
+        --region "$region" \
+        --instance-id "$instance_id" \
+        --iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}" > /dev/null
 
     # Fetch IPs
     local instance_data

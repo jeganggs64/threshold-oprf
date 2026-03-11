@@ -204,10 +204,8 @@ struct NodeEvalRequest {
 
 async fn health(State(state): State<Arc<ProxyState>>) -> Json<HealthResponse> {
     // Fan out HEAD /health requests to all nodes concurrently with a 2s timeout.
-    let health_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_else(|_| state.http_client.clone());
+    // Reuse state.http_client which has the custom CA cert for node TLS.
+    let health_client = state.http_client.clone();
 
     let mut handles = tokio::task::JoinSet::new();
     for node in &state.config.nodes {
@@ -217,7 +215,12 @@ async fn health(State(state): State<Arc<ProxyState>>) -> Json<HealthResponse> {
 
         handles.spawn(async move {
             let url = format!("{endpoint}/health");
-            let ok = client.head(&url).send().await.is_ok();
+            let ok = client
+                .head(&url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_ok();
             (node_id, ok)
         });
     }

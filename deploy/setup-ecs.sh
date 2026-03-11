@@ -594,7 +594,8 @@ step_task() {
       "name": "config-init",
       "image": "amazon/aws-cli:latest",
       "essential": false,
-      "command": ["sh", "-c", "mkdir -p /config/certs/ca && aws s3 cp s3://${CONFIG_BUCKET}/proxy-config.json /config/proxy-config.json && aws s3 cp s3://${CONFIG_BUCKET}/certs/ca/ca.pem /config/certs/ca/ca.pem"],
+      "entryPoint": ["sh", "-c"],
+      "command": ["mkdir -p /config/certs/ca && aws s3 cp s3://${CONFIG_BUCKET}/proxy-config.json /config/proxy-config.json && aws s3 cp s3://${CONFIG_BUCKET}/certs/ca/ca.pem /config/certs/ca/ca.pem"],
       "mountPoints": [{"sourceVolume": "config", "containerPath": "/config"}],
       "logConfiguration": {
         "logDriver": "awslogs",
