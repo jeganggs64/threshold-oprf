@@ -31,7 +31,6 @@ Each node's sealed key blob is stored in S3, encrypted with a hardware-derived k
 crates/
   core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine)
   node/       Stateless TEE node server — loads key share, serves /partial-evaluate
-  proxy/      Orchestrator — fans out to nodes, verifies DLEQ proofs, rate limits
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
   monitor/    Maintenance event monitor with webhook alerts
@@ -40,13 +39,14 @@ deploy/       Deployment automation (provision.sh, deploy.sh, setup-ecs.sh)
 scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
 ```
 
+The proxy lives in a separate repo: [ruonid-proxy](https://github.com/jeganggs64/ruonid-proxy).
+
 ### Crates
 
 | Crate | Description |
 |-------|-------------|
 | **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination. Built on FROST secp256k1 and k256. |
 | **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Supports three key loading modes: init-seal (attested TLS injection), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
-| **toprf-proxy** | Single entry point for clients. Issues challenge nonces, validates device attestation (Apple App Attest / Google Play Integrity), fans out to nodes over TLS, verifies DLEQ proofs, enforces per-device rate limits. |
 | **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (2-of-3 for TEE deployment). Also supports re-deriving node shares from admin shares. |
 | **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes attestation report fetching and verification. |
 | **toprf-monitor** | Daemon that polls for scheduled host maintenance events and sends webhook alerts. |

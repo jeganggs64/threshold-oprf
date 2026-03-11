@@ -4,7 +4,6 @@ members = [
     "crates/core",
     "crates/keygen",
     "crates/node",
-    "crates/proxy",
     "crates/seal",
     "crates/monitor",
 ]
