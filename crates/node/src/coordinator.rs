@@ -152,10 +152,7 @@ async fn call_peer(
     peer: &PeerNode,
     blinded_point: &str,
 ) -> Result<PartialEvaluation, String> {
-    let url = format!(
-        "{}/partial-evaluate",
-        peer.endpoint.trim_end_matches('/')
-    );
+    let url = format!("{}/partial-evaluate", peer.endpoint.trim_end_matches('/'));
 
     let resp = client
         .post(&url)

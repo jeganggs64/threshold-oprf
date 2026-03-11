@@ -472,7 +472,15 @@ async fn s3_delete(bucket: &str, key: &str) -> Result<(), Box<dyn Error>> {
     let host = format!("{bucket}.s3.{region}.amazonaws.com");
     let url = format!("https://{host}/{key}");
 
-    let headers = sigv4_headers("DELETE", &host, &format!("/{key}"), "", &region, &creds, b"");
+    let headers = sigv4_headers(
+        "DELETE",
+        &host,
+        &format!("/{key}"),
+        "",
+        &region,
+        &creds,
+        b"",
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS))

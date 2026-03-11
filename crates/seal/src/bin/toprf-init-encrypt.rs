@@ -179,7 +179,9 @@ async fn main() {
 
     // 3. Verify attestation report signature (AMD certificate chain)
     if skip_verify {
-        eprintln!("  WARNING: skipping AMD certificate chain verification (--skip-attestation-verify)");
+        eprintln!(
+            "  WARNING: skipping AMD certificate chain verification (--skip-attestation-verify)"
+        );
     } else {
         eprintln!("  Verifying AMD certificate chain (VCEK -> ASK -> ARK)...");
         AttestationVerifier::verify_report(&report)
