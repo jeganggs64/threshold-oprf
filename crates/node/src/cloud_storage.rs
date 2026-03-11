@@ -69,14 +69,6 @@ fn classify_url(url: &str) -> Result<StorageUrl, Box<dyn Error>> {
     }
 }
 
-/// Returns true if the URL scheme is acceptable for --upload-url / SEALED_KEY_URL.
-pub fn is_valid_storage_url(url: &str) -> bool {
-    url.starts_with("https://")
-        || url.starts_with("gs://")
-        || url.starts_with("s3://")
-        || url.starts_with("file://")
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -98,6 +90,21 @@ pub async fn upload_blob(url: &str, data: Vec<u8>) -> Result<(), Box<dyn Error>>
         StorageUrl::Gcs { bucket, object } => gcs_upload(&bucket, &object, &data).await,
         StorageUrl::S3 { bucket, key } => s3_upload(&bucket, &key, &data).await,
         StorageUrl::Https(url) => https_upload(&url, &data).await,
+    }
+}
+
+pub async fn delete_blob(url: &str) -> Result<(), Box<dyn Error>> {
+    let parsed = classify_url(url)?;
+    match parsed {
+        StorageUrl::File(path) => {
+            tokio::fs::remove_file(&path).await?;
+            Ok(())
+        }
+        StorageUrl::S3 { bucket, key } => s3_delete(&bucket, &key).await,
+        _ => {
+            warn!("delete not implemented for this storage backend, skipping");
+            Ok(())
+        }
     }
 }
 
@@ -456,6 +463,33 @@ async fn s3_upload(bucket: &str, key: &str, data: &[u8]) -> Result<(), Box<dyn E
     }
 
     info!("s3: upload complete");
+    Ok(())
+}
+
+async fn s3_delete(bucket: &str, key: &str) -> Result<(), Box<dyn Error>> {
+    info!(bucket, key, "s3: deleting blob");
+    let (creds, region) = aws_get_credentials_and_region().await?;
+    let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    let url = format!("https://{host}/{key}");
+
+    let headers = sigv4_headers("DELETE", &host, &format!("/{key}"), "", &region, &creds, b"");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS))
+        .build()?;
+
+    let mut req = client.delete(&url);
+    for (k, v) in &headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    let resp = req.send().await?;
+    // S3 returns 204 on successful delete
+    if !resp.status().is_success() && resp.status().as_u16() != 204 {
+        return Err(format!("S3 delete failed: HTTP {}", resp.status()).into());
+    }
+
+    info!("s3: delete complete");
     Ok(())
 }
 

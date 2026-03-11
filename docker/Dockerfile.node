@@ -12,17 +12,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
 COPY crates/keygen/Cargo.toml crates/keygen/Cargo.toml
 COPY crates/node/Cargo.toml crates/node/Cargo.toml
-COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
 COPY crates/seal/Cargo.toml crates/seal/Cargo.toml
 COPY crates/monitor/Cargo.toml crates/monitor/Cargo.toml
 
 # Create stub lib/main files so `cargo fetch` can resolve the workspace.
 # This lets us cache the dependency download layer independently of source changes.
-RUN mkdir -p crates/core/src crates/keygen/src crates/node/src crates/proxy/src crates/seal/src crates/monitor/src && \
+RUN mkdir -p crates/core/src crates/keygen/src crates/node/src crates/seal/src crates/monitor/src && \
     echo "// stub" > crates/core/src/lib.rs && \
     echo "fn main() {}" > crates/keygen/src/main.rs && \
     echo "fn main() {}" > crates/node/src/main.rs && \
-    echo "fn main() {}" > crates/proxy/src/main.rs && \
     echo "fn main(){}" > crates/seal/src/lib.rs && \
     echo "fn main(){}" > crates/monitor/src/main.rs
 
@@ -35,8 +33,7 @@ COPY crates/ crates/
 # Touch the source files so cargo recognises them as newer than the stubs
 RUN touch crates/core/src/lib.rs \
     crates/node/src/main.rs \
-    crates/keygen/src/main.rs \
-    crates/proxy/src/main.rs
+    crates/keygen/src/main.rs
 
 # Build the actual release binary
 RUN cargo build --release -p toprf-node
@@ -66,7 +63,6 @@ EXPOSE 3001
 
 LABEL org.opencontainers.image.title="toprf-node" \
       org.opencontainers.image.description="Threshold OPRF node for distributed key evaluation" \
-      org.opencontainers.image.vendor="ruonid" \
       org.opencontainers.image.source="https://github.com/jeganggs64/threshold-oprf" \
       org.opencontainers.image.licenses="MIT"
 

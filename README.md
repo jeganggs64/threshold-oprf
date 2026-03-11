@@ -8,20 +8,17 @@ A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF 
 Mobile App
     |  HTTPS
     v
-ALB / Load Balancer
-    |
+API Gateway (TLS, rate limiting)
+    |  VPC Link
     v
-Express API (port 3002)        ← device attestation, rate limiting
-    |  HTTP (internal)
-    v
-Rust TOPRF Proxy (port 3000)   ← fans out to TEE nodes, DLEQ verification
-    |  TLS (VPC peering)
-    +── Node 1 (AWS ap-southeast-1, SEV-SNP)
-    +── Node 2 (AWS us-east-1, SEV-SNP)
-    +── Node 3 (AWS eu-west-1, SEV-SNP)
+NLB (eu-west-1) → Node 1 or Node 2 (coordinator)
+                      |  AWS PrivateLink (private)
+                      +── Peer Node (same or cross-region)
 ```
 
-The proxy collects partial evaluations from any 2 of 3 nodes, verifies DLEQ proofs, and returns verified partials to the client. The client performs Lagrange interpolation and unblinding locally — the proxy never sees the unblinded result.
+Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to a peer node via PrivateLink, verifies the peer's DLEQ proof, combines both partials via Lagrange interpolation, and returns the final OPRF evaluation. No separate proxy service needed.
+
+Node-to-node communication uses AWS PrivateLink — each node sits behind a Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
 
 Each node's sealed key blob is stored in S3, encrypted with a hardware-derived key via `MSG_KEY_REQ` — even AWS cannot decrypt it.
 
@@ -30,23 +27,21 @@ Each node's sealed key blob is stored in S3, encrypted with a hardware-derived k
 ```
 crates/
   core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine)
-  node/       Stateless TEE node server — loads key share, serves /partial-evaluate
+  node/       TEE node server — coordinator + peer mode, serves /evaluate and /partial-evaluate
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
   monitor/    Maintenance event monitor with webhook alerts
 docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation (provision.sh, deploy.sh, setup-ecs.sh)
-scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
+scripts/      Dev utilities (integration-test.sh)
 ```
-
-The proxy lives in a separate repo: [ruonid-proxy](https://github.com/jeganggs64/ruonid-proxy).
 
 ### Crates
 
 | Crate | Description |
 |-------|-------------|
 | **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination. Built on FROST secp256k1 and k256. |
-| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Supports three key loading modes: init-seal (attested TLS injection), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
+| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Acts as both coordinator (receives client request, calls a peer, combines partials) and peer (computes partial evaluation). Supports three key loading modes: init-seal (S3-mediated ECIES key injection with attestation), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
 | **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (2-of-3 for TEE deployment). Also supports re-deriving node shares from admin shares. |
 | **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes attestation report fetching and verification. |
 | **toprf-monitor** | Daemon that polls for scheduled host maintenance events and sends webhook alerts. |
@@ -65,21 +60,18 @@ cargo build --release
 # Unit tests
 cargo test --release
 
-# Integration tests (builds binaries, starts 3 nodes + proxy, runs E2E OPRF evaluation)
+# Integration tests (builds binaries, starts 3 nodes, runs E2E OPRF evaluation)
 bash scripts/integration-test.sh
 ```
 
 ### Local Development
 
 ```bash
-# Generate TLS certificates
-bash scripts/gen-certs.sh
-
-# Start 3 nodes + proxy with Docker Compose
+# Start 3 nodes with Docker Compose
 docker compose -f docker/docker-compose.yml up --build
 ```
 
-Proxy available at `http://localhost:3000`. Nodes are only reachable within the Docker network.
+Any node can act as coordinator. Node 1 is exposed at `http://localhost:3001/evaluate`.
 
 ## Key Management
 
@@ -110,7 +102,7 @@ Output: `node-shares/node-{1,2,3}-share.json` + `node-shares/public-config.json`
 
 ## Deployment
 
-Three TEE VMs (one per AWS region) run the node binary. An ECS Fargate service runs the Express API + Rust proxy behind an ALB. The proxy connects to nodes via VPC peering over private IPs.
+Three TEE VMs (one per AWS region) run the node binary. Each node can act as coordinator — receiving client requests, calling a peer via PrivateLink, and returning the combined OPRF evaluation. Clients reach nodes via API Gateway → NLB.
 
 ### Prerequisites
 
@@ -121,7 +113,7 @@ Three TEE VMs (one per AWS region) run the node binary. An ECS Fargate service r
 
 ### VM Provisioning (`deploy/provision.sh`)
 
-Provisions Amazon Linux 2023 instances with AMD SEV-SNP across 3 AWS regions. Nodes can be provisioned individually.
+Provisions Amazon Linux 2023 instances with AMD SEV-SNP across AWS regions. Nodes can be provisioned individually.
 
 ```bash
 cd deploy
@@ -129,18 +121,18 @@ cp config.env.example config.env
 # Fill in KEY_NAMEs, SSH_KEYs, S3_BUCKETs
 # IAM_INSTANCE_PROFILE is auto-created by provision.sh
 
-./provision.sh 1          # Provision node 1 (ap-southeast-1)
-./provision.sh 2          # Provision node 2 (us-east-1)
-./provision.sh 3          # Provision node 3 (eu-west-1)
+./provision.sh 1          # Provision node 1 (eu-west-1)
+./provision.sh 2          # Provision node 2 (eu-west-1)
+./provision.sh 3          # Provision node 3 (us-east-2)
 ./provision.sh all        # Or all at once
 ```
 
 ### TEE Node Deployment (`deploy/deploy.sh`)
 
-Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates TLS certs, handles init-seal key injection, and starts nodes.
+Pulls the node image from ghcr.io (built by CI), creates S3 buckets, handles init-seal key injection, starts nodes, and sets up AWS PrivateLink.
 
 ```bash
-# Auto-populate IPs, SGs, VPC IDs from provisioned VMs:
+# Auto-populate IPs, SGs, VPC IDs, Subnet IDs from provisioned VMs:
 ./deploy.sh auto-config
 
 ./deploy.sh all           # Full deployment
@@ -149,14 +141,12 @@ Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates T
 ./deploy.sh setup-vms     # Install Docker on VMs
 ./deploy.sh pull           # Pull node image from ghcr.io
 ./deploy.sh storage        # Create S3 buckets for sealed blobs
-./deploy.sh certs          # Generate TLS certs + distribute to VMs
-./deploy.sh init-seal      # Interactive: inject key shares via attested TLS
+./deploy.sh init-seal      # Interactive: S3-mediated ECIES key injection (attested)
 ./deploy.sh start          # Start nodes in normal mode
-./deploy.sh firewall       # Allow port 3001 from proxy VPC CIDR
-./deploy.sh peering        # Set up VPC peering (proxy ↔ node VPCs)
-./deploy.sh proxy-config   # Generate proxy-config.production.json
+./deploy.sh privatelink    # Create NLBs, Endpoint Services, VPC Endpoints
+./deploy.sh coordinator-config  # Generate per-node coordinator configs
 ./deploy.sh verify         # Health check all nodes (via SSH)
-./deploy.sh e2e            # End-to-end: nodes + proxy + OPRF evaluate
+./deploy.sh e2e            # End-to-end: OPRF evaluate via coordinator
 
 # Utilities
 ./deploy.sh show-ips       # Fetch VM IPs from all regions
@@ -165,7 +155,7 @@ Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates T
 
 ### ECS Fargate + ALB (`deploy/setup-ecs.sh`)
 
-Provisions the API proxy infrastructure: VPC with NAT Gateway, ALB, ECS Fargate cluster.
+Provisions the API server infrastructure: VPC with NAT Gateway, ALB, ECS Fargate cluster.
 
 ```bash
 ./setup-ecs.sh all          # Full infrastructure setup
@@ -176,17 +166,25 @@ Provisions the API proxy infrastructure: VPC with NAT Gateway, ALB, ECS Fargate 
 ./setup-ecs.sh alb          # Application Load Balancer
 ./setup-ecs.sh cert         # ACM certificate request
 ./setup-ecs.sh roles        # IAM roles
-./setup-ecs.sh config-bucket # S3 bucket for proxy config
 ./setup-ecs.sh ecr          # ECR repo for API server
 ./setup-ecs.sh cluster      # ECS Fargate cluster
 ./setup-ecs.sh task         # Task definition
 ./setup-ecs.sh service      # ECS service
 
 # Operations
-./setup-ecs.sh upload-config # Upload proxy config + CA cert to S3
 ./setup-ecs.sh status        # Show NAT EIP, ALB DNS, service health
 ./setup-ecs.sh redeploy      # Force new deployment
 ```
+
+### Node Replacement (`deploy/replace-node.sh`)
+
+Replaces a single failed node without touching the other nodes. The replacement reuses the same key share and the same PrivateLink endpoint — peers don't need any config changes.
+
+```bash
+./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json
+```
+
+See `deploy/README.md` for full options (`--skip-provision`, `--skip-init-seal`).
 
 ### Zero-Downtime Key Rotation
 
@@ -217,13 +215,13 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
    ./deploy.sh verify
    ```
 
-6. **Switch proxy to new nodes** — regenerate and upload the proxy config, then redeploy ECS:
+6. **Set up PrivateLink for new nodes** and update coordinator configs:
    ```bash
-   ./deploy.sh proxy-config
-   ./setup-ecs.sh upload-config
-   ./setup-ecs.sh redeploy
+   ./deploy.sh privatelink
+   ./deploy.sh coordinator-config
+   ./deploy.sh start
    ```
-   Traffic switches to new nodes instantly on ECS redeploy.
+   Restart nodes to pick up the new coordinator configs.
 
 7. **Decommission old VMs**:
    ```bash
@@ -235,10 +233,8 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
 - **No single point of compromise** — key shares split across 3 AWS regions, each below the 2-of-3 threshold
 - **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP measurement-derived keys; AWS cannot decrypt
 - **TEE attestation** — key injection verified against hardware attestation reports
-- **Network isolation** — nodes only reachable from proxy VPC via VPC peering; security groups restrict port 3001
-- **Server TLS** — proxy-to-node communication encrypted with CA-signed TLS certificates
-- **Device attestation** — Apple App Attest and Google Play Integrity validation before OPRF evaluation
-- **Proxy-blind** — proxy verifies DLEQ proofs but never sees unblinded points or final output
+- **Network isolation** — nodes only reachable via AWS PrivateLink; traffic never crosses the public internet
+- **Device attestation** — Apple App Attest and Google Play Integrity validation (via API Gateway)
 
 ## CI
 
@@ -247,7 +243,7 @@ GitHub Actions runs on push/PR to `main`:
 1. **Format & Lint** — `cargo fmt --check` + `cargo clippy` (warnings are errors)
 2. **Unit Tests** — `cargo test --release`
 3. **Build** — `cargo build --release`
-4. **Integration Tests** — Full E2E with 3 nodes + proxy
+4. **Integration Tests** — Full E2E with 3 nodes
 
 ## License
 

@@ -2,8 +2,8 @@
 #
 # Integration test for threshold-OPRF system.
 #
-# Builds the workspace, generates keys, starts 3 nodes + 1 proxy,
-# and runs end-to-end HTTP tests.
+# Builds the workspace, generates keys, starts 3 nodes with coordinator
+# configs, and runs end-to-end HTTP tests via /evaluate (coordinator mode).
 #
 set -euo pipefail
 
@@ -13,12 +13,10 @@ TMPDIR="$(mktemp -d)"
 # Binary paths (built in step 1)
 KEYGEN="$REPO_ROOT/target/release/toprf-keygen"
 NODE="$REPO_ROOT/target/release/toprf-node"
-PROXY_REPO="https://github.com/jeganggs64/ruonid-proxy.git"
 
 NODE1_PORT=7101
 NODE2_PORT=7102
 NODE3_PORT=7103
-PROXY_PORT=7100
 
 PIDS=()
 PASS=0
@@ -94,16 +92,6 @@ for bin in "$KEYGEN" "$NODE"; do
     fi
 done
 
-echo ""
-echo "=== Step 1b: Building proxy from ruonid-proxy repo ==="
-cargo install --git "$PROXY_REPO" --root "$TMPDIR/proxy-install" 2>&1 | tail -5
-PROXY="$TMPDIR/proxy-install/bin/toprf-proxy"
-if [[ ! -x "$PROXY" ]]; then
-    echo "  FATAL: proxy binary not found at $PROXY"
-    exit 1
-fi
-echo "  Proxy built."
-
 # ---------- 2. Generate keys ----------
 
 echo ""
@@ -146,10 +134,47 @@ VS_3=$(jq -r '.verification_shares[] | select(.node_id == 3) | .verification_sha
 
 echo "  Verification shares extracted for nodes 1, 2, 3."
 
-# ---------- 3. Start 3 node servers (with key files) ----------
+# ---------- 3. Create coordinator configs ----------
 
 echo ""
-echo "=== Step 3: Starting 3 node servers ==="
+echo "=== Step 3: Creating coordinator configs ==="
+
+# Node 1: peers are node 2 and node 3
+cat > "$TMPDIR/coord-1.json" <<EOF
+{
+  "peers": [
+    {"node_id": 2, "endpoint": "http://127.0.0.1:$NODE2_PORT", "verification_share": "$VS_2"},
+    {"node_id": 3, "endpoint": "http://127.0.0.1:$NODE3_PORT", "verification_share": "$VS_3"}
+  ]
+}
+EOF
+
+# Node 2: peers are node 1 and node 3
+cat > "$TMPDIR/coord-2.json" <<EOF
+{
+  "peers": [
+    {"node_id": 1, "endpoint": "http://127.0.0.1:$NODE1_PORT", "verification_share": "$VS_1"},
+    {"node_id": 3, "endpoint": "http://127.0.0.1:$NODE3_PORT", "verification_share": "$VS_3"}
+  ]
+}
+EOF
+
+# Node 3: peers are node 1 and node 2
+cat > "$TMPDIR/coord-3.json" <<EOF
+{
+  "peers": [
+    {"node_id": 1, "endpoint": "http://127.0.0.1:$NODE1_PORT", "verification_share": "$VS_1"},
+    {"node_id": 2, "endpoint": "http://127.0.0.1:$NODE2_PORT", "verification_share": "$VS_2"}
+  ]
+}
+EOF
+
+echo "  Coordinator configs created."
+
+# ---------- 4. Start 3 node servers ----------
+
+echo ""
+echo "=== Step 4: Starting 3 node servers ==="
 
 for i in 1 2 3; do
     SHARE_FILE="$NODE_SHARES_DIR/node-${i}-share.json"
@@ -159,15 +184,18 @@ for i in 1 2 3; do
     fi
 done
 
-"$NODE" --port $NODE1_PORT --key-file "$NODE_SHARES_DIR/node-1-share.json" > "$TMPDIR/node1.log" 2>&1 &
+"$NODE" --port $NODE1_PORT --key-file "$NODE_SHARES_DIR/node-1-share.json" \
+    --coordinator-config "$TMPDIR/coord-1.json" > "$TMPDIR/node1.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 1 started (PID $!, port $NODE1_PORT)"
 
-"$NODE" --port $NODE2_PORT --key-file "$NODE_SHARES_DIR/node-2-share.json" > "$TMPDIR/node2.log" 2>&1 &
+"$NODE" --port $NODE2_PORT --key-file "$NODE_SHARES_DIR/node-2-share.json" \
+    --coordinator-config "$TMPDIR/coord-2.json" > "$TMPDIR/node2.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 2 started (PID $!, port $NODE2_PORT)"
 
-"$NODE" --port $NODE3_PORT --key-file "$NODE_SHARES_DIR/node-3-share.json" > "$TMPDIR/node3.log" 2>&1 &
+"$NODE" --port $NODE3_PORT --key-file "$NODE_SHARES_DIR/node-3-share.json" \
+    --coordinator-config "$TMPDIR/coord-3.json" > "$TMPDIR/node3.log" 2>&1 &
 PIDS+=($!)
 echo "  Node 3 started (PID $!, port $NODE3_PORT)"
 
@@ -176,139 +204,110 @@ wait_for_health "http://127.0.0.1:$NODE1_PORT/health" "Node 1"
 wait_for_health "http://127.0.0.1:$NODE2_PORT/health" "Node 2"
 wait_for_health "http://127.0.0.1:$NODE3_PORT/health" "Node 3"
 
-# ---------- 4. Create proxy config ----------
+# ---------- 5. Run test requests ----------
 
 echo ""
-echo "=== Step 4: Creating proxy config ==="
+echo "=== Step 5: Running tests ==="
 
-PROXY_CONFIG="$TMPDIR/proxy-config.json"
-cat > "$PROXY_CONFIG" <<CONFIGEOF
-{
-  "group_public_key": "$GROUP_PUBLIC_KEY",
-  "threshold": $THRESHOLD,
-  "require_attestation": false,
-  "rate_limit": {
-    "per_hour": 100,
-    "per_day": 1000
-  },
-  "nodes": [
-    {
-      "node_id": 1,
-      "endpoint": "http://127.0.0.1:$NODE1_PORT",
-      "verification_share": "$VS_1"
-    },
-    {
-      "node_id": 2,
-      "endpoint": "http://127.0.0.1:$NODE2_PORT",
-      "verification_share": "$VS_2"
-    },
-    {
-      "node_id": 3,
-      "endpoint": "http://127.0.0.1:$NODE3_PORT",
-      "verification_share": "$VS_3"
-    }
-  ]
-}
-CONFIGEOF
-
-echo "  Proxy config written to $PROXY_CONFIG"
-echo "  Config contents:"
-jq . "$PROXY_CONFIG"
-
-# ---------- 5. Start the proxy ----------
-
+# 5a. GET /health on node 1
 echo ""
-echo "=== Step 5: Starting proxy ==="
+echo "--- Test 5a: GET /health ---"
+HEALTH_RESP=$(curl -sf "http://127.0.0.1:$NODE1_PORT/health")
+HEALTH_STATUS=$(echo "$HEALTH_RESP" | jq -r '.status')
+assert_eq "node 1 health status is 'ready'" "ready" "$HEALTH_STATUS"
 
-"$PROXY" --config "$PROXY_CONFIG" --port $PROXY_PORT > "$TMPDIR/proxy.log" 2>&1 &
-PIDS+=($!)
-echo "  Proxy started (PID $!, port $PROXY_PORT)"
+HEALTH_COORDINATOR=$(echo "$HEALTH_RESP" | jq -r '.coordinator')
+assert_eq "node 1 is coordinator" "true" "$HEALTH_COORDINATOR"
 
-wait_for_health "http://127.0.0.1:$PROXY_PORT/health" "Proxy"
-
-# ---------- 6. Run test requests ----------
-
+# 5b. GET /info on node 1
 echo ""
-echo "=== Step 6: Running tests ==="
+echo "--- Test 5b: GET /info ---"
+INFO_RESP=$(curl -sf "http://127.0.0.1:$NODE1_PORT/info")
+INFO_NODE_ID=$(echo "$INFO_RESP" | jq -r '.node_id')
+assert_eq "node 1 info node_id is 1" "1" "$INFO_NODE_ID"
 
-# 6a. GET /health on proxy
+INFO_GPK=$(echo "$INFO_RESP" | jq -r '.group_public_key')
+assert_eq "node 1 group_public_key matches" "$GROUP_PUBLIC_KEY" "$INFO_GPK"
+
+# 5c. POST /evaluate on node 1 (coordinator mode)
 echo ""
-echo "--- Test 6a: GET /health ---"
-HEALTH_RESP=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health")
-assert_eq "proxy /health returns 200" "200" "$HEALTH_RESP"
+echo "--- Test 5c: POST /evaluate (coordinator) ---"
 
-HEALTH_BODY=$(curl -sf "http://127.0.0.1:$PROXY_PORT/health")
-HEALTH_STATUS=$(echo "$HEALTH_BODY" | jq -r '.status')
-assert_eq "proxy health status is 'ok'" "ok" "$HEALTH_STATUS"
-
-HEALTH_THRESHOLD=$(echo "$HEALTH_BODY" | jq -r '.threshold')
-assert_eq "proxy health threshold is 2" "2" "$HEALTH_THRESHOLD"
-
-HEALTH_NODES=$(echo "$HEALTH_BODY" | jq -r '.total_nodes')
-assert_eq "proxy health total_nodes is 3" "3" "$HEALTH_NODES"
-
-# 6b. GET /oprf/public-key
-echo ""
-echo "--- Test 6b: GET /oprf/public-key ---"
-PK_RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/oprf/public-key")
-PK_VALUE=$(echo "$PK_RESP" | jq -r '.group_public_key')
-assert_eq "public-key matches group key" "$GROUP_PUBLIC_KEY" "$PK_VALUE"
-
-# Verify the public key looks like a valid compressed secp256k1 point
-assert_match "public key is 66 hex chars" '^(02|03)[0-9a-f]{64}$' "$PK_VALUE"
-
-# 6c. GET /oprf/challenge
-echo ""
-echo "--- Test 6c: GET /oprf/challenge ---"
-CHALLENGE_RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/oprf/challenge")
-NONCE=$(echo "$CHALLENGE_RESP" | jq -r '.nonce')
-assert_match "challenge nonce is non-empty hex" '^[0-9a-f]+$' "$NONCE"
-
-# 6d. POST /oprf/evaluate with a blinded point
-echo ""
-echo "--- Test 6d: POST /oprf/evaluate ---"
-
-# Use the secp256k1 generator point as a valid test blinded point.
-# The generator in compressed SEC1 form:
-# 02 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+# Use the secp256k1 generator point as a valid test blinded point
 TEST_BLINDED_POINT="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
 EVAL_HTTP_CODE=$(curl -s -o "$TMPDIR/eval_resp.json" -w "%{http_code}" \
-    -X POST "http://127.0.0.1:$PROXY_PORT/oprf/evaluate" \
+    -X POST "http://127.0.0.1:$NODE1_PORT/evaluate" \
     -H "Content-Type: application/json" \
     -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}")
 
 if [[ "$EVAL_HTTP_CODE" != "200" ]]; then
     echo "  DEBUG: evaluate returned HTTP $EVAL_HTTP_CODE"
     echo "  DEBUG: response body: $(cat "$TMPDIR/eval_resp.json" 2>/dev/null)"
-    echo "  DEBUG: proxy log (last 20 lines):"
-    tail -20 "$TMPDIR/proxy.log" 2>/dev/null || echo "(no log)"
+    echo "  DEBUG: node 1 log (last 20 lines):"
+    tail -20 "$TMPDIR/node1.log" 2>/dev/null || echo "(no log)"
 fi
 assert_eq "evaluate returns 200" "200" "$EVAL_HTTP_CODE"
 
 if [[ -f "$TMPDIR/eval_resp.json" ]]; then
     EVAL_RESP=$(cat "$TMPDIR/eval_resp.json")
-    EVAL_THRESHOLD=$(echo "$EVAL_RESP" | jq -r '.threshold')
-    assert_eq "evaluate response threshold is 2" "2" "$EVAL_THRESHOLD"
 
+    # Check evaluation point
+    EVALUATION=$(echo "$EVAL_RESP" | jq -r '.evaluation')
+    assert_match "evaluation is valid compressed point" '^(02|03)[0-9a-f]{64}$' "$EVALUATION"
+
+    # Check partials
     PARTIALS_COUNT=$(echo "$EVAL_RESP" | jq '.partials | length')
-    assert_match "partials array has >= 2 entries" '^[2-9][0-9]*$|^[2-3]$' "$PARTIALS_COUNT"
+    assert_eq "partials array has 2 entries" "2" "$PARTIALS_COUNT"
 
-    # 6e. Verify each partial_point is a valid compressed secp256k1 point
+    # 5d. Verify each partial_point is a valid compressed secp256k1 point
     echo ""
-    echo "--- Test 6e: Verify partial points ---"
-    for idx in $(seq 0 $((PARTIALS_COUNT - 1))); do
+    echo "--- Test 5d: Verify partial points ---"
+    for idx in 0 1; do
         NODE_ID=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].node_id")
         PARTIAL_POINT=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].partial_point")
-        assert_match "partial_point from node $NODE_ID is valid compressed point (66 hex, starts with 02 or 03)" \
+        assert_match "partial from node $NODE_ID is valid compressed point" \
             '^(02|03)[0-9a-f]{64}$' "$PARTIAL_POINT"
+
+        # Verify DLEQ proof fields exist
+        CHALLENGE=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].dleq_proof.challenge")
+        RESPONSE=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].dleq_proof.response")
+        assert_match "DLEQ challenge from node $NODE_ID is 64 hex" '^[0-9a-f]{64}$' "$CHALLENGE"
+        assert_match "DLEQ response from node $NODE_ID is 64 hex" '^[0-9a-f]{64}$' "$RESPONSE"
     done
 else
     echo "  FAIL: evaluate response file not found"
     FAIL=$((FAIL + 1))
 fi
 
-# ---------- 7. Summary ----------
+# 5e. Test coordinator on all 3 nodes (each can coordinate)
+echo ""
+echo "--- Test 5e: All nodes can coordinate ---"
+for port in $NODE1_PORT $NODE2_PORT $NODE3_PORT; do
+    EVAL_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST "http://127.0.0.1:$port/evaluate" \
+        -H "Content-Type: application/json" \
+        -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}")
+    assert_eq "node at port $port can coordinate (200)" "200" "$EVAL_CODE"
+done
+
+# 5f. All coordinators produce the same evaluation
+echo ""
+echo "--- Test 5f: All coordinators produce same evaluation ---"
+EVAL_1=$(curl -sf -X POST "http://127.0.0.1:$NODE1_PORT/evaluate" \
+    -H "Content-Type: application/json" \
+    -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}" | jq -r '.evaluation')
+EVAL_2=$(curl -sf -X POST "http://127.0.0.1:$NODE2_PORT/evaluate" \
+    -H "Content-Type: application/json" \
+    -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}" | jq -r '.evaluation')
+EVAL_3=$(curl -sf -X POST "http://127.0.0.1:$NODE3_PORT/evaluate" \
+    -H "Content-Type: application/json" \
+    -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}" | jq -r '.evaluation')
+
+assert_eq "node 1 and 2 produce same evaluation" "$EVAL_1" "$EVAL_2"
+assert_eq "node 1 and 3 produce same evaluation" "$EVAL_1" "$EVAL_3"
+
+# ---------- 6. Summary ----------
 
 echo ""
 echo "========================================"
@@ -321,13 +320,10 @@ echo "========================================"
 if [[ $FAIL -gt 0 ]]; then
     echo "  RESULT: FAIL"
     echo ""
-    echo "--- Node logs ---"
     for i in 1 2 3; do
         echo "--- Node $i log (last 10 lines) ---"
         tail -10 "$TMPDIR/node${i}.log" 2>/dev/null || echo "(no log)"
     done
-    echo "--- Proxy log (last 10 lines) ---"
-    tail -10 "$TMPDIR/proxy.log" 2>/dev/null || echo "(no log)"
     exit 1
 else
     echo "  RESULT: PASS"

@@ -2,8 +2,8 @@
 # =============================================================================
 # deploy.sh — Automated deployment for threshold OPRF nodes on AWS.
 #
-# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions with VPC peering
-# to the proxy. All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
+# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions with AWS PrivateLink.
+# All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
 #
 # Usage:
 #   ./deploy.sh <step> [step...]
@@ -30,14 +30,12 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
-  certs         Generate TLS certs (with IPs as SANs) + distribute
-  init-seal     Interactive: inject key shares via attested TLS
+  init-seal     S3-mediated ECIES key injection (attested)
   start         Start nodes in normal mode (unseal + serve)
-  firewall      Allow port 3001 from proxy VPC CIDR to each node
-  peering       Set up VPC peering between proxy and node VPCs
-  proxy-config  Generate docker/proxy-config.production.json
+  privatelink   Create NLBs, Endpoint Services, VPC Endpoints
+  coordinator-config  Generate per-node coordinator configs (peer endpoints)
   verify        Health check all nodes (via SSH)
-  e2e           End-to-end verify: nodes + proxy + OPRF evaluate
+  e2e           End-to-end verify: OPRF evaluate via coordinator
 
 Utilities:
   auto-config   Auto-populate config.env from AWS
@@ -45,8 +43,8 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage → certs
-  post-seal     start → firewall → peering → proxy-config → verify
+  pre-seal      setup-vms → pull → storage
+  post-seal     start → privatelink → coordinator-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
@@ -66,9 +64,7 @@ source "$CONFIG_FILE"
 
 # ─── Derived values ──────────────────────────────────────────────────────────
 
-ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com"
 NODE_IMAGE="${NODE_IMAGE:-ghcr.io/${GHCR_OWNER:-jeganggs64}/toprf-node:latest}"
-PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-ruonid/proxy}:latest"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -121,6 +117,14 @@ node_vpc_id() {
         1) echo "$NODE1_VPC_ID" ;;
         2) echo "$NODE2_VPC_ID" ;;
         3) echo "$NODE3_VPC_ID" ;;
+    esac
+}
+
+node_subnet_id() {
+    case "$1" in
+        1) echo "$NODE1_SUBNET_ID" ;;
+        2) echo "$NODE2_SUBNET_ID" ;;
+        3) echo "$NODE3_SUBNET_ID" ;;
     esac
 }
 
@@ -261,268 +265,284 @@ SETUP
     echo "  Done."
 }
 
-# ─── 4. Generate + distribute TLS certs ──────────────────────────────────────
+# ─── 4. AWS PrivateLink (NLBs + Endpoint Services + VPC Endpoints) ──────────
 
-step_certs() {
+step_privatelink() {
     echo ""
-    info "Generating TLS certificates (with node IPs as SANs)"
-
-    local CERTS_DIR="$REPO_ROOT/certs"
-    local CA_DIR="$CERTS_DIR/ca"
-    local NODES_DIR="$CERTS_DIR/nodes"
-
-    rm -rf "$CERTS_DIR"
-    mkdir -p "$CA_DIR" "$NODES_DIR"
-
-    # CA
-    echo "  Generating CA..."
-    openssl ecparam -genkey -name prime256v1 -noout -out "$CA_DIR/ca.key" 2>/dev/null
-    chmod 600 "$CA_DIR/ca.key"
-    openssl req -new -x509 -key "$CA_DIR/ca.key" -out "$CA_DIR/ca.pem" \
-        -days 1095 -subj "/CN=toprf-ca/O=Threshold OPRF/OU=CA" -sha256
-
-    # Node certs — SANs include public and private IPs
-    for i in $(active_nodes); do
-        local ip private_ip
-        ip=$(node_ip "$i")
-        private_ip=$(node_private_ip "$i")
-        echo "  Node $i cert (SAN: $ip, $private_ip)..."
-
-        openssl ecparam -genkey -name prime256v1 -noout \
-            -out "$NODES_DIR/node${i}.key" 2>/dev/null
-        chmod 600 "$NODES_DIR/node${i}.key"
-
-        openssl req -new -key "$NODES_DIR/node${i}.key" \
-            -out "$NODES_DIR/node${i}.csr" \
-            -subj "/CN=node${i}/O=Threshold OPRF/OU=Node" -sha256
-
-        # Include both public IP (for init-seal) and private IP (for proxy via VPC peering)
-        cat > "$NODES_DIR/node${i}.ext" <<EXTEOF
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature,keyEncipherment
-extendedKeyUsage=serverAuth
-subjectAltName=@alt_names
-
-[alt_names]
-DNS.1 = localhost
-DNS.2 = node${i}
-IP.1  = 127.0.0.1
-IP.2  = ${ip}
-IP.3  = ${private_ip}
-EXTEOF
-
-        openssl x509 -req -in "$NODES_DIR/node${i}.csr" \
-            -CA "$CA_DIR/ca.pem" -CAkey "$CA_DIR/ca.key" -CAcreateserial \
-            -out "$NODES_DIR/node${i}.pem" -days 365 -sha256 \
-            -extfile "$NODES_DIR/node${i}.ext" 2>/dev/null
-
-        rm -f "$NODES_DIR/node${i}.csr" "$NODES_DIR/node${i}.ext"
-    done
-
-    rm -f "$CA_DIR/ca.srl"
-
-    # Distribute certs to VMs
-    echo "  Distributing certs to VMs..."
-    for i in $(active_nodes); do
-        echo "    Node $i..."
-        scp_to_node "$i" \
-            "$CA_DIR/ca.pem" \
-            "$NODES_DIR/node${i}.pem" \
-            "$NODES_DIR/node${i}.key"
-        ssh_node "$i" "sudo mkdir -p /etc/toprf/certs && \
-            sudo mv /tmp/ca.pem /tmp/node${i}.pem /tmp/node${i}.key /etc/toprf/certs/ && \
-            sudo chmod 644 /etc/toprf/certs/ca.pem /etc/toprf/certs/node${i}.pem && \
-            sudo chmod 600 /etc/toprf/certs/node${i}.key"
-    done
-
-    echo "  Done."
-    echo "  Local certs at: $CERTS_DIR"
-}
-
-# ─── 5. Open firewall (proxy VPC → nodes on port 3001) ───────────────────────
-
-step_firewall() {
-    echo ""
-    info "Allowing port 3001 from proxy VPC CIDR to nodes"
-
-    [[ -n "${PROXY_VPC_CIDR:-}" ]] || die "PROXY_VPC_CIDR not set in config.env"
-
-    for i in $(active_nodes); do
-        local sg_id region
-        sg_id=$(node_sg_id "$i")
-        region=$(node_region "$i")
-        echo "  Node $i: SG $sg_id ($region)..."
-        aws ec2 authorize-security-group-ingress \
-            --group-id "$sg_id" --protocol tcp --port 3001 \
-            --cidr "$PROXY_VPC_CIDR" --region "$region" 2>/dev/null \
-            || warn "rule may already exist"
-    done
-
-    echo "  Done."
-}
-
-# ─── 6. VPC peering (proxy ↔ node VPCs) ──────────────────────────────────────
-
-step_peering() {
-    echo ""
-    info "Setting up VPC peering between proxy and node VPCs"
+    info "Setting up AWS PrivateLink (NLBs → Endpoint Services → VPC Endpoints)"
 
     local ecs_state="${SCRIPT_DIR}/ecs-state.env"
     [[ -f "$ecs_state" ]] || die "ecs-state.env not found. Run setup-ecs.sh vpc first."
     source "$ecs_state"
 
     local proxy_vpc_id="${VPC_ID:?VPC_ID not found in ecs-state.env}"
-    local proxy_priv_rt="${PRIV_RT:?PRIV_RT not found in ecs-state.env}"
+    local pl_state="${SCRIPT_DIR}/privatelink-state.env"
 
-    # Track which VPCs we've already peered (bash 3 compatible)
-    local peered_vpcs=""
+    # Load existing PrivateLink state
+    [[ -f "$pl_state" ]] && source "$pl_state"
+
+    # Create security group for VPC endpoints (once)
+    if [[ -z "${VPCE_SG:-}" ]]; then
+        echo "  Creating VPC endpoint security group..."
+        VPCE_SG=$(aws ec2 create-security-group \
+            --region "$PROXY_REGION" \
+            --vpc-id "$proxy_vpc_id" \
+            --group-name "toprf-privatelink-sg" \
+            --description "Allow ECS tasks to reach TOPRF nodes via PrivateLink" \
+            --query 'GroupId' --output text)
+        aws ec2 authorize-security-group-ingress \
+            --region "$PROXY_REGION" \
+            --group-id "$VPCE_SG" \
+            --protocol tcp --port 3001 \
+            --source-group "${ECS_SG:?ECS_SG not found in ecs-state.env}"
+        echo "VPCE_SG=${VPCE_SG}" >> "$pl_state"
+        echo "    SG: $VPCE_SG"
+    else
+        echo "  VPC endpoint SG: $VPCE_SG (exists)"
+    fi
 
     for i in $(active_nodes); do
-        local region vpc_id private_ip
+        local region vpc_id subnet_id private_ip
         region=$(node_region "$i")
         vpc_id=$(node_vpc_id "$i")
+        subnet_id=$(node_subnet_id "$i")
         private_ip=$(node_private_ip "$i")
 
-        [[ -n "$vpc_id" ]] || die "NODE${i}_VPC_ID not set in config.env"
+        [[ -n "$subnet_id" ]] || die "NODE${i}_SUBNET_ID not set in config.env. Run auto-config or set manually."
 
-        if [[ "$vpc_id" == "$proxy_vpc_id" ]]; then
-            echo "  Node $i: same VPC as proxy, skipping peering"
-            continue
+        echo ""
+        echo "  ━━━ Node $i ($region, $private_ip) ━━━"
+
+        # ── 1. Network Load Balancer (needs ≥2 AZs for cross-region PrivateLink) ──
+        local nlb_var="NLB_ARN_NODE${i}"
+        local nlb_arn="${!nlb_var:-}"
+        if [[ -z "$nlb_arn" ]]; then
+            # Find a second subnet in a different AZ within the same VPC
+            local second_subnet
+            second_subnet=$(aws ec2 describe-subnets --region "$region" \
+                --filters "Name=vpc-id,Values=$vpc_id" \
+                --query "Subnets[?SubnetId!='${subnet_id}'] | [0].SubnetId" --output text)
+
+            echo "  Creating NLB (2 AZs: $subnet_id, $second_subnet)..."
+            nlb_arn=$(aws elbv2 create-load-balancer \
+                --region "$region" \
+                --name "toprf-node-${i}-nlb" \
+                --type network \
+                --scheme internal \
+                --subnets "$subnet_id" "$second_subnet" \
+                --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+            echo "${nlb_var}=${nlb_arn}" >> "$pl_state"
+            echo "    NLB: $nlb_arn"
+        else
+            echo "    NLB: $nlb_arn (exists)"
         fi
 
-        # --- Peering (once per unique VPC) ---
-        local peering_id=""
-        local already_peered=false
-        if echo "$peered_vpcs" | grep -q "$vpc_id"; then
-            already_peered=true
+        # ── 2. Target Group ──
+        local tg_var="PL_TG_ARN_NODE${i}"
+        local tg_arn="${!tg_var:-}"
+        if [[ -z "$tg_arn" ]]; then
+            echo "  Creating Target Group..."
+            tg_arn=$(aws elbv2 create-target-group \
+                --region "$region" \
+                --name "toprf-node-${i}-tg" \
+                --protocol TCP --port 3001 \
+                --vpc-id "$vpc_id" \
+                --target-type ip \
+                --health-check-protocol HTTP \
+                --health-check-path /health \
+                --health-check-interval-seconds 30 \
+                --healthy-threshold-count 2 \
+                --unhealthy-threshold-count 2 \
+                --query 'TargetGroups[0].TargetGroupArn' --output text)
+            echo "${tg_var}=${tg_arn}" >> "$pl_state"
+            echo "    TG: $tg_arn"
+
+            aws elbv2 register-targets --region "$region" \
+                --target-group-arn "$tg_arn" \
+                --targets "Id=${private_ip},Port=3001"
+            echo "    Registered target: ${private_ip}:3001"
+        else
+            echo "    TG: $tg_arn (exists)"
         fi
 
-        # Check for existing active/pending peering
-        local existing_peering
-        existing_peering=$(aws ec2 describe-vpc-peering-connections \
-            --region "$PROXY_REGION" \
-            --filters "Name=requester-vpc-info.vpc-id,Values=$proxy_vpc_id" \
-                      "Name=accepter-vpc-info.vpc-id,Values=$vpc_id" \
-                      "Name=status-code,Values=active,pending-acceptance" \
-            --query 'VpcPeeringConnections[0].VpcPeeringConnectionId' --output text 2>/dev/null)
-
-        if [[ -n "$existing_peering" && "$existing_peering" != "None" ]]; then
-            peering_id="$existing_peering"
-            if [[ "$already_peered" == "false" ]]; then
-                echo "  Node $i: Using existing peering $peering_id for $vpc_id ($region)"
-            fi
-        elif [[ "$already_peered" == "false" ]]; then
-            echo "  Node $i: Peering $vpc_id ($region) ↔ $proxy_vpc_id ($PROXY_REGION)..."
-            peering_id=$(aws ec2 create-vpc-peering-connection \
-                --region "$PROXY_REGION" \
-                --vpc-id "$proxy_vpc_id" \
-                --peer-vpc-id "$vpc_id" \
-                --peer-region "$region" \
-                --query 'VpcPeeringConnection.VpcPeeringConnectionId' --output text)
-            echo "    Created: $peering_id"
+        # ── 3. NLB Listener ──
+        local listener_var="NLB_LISTENER_NODE${i}"
+        local listener_arn="${!listener_var:-}"
+        if [[ -z "$listener_arn" ]]; then
+            echo "  Creating NLB listener (TCP :3001)..."
+            listener_arn=$(aws elbv2 create-listener \
+                --region "$region" \
+                --load-balancer-arn "$nlb_arn" \
+                --protocol TCP --port 3001 \
+                --default-actions "Type=forward,TargetGroupArn=${tg_arn}" \
+                --query 'Listeners[0].ListenerArn' --output text)
+            echo "${listener_var}=${listener_arn}" >> "$pl_state"
+            echo "    Listener: $listener_arn"
+        else
+            echo "    Listener: exists"
         fi
 
-        [[ -n "$peering_id" ]] || { warn "No peering found for node $i"; continue; }
+        # ── 4. Wait for NLB to be active ──
+        echo "  Waiting for NLB to become active..."
+        aws elbv2 wait load-balancer-available \
+            --region "$region" \
+            --load-balancer-arns "$nlb_arn" 2>/dev/null || true
+        echo "    NLB active."
 
-        # Accept if pending (once per VPC)
-        if [[ "$already_peered" == "false" ]]; then
-            local status
-            status=$(aws ec2 describe-vpc-peering-connections \
-                --region "$PROXY_REGION" \
-                --vpc-peering-connection-ids "$peering_id" \
-                --query 'VpcPeeringConnections[0].Status.Code' --output text 2>/dev/null)
+        # ── 5. VPC Endpoint Service ──
+        local svc_var="ENDPOINT_SVC_ID_NODE${i}"
+        local svc_id="${!svc_var:-}"
+        if [[ -z "$svc_id" ]]; then
+            echo "  Creating VPC Endpoint Service..."
+            svc_id=$(aws ec2 create-vpc-endpoint-service-configuration \
+                --region "$region" \
+                --network-load-balancer-arns "$nlb_arn" \
+                --no-acceptance-required \
+                --query 'ServiceConfiguration.ServiceId' --output text)
+            echo "${svc_var}=${svc_id}" >> "$pl_state"
+            echo "    Endpoint Service: $svc_id"
 
-            if [[ "$status" == "pending-acceptance" ]]; then
-                echo "    Waiting for peering to propagate to $region..."
-                local attempts=0
-                while ! aws ec2 describe-vpc-peering-connections \
-                        --region "$region" \
-                        --vpc-peering-connection-ids "$peering_id" > /dev/null 2>&1; do
-                    attempts=$((attempts + 1))
-                    if [[ $attempts -ge 12 ]]; then
-                        die "Peering $peering_id not visible in $region after 60s"
-                    fi
-                    sleep 5
-                done
-                aws ec2 accept-vpc-peering-connection \
+            # Allow our AWS account to connect
+            aws ec2 modify-vpc-endpoint-service-permissions \
+                --region "$region" \
+                --service-id "$svc_id" \
+                --add-allowed-principals "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
+            echo "    Allowed principal: account ${AWS_ACCOUNT_ID}"
+
+            # Cross-region: allow the proxy's region to connect
+            if [[ "$region" != "$PROXY_REGION" ]]; then
+                aws ec2 modify-vpc-endpoint-service-configuration \
                     --region "$region" \
-                    --vpc-peering-connection-id "$peering_id" > /dev/null
-                echo "    Accepted."
-            elif [[ "$status" == "active" ]]; then
-                echo "    Already active."
+                    --service-id "$svc_id" \
+                    --add-supported-regions "$PROXY_REGION"
+                echo "    Added supported region: $PROXY_REGION"
+            fi
+        else
+            echo "    Endpoint Service: $svc_id (exists)"
+        fi
+
+        # Get the service name (needed to create the VPC endpoint)
+        local svc_name_var="ENDPOINT_SVC_NAME_NODE${i}"
+        local svc_name="${!svc_name_var:-}"
+        if [[ -z "$svc_name" ]]; then
+            svc_name=$(aws ec2 describe-vpc-endpoint-service-configurations \
+                --region "$region" \
+                --service-ids "$svc_id" \
+                --query 'ServiceConfigurations[0].ServiceName' --output text)
+            echo "${svc_name_var}=${svc_name}" >> "$pl_state"
+        fi
+        echo "    Service name: $svc_name"
+
+        # ── 6. Interface VPC Endpoint (in proxy VPC) ──
+        local vpce_var="VPCE_ID_NODE${i}"
+        local vpce_id="${!vpce_var:-}"
+        if [[ -z "$vpce_id" ]]; then
+            echo "  Creating Interface VPC Endpoint in proxy VPC ($PROXY_REGION)..."
+
+            local vpce_args=(
+                --region "$PROXY_REGION"
+                --vpc-id "$proxy_vpc_id"
+                --service-name "$svc_name"
+                --vpc-endpoint-type Interface
+                --subnet-ids "${PRIV_SUBNET_1}" "${PRIV_SUBNET_2}"
+                --security-group-ids "$VPCE_SG"
+                --no-private-dns-enabled
+            )
+
+            # Cross-region PrivateLink requires --service-region
+            if [[ "$region" != "$PROXY_REGION" ]]; then
+                vpce_args+=(--service-region "$region")
+                echo "    Cross-region: $region → $PROXY_REGION"
             fi
 
-            # Reverse route: node VPC → proxy VPC
-            local node_rt
-            node_rt=$(aws ec2 describe-route-tables --region "$region" \
-                --filters "Name=vpc-id,Values=$vpc_id" "Name=association.main,Values=true" \
-                --query 'RouteTables[0].RouteTableId' --output text)
-            aws ec2 create-route --region "$region" \
-                --route-table-id "$node_rt" \
-                --destination-cidr-block "$PROXY_VPC_CIDR" \
-                --vpc-peering-connection-id "$peering_id" 2>/dev/null \
-                || warn "node → proxy route may exist"
-
-            peered_vpcs="${peered_vpcs} ${vpc_id}"
+            vpce_id=$(aws ec2 create-vpc-endpoint \
+                "${vpce_args[@]}" \
+                --query 'VpcEndpoint.VpcEndpointId' --output text)
+            echo "${vpce_var}=${vpce_id}" >> "$pl_state"
+            echo "    VPC Endpoint: $vpce_id"
+        else
+            echo "    VPC Endpoint: $vpce_id (exists)"
         fi
 
-        # --- Subnet-specific proxy→node route (per node) ---
-        # Multiple node VPCs may share the same top-level CIDR (e.g. default
-        # VPCs all use 172.31.0.0/16), so we route the specific subnet
-        # containing each node's private IP to the correct peering.
-        local subnet_id subnet_cidr
-        subnet_id=$(aws ec2 describe-instances --region "$region" \
-            --filters "Name=tag:Name,Values=toprf-node-${i}" \
-                      "Name=instance-state-name,Values=running" \
-            --query 'Reservations[0].Instances[0].SubnetId' --output text 2>/dev/null)
-        if [[ -n "$subnet_id" && "$subnet_id" != "None" ]]; then
-            subnet_cidr=$(aws ec2 describe-subnets --region "$region" \
-                --subnet-ids "$subnet_id" \
-                --query 'Subnets[0].CidrBlock' --output text 2>/dev/null)
+        # ── 7. Wait for endpoint to become available + get DNS ──
+        echo "  Waiting for VPC endpoint DNS..."
+        local vpce_dns_var="VPCE_DNS_NODE${i}"
+        local vpce_dns="${!vpce_dns_var:-}"
+        if [[ -z "$vpce_dns" ]]; then
+            local attempts=0
+            while true; do
+                vpce_dns=$(aws ec2 describe-vpc-endpoints \
+                    --region "$PROXY_REGION" \
+                    --vpc-endpoint-ids "$vpce_id" \
+                    --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text 2>/dev/null)
+                if [[ -n "$vpce_dns" && "$vpce_dns" != "None" && "$vpce_dns" != "null" ]]; then
+                    echo "${vpce_dns_var}=${vpce_dns}" >> "$pl_state"
+                    break
+                fi
+                attempts=$((attempts + 1))
+                if [[ $attempts -ge 60 ]]; then
+                    warn "Could not get DNS for $vpce_id after 5 minutes"
+                    vpce_dns=""
+                    break
+                fi
+                sleep 5
+            done
         fi
-
-        if [[ -z "$subnet_cidr" || "$subnet_cidr" == "None" ]]; then
-            warn "Could not determine subnet CIDR for node $i ($private_ip)"
-            continue
+        if [[ -n "$vpce_dns" ]]; then
+            echo "    DNS: $vpce_dns"
         fi
-
-        echo "    Node $i ($private_ip): route $subnet_cidr → $peering_id"
-        aws ec2 create-route --region "$PROXY_REGION" \
-            --route-table-id "$proxy_priv_rt" \
-            --destination-cidr-block "$subnet_cidr" \
-            --vpc-peering-connection-id "$peering_id" 2>/dev/null \
-            || warn "proxy → node $i subnet route may exist"
     done
 
-    echo "  Done."
+    echo ""
+    echo "  PrivateLink setup complete."
+    echo "  State saved to: $pl_state"
+    echo ""
+    echo "  Next: ./deploy.sh coordinator-config  (generates per-node peer configs)"
 }
 
 # ─── 7. Init-seal (interactive) ──────────────────────────────────────────────
 
 step_init_seal() {
     echo ""
-    info "Init-seal — interactive key injection via attested TLS"
+    info "Init-seal — S3-mediated ECIES key injection"
     echo ""
     echo "  For each node, the script will:"
-    echo "    1. Start the node in init-seal mode"
-    echo "    2. Wait for the attestation endpoint to be ready"
-    echo "    3. Pause so you can verify the attestation report"
-    echo "    4. Send the key share after you confirm"
+    echo "    1. Start the node in init-seal mode (generates keypair, uploads attestation + pubkey to S3)"
+    echo "    2. Download and verify the attestation report"
+    echo "    3. Encrypt the key share with ECIES to the attested public key"
+    echo "    4. Upload the encrypted share to S3 for the node to pick up"
     echo ""
 
     load_ceremony
 
+    # Build the toprf-init-encrypt binary if not already built
+    local init_encrypt="$REPO_ROOT/target/release/toprf-init-encrypt"
+    if [[ ! -x "$init_encrypt" ]]; then
+        echo "  Building toprf-init-encrypt..."
+        (cd "$REPO_ROOT" && cargo build --release -p toprf-seal --bin toprf-init-encrypt 2>&1 | tail -3)
+    fi
+
+    # Get expected measurement (operator should set this in config.env or env)
+    local expected_measurement="${EXPECTED_MEASUREMENT:-}"
+    if [[ -z "$expected_measurement" ]]; then
+        echo ""
+        echo "  EXPECTED_MEASUREMENT not set. Enter the expected measurement (96 hex chars),"
+        echo "  or press Enter to skip attestation verification (dev only):"
+        read -r expected_measurement < /dev/tty
+    fi
+
     for i in $(active_nodes); do
-        local ip vs url share
+        local ip vs url share bucket
         ip=$(node_ip "$i")
         vs=$(node_vs "$i")
         url=$(sealed_url "$i")
         share="${NODE_SHARES_DIR}/node-${i}-share.json"
+        bucket=$(node_s3_bucket "$i")
 
         [[ -f "$share" ]] || die "Key share not found: $share"
 
         echo "━━━ Node $i ($ip) ━━━"
+        echo "  S3 bucket: $bucket"
         echo "  Starting init-seal container..."
 
         # Clean up any previous init-seal container
@@ -532,15 +552,22 @@ step_init_seal() {
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             --device /dev/sev-guest:/dev/sev-guest \
             --privileged --user root \
-            -p 3001:3001 \
             ${NODE_IMAGE} \
             --init-seal \
-            --upload-url '${url}' \
-            --port 3001" < /dev/null
+            --s3-bucket '${bucket}' \
+            --upload-url '${url}'" < /dev/null
 
-        echo "  Waiting for attestation endpoint..."
+        echo "  Node started in init-seal mode. Waiting for attestation artifacts in S3..."
+
+        # Poll for attestation.bin in S3
+        local s3_attestation="s3://${bucket}/init/attestation.bin"
+        local s3_pubkey="s3://${bucket}/init/pubkey.bin"
+        local s3_encrypted="s3://${bucket}/init/encrypted-share.bin"
+        local tmpdir
+        tmpdir=$(mktemp -d)
+
         local waited=0
-        while ! ssh_node "$i" "curl -sk https://localhost:3001/attest > /dev/null 2>&1" < /dev/null; do
+        while ! aws s3 cp "$s3_attestation" "$tmpdir/attestation.bin" --quiet 2>/dev/null; do
             local running
             running=$(ssh_node "$i" "sudo docker inspect -f '{{.State.Running}}' toprf-init-seal 2>/dev/null || echo false" < /dev/null)
             if [[ "$running" != "true" ]]; then
@@ -550,58 +577,75 @@ step_init_seal() {
                 echo "  Press Enter to skip this node and continue, or Ctrl-C to abort:"
                 read -r _ < /dev/tty
                 ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
+                rm -rf "$tmpdir"
                 continue 2
             fi
-            sleep 2
+            sleep 3
             waited=$((waited + 1))
-            if [[ $waited -ge 60 ]]; then
-                echo "  Timed out after 120s. Check logs:"
+            if [[ $waited -ge 40 ]]; then
+                echo "  Timed out after 120s. Check container logs:"
                 echo "    ssh → sudo docker logs toprf-init-seal"
-                die "init-seal endpoint not ready"
+                rm -rf "$tmpdir"
+                die "init-seal: attestation not uploaded to S3"
             fi
         done
 
-        echo ""
-        echo "  Attestation endpoint ready: https://${ip}:3001/attest"
-        echo ""
-        echo "  To verify (from another terminal):"
-        echo "    curl -k https://${ip}:3001/attest -o report-node${i}.bin"
-        echo "    # Check: AMD signature chain (ARK→ASK→VCEK)"
-        echo "    # Check: MEASUREMENT matches expected binary"
-        echo "    # Check: REPORT_DATA[0..32] == SHA-256(TLS pubkey)"
-        echo ""
-        echo "  Press Enter to send key share, or 'skip' to skip this node:"
-        read -r response < /dev/tty
+        aws s3 cp "$s3_pubkey" "$tmpdir/pubkey.bin" --quiet
+        echo "  Attestation and pubkey downloaded from S3."
 
-        if [[ "$response" == "skip" ]]; then
-            echo "  Skipping node $i."
-            ssh_node "$i" "sudo docker rm -f toprf-init-seal" < /dev/null || true
-            echo ""
-            continue
+        # Run the operator-side verification + encryption
+        local encrypt_args=(
+            --attestation "$tmpdir/attestation.bin"
+            --pubkey "$tmpdir/pubkey.bin"
+            --output "$tmpdir/encrypted-share.bin"
+            --share-file "$share"
+        )
+
+        if [[ -n "$expected_measurement" ]]; then
+            encrypt_args+=(--expected-measurement "$expected_measurement")
+        else
+            encrypt_args+=(--skip-attestation-verify --expected-measurement "$(printf '%096d' 0)")
+            echo "  WARNING: skipping attestation verification (dev mode)"
         fi
 
-        echo "  Sending key share to node $i..."
-        scp_to_node "$i" "$share" < /dev/null
-        local share_filename
-        share_filename=$(basename "$share")
-        local http_code body
-        body=$(ssh_node "$i" "curl -sk https://localhost:3001/init-key \
-            -X POST -H 'Content-Type: application/json' \
-            -d @/tmp/${share_filename} \
-            -w '\n%{http_code}' 2>&1 ; rm -f /tmp/${share_filename}" < /dev/null)
+        echo "  Verifying attestation and encrypting key share..."
+        "$init_encrypt" "${encrypt_args[@]}" 2>&1 | sed 's/^/  /'
 
-        http_code=$(echo "$body" | tail -1)
-        body=$(echo "$body" | sed '$d')
+        # Upload encrypted share to S3
+        echo "  Uploading encrypted share to S3..."
+        aws s3 cp "$tmpdir/encrypted-share.bin" "$s3_encrypted" --quiet
 
-        if [[ "$http_code" == "200" ]]; then
+        echo "  Encrypted share uploaded. Node will pick it up and seal."
+
+        # Wait for the init-seal container to finish (it seals and exits)
+        local seal_waited=0
+        while true; do
+            local running
+            running=$(ssh_node "$i" "sudo docker inspect -f '{{.State.Running}}' toprf-init-seal 2>/dev/null || echo false" < /dev/null)
+            if [[ "$running" != "true" ]]; then
+                break
+            fi
+            sleep 3
+            seal_waited=$((seal_waited + 1))
+            if [[ $seal_waited -ge 60 ]]; then
+                echo "  Timed out waiting for seal to complete."
+                break
+            fi
+        done
+
+        # Check container exit code
+        local exit_code
+        exit_code=$(ssh_node "$i" "sudo docker inspect -f '{{.State.ExitCode}}' toprf-init-seal 2>/dev/null || echo 1" < /dev/null)
+        if [[ "$exit_code" == "0" ]]; then
             echo "  Node $i sealed successfully."
         else
-            echo "  WARNING: init-key returned HTTP $http_code"
-            echo "  Response: $body"
+            echo "  WARNING: init-seal container exited with code $exit_code"
+            echo "  Logs:"
+            ssh_node "$i" "sudo docker logs --tail 20 toprf-init-seal 2>&1" < /dev/null | sed 's/^/    /' || true
         fi
 
-        sleep 3
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
+        rm -rf "$tmpdir"
         echo ""
     done
 
@@ -616,6 +660,8 @@ step_start() {
 
     load_ceremony
 
+    local config_dir="$SCRIPT_DIR/coordinator-configs"
+
     for i in $(active_nodes); do
         local ip vs url
         ip=$(node_ip "$i")
@@ -626,17 +672,26 @@ step_start() {
 
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
 
+        # Upload coordinator config if it exists
+        local coord_config="${config_dir}/coordinator-node-${i}.json"
+        local coord_args=""
+        if [[ -f "$coord_config" ]]; then
+            scp_to_node "$i" "$coord_config"
+            ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json"
+            coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
+            echo "    Coordinator config uploaded"
+        fi
+
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
+            ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
             --privileged --user root \
-            -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --port 3001 \
-            --tls-cert /etc/toprf/certs/node${i}.pem \
-            --tls-key /etc/toprf/certs/node${i}.key"
+            --coordinator-config /etc/toprf/coordinator.json"
     done
 
     echo "  Waiting for nodes to boot..."
@@ -644,47 +699,79 @@ step_start() {
     echo "  Done. Run './deploy.sh verify' to check health."
 }
 
-# ─── 9. Generate proxy config ────────────────────────────────────────────────
+# ─── 9. Generate coordinator configs ─────────────────────────────────────────
 
-step_proxy_config() {
+step_coordinator_config() {
     echo ""
-    info "Generating proxy config"
+    info "Generating coordinator configs (per-node peer endpoints)"
 
     load_ceremony
 
-    local out="$REPO_ROOT/docker/proxy-config.production.json"
+    local pl_state="${SCRIPT_DIR}/privatelink-state.env"
+    [[ -f "$pl_state" ]] || die "privatelink-state.env not found. Run './deploy.sh privatelink' first."
+    source "$pl_state"
 
-    # Build nodes array using private IPs (proxy connects via VPC peering)
-    local nodes_json=""
-    local first=true
+    local config_dir="$SCRIPT_DIR/coordinator-configs"
+    mkdir -p "$config_dir"
+
+    # For each node, generate a coordinator config listing its peers
     for i in $(active_nodes); do
-        local private_ip vs
-        private_ip=$(node_private_ip "$i")
-        vs=$(node_vs "$i")
-        [[ -n "$private_ip" ]] || die "NODE${i}_PRIVATE_IP not set in config.env"
-        $first || nodes_json+=","
-        nodes_json+="
+        local out="${config_dir}/coordinator-node-${i}.json"
+        local peers_json=""
+        local first=true
+
+        for j in $(active_nodes); do
+            [[ "$j" != "$i" ]] || continue
+
+            local vs peer_endpoint
+            vs=$(node_vs "$j")
+
+            # Determine peer endpoint: same-VPC nodes use NLB DNS,
+            # cross-VPC nodes use PrivateLink VPCE DNS.
+            # With full PrivateLink mesh, all peers use VPCE DNS from the
+            # node's own VPC. The VPCEs are named by which VPC they're in.
+            local node_region peer_region vpce_dns
+            node_region=$(node_region "$i")
+            peer_region=$(node_region "$j")
+
+            # VPCE DNS for node j as seen from node i's VPC
+            # These are stored as VPCE_DNS_NODE<j>_FROM_NODE<i>_VPC
+            # For the initial deployment, we use the proxy VPC endpoints
+            # which will be replaced with node-to-node VPCEs
+            local vpce_dns_var="VPCE_DNS_NODE${j}_FROM_VPC_${node_region//-/_}"
+            vpce_dns="${!vpce_dns_var:-}"
+
+            # Fall back to the existing proxy VPC endpoints if node-to-node
+            # VPCEs haven't been created yet
+            if [[ -z "$vpce_dns" ]]; then
+                vpce_dns_var="VPCE_DNS_NODE${j}"
+                vpce_dns="${!vpce_dns_var:-}"
+            fi
+
+            [[ -n "$vpce_dns" ]] || die "No VPCE DNS for node $j reachable from node $i. Run './deploy.sh privatelink' first."
+
+            peer_endpoint="http://${vpce_dns}:3001"
+
+            $first || peers_json+=","
+            peers_json+="
     {
-      \"node_id\": $i,
-      \"endpoint\": \"https://${private_ip}:3001\",
+      \"node_id\": $j,
+      \"endpoint\": \"${peer_endpoint}\",
       \"verification_share\": \"${vs}\"
     }"
-        first=false
-    done
+            first=false
+        done
 
-    cat > "$out" <<CFGEOF
+        cat > "$out" <<CFGEOF
 {
-  "group_public_key": "${GROUP_PUBLIC_KEY}",
-  "threshold": ${THRESHOLD},
-  "require_attestation": false,
-  "rate_limit": { "per_hour": 1000, "per_day": 10000 },
-  "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
-  "nodes": [${nodes_json}
+  "peers": [${peers_json}
   ]
 }
 CFGEOF
 
-    echo "  Written to: $out"
+        echo "  Node $i config: $out"
+    done
+
     echo "  Done."
 }
 
@@ -694,12 +781,7 @@ step_verify() {
     echo ""
     info "Verifying node health"
 
-    local certs_dir="$REPO_ROOT/certs"
     local pass=0 fail=0
-
-    if [[ ! -f "$certs_dir/ca/ca.pem" ]]; then
-        die "Certs not found at $certs_dir. Run './deploy.sh certs' first."
-    fi
 
     for i in $(active_nodes); do
         local ip
@@ -708,7 +790,7 @@ step_verify() {
 
         # Health check via SSH (port 3001 is not open from local machine)
         local resp
-        resp=$(ssh_node "$i" "curl -sk --connect-timeout 5 https://localhost:3001/health 2>&1" < /dev/null) || true
+        resp=$(ssh_node "$i" "curl -s --connect-timeout 5 http://localhost:3001/health 2>&1" < /dev/null) || true
 
         if echo "$resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
             echo "    PASS: ready"
@@ -749,7 +831,7 @@ step_e2e() {
         total=$((total + 1))
 
         local resp
-        resp=$(ssh_node "$i" "curl -sk --connect-timeout 5 https://localhost:3001/health 2>&1" < /dev/null) || true
+        resp=$(ssh_node "$i" "curl -s --connect-timeout 5 http://localhost:3001/health 2>&1" < /dev/null) || true
 
         if echo "$resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
             echo "    Node $i ($ip): PASS"
@@ -760,52 +842,48 @@ step_e2e() {
         fi
     done
 
-    # 2. Proxy health (via ALB / domain)
+    # 2. Coordinator test (via SSH to node 1, calls /evaluate which coordinates with a peer)
     echo ""
-    echo "  [2/3] Proxy health (https://${domain})"
+    echo "  [2/3] Coordinator evaluate (node 1 → peer via PrivateLink)"
     total=$((total + 1))
 
-    local proxy_resp
-    proxy_resp=$(curl -s --connect-timeout 10 "https://${domain}/health" 2>&1) || true
-
-    if echo "$proxy_resp" | jq -e '.status' > /dev/null 2>&1; then
-        local proxy_status node_count
-        proxy_status=$(echo "$proxy_resp" | jq -r '.status')
-        node_count=$(echo "$proxy_resp" | jq -r '.nodes_reachable // empty')
-        echo "    Proxy: PASS (status=$proxy_status, nodes_reachable=${node_count:-?})"
-        pass=$((pass + 1))
-    else
-        echo "    Proxy: FAIL — $proxy_resp"
-        fail=$((fail + 1))
-    fi
-
-    # 3. OPRF evaluate (test round-trip through proxy → nodes)
-    echo ""
-    echo "  [3/3] OPRF evaluate (test request)"
-    total=$((total + 1))
-
-    # Generate a random 32-byte blinded element (hex-encoded)
-    local test_input
-    test_input=$(openssl rand -hex 32)
+    # Use a known test blinded point (valid secp256k1 point)
+    local test_point="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
     local eval_resp
-    eval_resp=$(curl -s --connect-timeout 10 \
-        -X POST "https://${domain}/oprf/evaluate" \
-        -H "Content-Type: application/json" \
-        -d "{\"blinded_element\":\"${test_input}\"}" 2>&1) || true
+    eval_resp=$(ssh_node "1" "curl -s --connect-timeout 10 \
+        -X POST http://localhost:3001/evaluate \
+        -H 'Content-Type: application/json' \
+        -d '{\"blinded_point\":\"${test_point}\"}'" < /dev/null 2>&1) || true
 
-    if echo "$eval_resp" | jq -e '.evaluated_element' > /dev/null 2>&1; then
-        echo "    Evaluate: PASS"
+    if echo "$eval_resp" | jq -e '.evaluation' > /dev/null 2>&1; then
+        local eval_point partials_count
+        eval_point=$(echo "$eval_resp" | jq -r '.evaluation')
+        partials_count=$(echo "$eval_resp" | jq '.partials | length')
+        echo "    Evaluate: PASS (partials=$partials_count, evaluation=${eval_point:0:16}...)"
         pass=$((pass + 1))
-    elif echo "$eval_resp" | jq -e '.error' > /dev/null 2>&1; then
-        local err
-        err=$(echo "$eval_resp" | jq -r '.error')
-        echo "    Evaluate: FAIL — $err"
-        echo "    (This is expected if the input isn't a valid curve point)"
-        fail=$((fail + 1))
     else
         echo "    Evaluate: FAIL — $eval_resp"
         fail=$((fail + 1))
+    fi
+
+    # 3. Domain endpoint (if API Gateway is configured)
+    echo ""
+    echo "  [3/3] Domain endpoint (https://${domain})"
+    total=$((total + 1))
+
+    local domain_resp
+    domain_resp=$(curl -s --connect-timeout 10 \
+        -X POST "https://${domain}/evaluate" \
+        -H "Content-Type: application/json" \
+        -d "{\"blinded_point\":\"${test_point}\"}" 2>&1) || true
+
+    if echo "$domain_resp" | jq -e '.evaluation' > /dev/null 2>&1; then
+        echo "    Domain: PASS"
+        pass=$((pass + 1))
+    else
+        echo "    Domain: SKIP (API Gateway not configured yet) — $domain_resp"
+        # Don't count as failure — API Gateway setup is a separate step
     fi
 
     # Summary
@@ -817,8 +895,8 @@ step_e2e() {
         echo ""
         echo "  Troubleshooting:"
         echo "    Nodes:  ssh → sudo docker logs toprf-node"
-        echo "    Proxy:  ./setup-ecs.sh status"
-        echo "    Logs:   aws logs tail /ecs/ruonid --region eu-west-2 --since 10m"
+        echo "    Config: check coordinator-configs/coordinator-node-<N>.json"
+        echo "    PrivateLink: verify VPC endpoint state in privatelink-state.env"
         return 1
     else
         echo "  All checks passed."
@@ -895,16 +973,18 @@ step_auto_config() {
             --query 'Reservations[0].Instances[0]' --output json 2>/dev/null) || true
 
         if [[ -n "$instance_data" && "$instance_data" != "null" ]]; then
-            local pub_ip priv_ip sg_id vpc_id
+            local pub_ip priv_ip sg_id vpc_id subnet_id
             pub_ip=$(echo "$instance_data" | jq -r '.PublicIpAddress // empty')
             priv_ip=$(echo "$instance_data" | jq -r '.PrivateIpAddress // empty')
             sg_id=$(echo "$instance_data" | jq -r '.SecurityGroups[0].GroupId // empty')
             vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
+            subnet_id=$(echo "$instance_data" | jq -r '.SubnetId // empty')
 
             [[ -n "$pub_ip" ]] && _set_config "NODE${i}_IP" "$pub_ip"
             [[ -n "$priv_ip" ]] && _set_config "NODE${i}_PRIVATE_IP" "$priv_ip"
             [[ -n "$sg_id" ]] && _set_config "NODE${i}_SG_ID" "$sg_id"
             [[ -n "$vpc_id" ]] && _set_config "NODE${i}_VPC_ID" "$vpc_id"
+            [[ -n "$subnet_id" ]] && _set_config "NODE${i}_SUBNET_ID" "$subnet_id"
         else
             warn "Could not find Node $i in $region"
         fi
@@ -965,7 +1045,7 @@ step_lock() {
 
     echo ""
     echo "  All nodes locked. SSH access removed."
-    echo "  Nodes are now only reachable via port 3001 from the proxy VPC."
+    echo "  Nodes are now only reachable via port 3001 through PrivateLink."
 }
 
 # ─── 14. Redeploy ────────────────────────────────────────────────────────────
@@ -996,14 +1076,12 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
-  certs         Generate TLS certs (with IPs as SANs) + distribute
-  init-seal     Interactive: inject key shares via attested TLS
+  init-seal     S3-mediated ECIES key injection (attested)
   start         Start nodes in normal mode (unseal + serve)
-  firewall      Allow port 3001 from proxy VPC CIDR to each node
-  peering       Set up VPC peering between proxy and node VPCs
-  proxy-config  Generate docker/proxy-config.production.json
+  privatelink   Create NLBs, Endpoint Services, VPC Endpoints
+  coordinator-config  Generate per-node coordinator configs (peer endpoints)
   verify        Health check all nodes (via SSH)
-  e2e           End-to-end verify: nodes + proxy + OPRF evaluate
+  e2e           End-to-end verify: OPRF evaluate via coordinator
 
 Utilities:
   auto-config   Auto-populate config.env from AWS
@@ -1011,8 +1089,8 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage → certs
-  post-seal     start → firewall → peering → proxy-config → verify
+  pre-seal      setup-vms → pull → storage
+  post-seal     start → privatelink → coordinator-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
@@ -1053,12 +1131,10 @@ for step in "${steps[@]}"; do
         pull)         step_pull ;;
         storage)      step_storage ;;
         setup-vms)    step_setup_vms ;;
-        certs)        step_certs ;;
-        firewall)     step_firewall ;;
-        peering)      step_peering ;;
+        privatelink)  step_privatelink ;;
         init-seal)    step_init_seal ;;
         start)        step_start ;;
-        proxy-config) step_proxy_config ;;
+        coordinator-config) step_coordinator_config ;;
         verify)       step_verify ;;
         e2e)          step_e2e ;;
         auto-config)  step_auto_config ;;
@@ -1069,30 +1145,26 @@ for step in "${steps[@]}"; do
             step_setup_vms
             step_pull
             step_storage
-            step_certs
             ;;
         post-seal)
+            step_privatelink
+            step_coordinator_config
             step_start
-            step_firewall
-            step_peering
-            step_proxy_config
             step_verify
             ;;
         all)
             step_setup_vms
             step_pull
             step_storage
-            step_certs
             echo ""
             echo "═══════════════════════════════════════════════════"
             echo "  Pre-seal steps complete."
             echo "  Next: init-seal (interactive key injection)."
             echo "═══════════════════════════════════════════════════"
             step_init_seal
+            step_privatelink
+            step_coordinator_config
             step_start
-            step_firewall
-            step_peering
-            step_proxy_config
             step_verify
             ;;
         -h|--help|help)

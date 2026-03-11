@@ -1,17 +1,15 @@
 # Deployment Guide
 
-Deploy the RuonID API server, TOPRF proxy, and 3 threshold OPRF nodes across AWS.
+Deploy the RuonID API server and 3 threshold OPRF nodes across AWS.
 
 ## Architecture
 
 ```
-Internet → ALB (443) → ECS Fargate (eu-west-2):
-  ├── api-server  (Node.js, port 3002)
-  └── toprf-proxy (Rust, port 3000)
-         ↓ VPC Peering (private IPs)
-  ├── Node 1 (eu-west-1, :3001, TLS)
-  ├── Node 2 (eu-west-1, :3001, TLS)
-  └── Node 3 (us-east-2, :3001, TLS)
+Mobile App → API Gateway (TLS) → VPC Link → NLB (eu-west-1)
+                                               ↓
+                                    Node 1 or Node 2 (coordinator)
+                                               ↓ AWS PrivateLink
+                                            Peer Node
 ```
 
 Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
@@ -20,7 +18,7 @@ Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shar
 
 ## Step 1: ECS Infrastructure (`setup-ecs.sh`)
 
-Sets up the cloud infrastructure for the API server and TOPRF proxy.
+Sets up the cloud infrastructure for the API server.
 
 ### Prerequisites
 
@@ -37,11 +35,10 @@ Sets up the cloud infrastructure for the API server and TOPRF proxy.
 | `security` | Security groups for ALB and ECS tasks |
 | `alb` | Application Load Balancer + target group |
 | `cert` | ACM certificate request (needs DNS validation after) |
-| `roles` | IAM roles for ECS task execution and runtime (DynamoDB, KMS, S3) |
-| `config-bucket` | S3 bucket for proxy config and certs |
+| `roles` | IAM roles for ECS task execution and runtime (DynamoDB, KMS) |
 | `ecr` | ECR repository for the API server image |
 | `cluster` | ECS Fargate cluster + CloudWatch log group |
-| `task` | ECS task definition (api-server + toprf-proxy + config-init sidecar) |
+| `task` | ECS task definition (api-server) |
 | `service` | ECS service wired to the ALB |
 
 ### Run
@@ -57,7 +54,7 @@ cp config.env.example config.env   # Fill in AWS_ACCOUNT_ID, DOMAIN
 - ALB is live (HTTP only initially)
 - Add the DNS CNAME record shown in the output
 - Validate the ACM certificate, then run `./setup-ecs.sh add-https`
-- Note the NAT Gateway EIP — add it to `config.env` as `PROXY_IP`
+- Note the NAT Gateway EIP
 - Resource IDs are saved to `ecs-state.env` (don't delete this file)
 
 ---
@@ -114,7 +111,6 @@ Installs Docker, injects key shares, and starts the OPRF service on each node.
   - `public-config.json` (group public key, threshold, verification shares)
   - `node-1-share.json`, `node-2-share.json`, `node-3-share.json`
 - Node image available at `ghcr.io/<owner>/toprf-node:latest` (built by CI)
-- Proxy config + CA cert uploaded to S3 (`./setup-ecs.sh upload-config`)
 
 ### What it does
 
@@ -125,25 +121,24 @@ Installs Docker, injects key shares, and starts the OPRF service on each node.
 | `setup-vms` | Installs Docker on each VM |
 | `pull` | Pulls the node image from ghcr.io |
 | `storage` | Creates S3 buckets for sealed key blobs |
-| `certs` | Generates CA + per-node TLS certs, distributes to VMs |
 
-**Phase 2: `init-seal`** (interactive)
+**Phase 2: `init-seal`** (interactive, S3-mediated ECIES)
 
 For each node:
-1. Starts a temporary container in init-seal mode
-2. Waits for the attestation endpoint
-3. Pauses so you can verify the SEV-SNP attestation report
-4. Sends the key share — node seals it to hardware and uploads to S3
+1. Starts a temporary container in init-seal mode — node generates an X25519 keypair, gets an attestation report binding the public key, and uploads both to S3
+2. Downloads the attestation report and public key from S3
+3. Verifies the SEV-SNP attestation (measurement + AMD certificate chain) and confirms the public key is bound to the report via REPORT_DATA
+4. Encrypts the key share using ECIES (X25519 ECDH + HKDF-SHA256 + AES-256-GCM) to the attested public key
+5. Uploads the encrypted share to S3 — node picks it up, decrypts with its private key, seals to hardware, verifies the seal round-trips, and uploads the sealed blob
 
 **Phase 3: `post-seal`** (automated)
 
 | Step | What it does |
 |------|-------------|
-| `start` | Starts nodes in normal mode (auto-unseal from S3) |
-| `firewall` | Opens port 3001 from proxy VPC CIDR |
-| `peering` | VPC peering between proxy and each node VPC |
-| `proxy-config` | Generates `proxy-config.production.json` with private IPs |
-| `verify` | Health-checks all nodes via HTTPS |
+| `privatelink` | Creates NLBs, Endpoint Services, and VPC Endpoints |
+| `coordinator-config` | Generates per-node coordinator configs with peer PrivateLink endpoints |
+| `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
+| `verify` | Health-checks all nodes via SSH |
 
 ### Run
 
@@ -159,16 +154,15 @@ For each node:
 
 ### After it runs
 
-- All nodes are sealed, running, and reachable from the proxy
-- Upload the generated proxy config: `./setup-ecs.sh upload-config`
-- Redeploy ECS to pick up the new config: `./setup-ecs.sh redeploy`
-- Verify end-to-end by hitting the API
+- All nodes are sealed, running, and reachable via PrivateLink
+- Each node can act as coordinator (receives client requests, calls a peer, returns combined evaluation)
+- Set up API Gateway to expose nodes to clients
 
 ---
 
 ## Step 4: Lock Nodes (`deploy.sh lock`)
 
-Removes SSH access permanently. Nodes become stateless black boxes — only reachable on port 3001 from the proxy VPC.
+Removes SSH access permanently. Nodes become stateless black boxes — only reachable on port 3001 through PrivateLink.
 
 ### Prerequisites
 
@@ -204,9 +198,8 @@ For each node:
 ./deploy.sh --nodes 2 redeploy     # Single node
 ```
 
-### Redeploy ECS (API/proxy update)
+### Redeploy ECS (API server update)
 ```bash
-./setup-ecs.sh upload-config       # Upload new proxy config
 ./setup-ecs.sh redeploy            # Force new ECS deployment
 ```
 
@@ -219,11 +212,30 @@ For each node:
 
 ---
 
+## Node Replacement
+
+If a node fails, replace it with `replace-node.sh`. This provisions a new VM, seals the key share, swaps the NLB target, and starts the node — without touching the other nodes or their PrivateLink endpoints.
+
+```bash
+# Full replacement (provision new VM + seal + start)
+./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json
+
+# Skip provisioning (VM already exists, just re-seal and start)
+./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json --skip-provision
+
+# Skip init-seal too (node already sealed, just update NLB and start)
+./replace-node.sh 3 --skip-provision --skip-init-seal
+```
+
+The NLB target group swap is transparent to peers — the PrivateLink endpoint DNS stays the same, so other nodes' coordinator configs don't need updating.
+
+---
+
 ## Troubleshooting
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | S3 upload denied during seal | Missing IAM permissions | Add `s3:PutObject` to the instance profile role |
 | Container exits on init-seal | Crash during attestation | `ssh <node> "sudo docker logs toprf-init-seal"` |
-| Proxy can't reach nodes | Routes or SG missing | Check VPC peering routes + SG allows TCP 3001 from `10.0.0.0/16` |
-| VPC peering "already exists" | Stale peering from previous run | Delete old peering in AWS console |
+| Coordinator can't reach peer | PrivateLink endpoint not available | Check `privatelink-state.env` for endpoint IDs; verify endpoint is in `available` state |
+| NLB targets unhealthy | Node not running or wrong port | SSH to node, check `docker ps` and `docker logs toprf-node` |

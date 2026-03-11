@@ -2,11 +2,12 @@
 //!
 //! Key loading modes (at boot, never at runtime):
 //!
-//! 1. **Init-seal** (initial deployment) — `--init-seal --upload-url <URL>`
-//!    boots an ephemeral HTTPS server with a self-signed cert. The operator
-//!    verifies the attestation report (which binds the TLS pubkey), then
-//!    POSTs the key share. The node seals it with MSG_KEY_REQ and uploads
-//!    the sealed blob to object storage, then exits.
+//! 1. **Init-seal** (initial deployment) — `--init-seal --s3-bucket <BUCKET>`
+//!    Generates an ephemeral secp256k1 keypair inside the enclave, gets an
+//!    attestation report binding the public key via REPORT_DATA, uploads both
+//!    to S3, then polls for the operator's ECIES-encrypted key share. Once
+//!    received, decrypts, seals with MSG_KEY_REQ, uploads the sealed blob
+//!    to S3, and exits.
 //!
 //! 2. **Auto-unseal** (production) — When `SEALED_KEY_URL` is set, the node
 //!    fetches a sealed key blob from object storage at boot, derives the
@@ -22,17 +23,14 @@
 //! restarts, auto-unseal re-derives the key from the sealed blob.
 //!
 //! Endpoints (normal mode):
-//!   GET  /health           — liveness + key status ("waiting_for_key" or "ready")
+//!   GET  /health           — liveness + key status
 //!   GET  /info             — public info (only when key is loaded)
-//!   POST /partial-evaluate — OPRF partial evaluation (only when key is loaded)
-//!
-//! Endpoints (init-seal mode):
-//!   GET  /attest           — raw attestation report (binary)
-//!   POST /init-key         — accept key share JSON, seal, upload, exit
+//!   POST /evaluate         — full OPRF evaluation (coordinator mode, requires --coordinator-config)
+//!   POST /partial-evaluate — partial OPRF evaluation (peer mode, always available)
 //!
 //! Usage:
-//!   toprf-node --port 3001 --key-file /path/to/share.json
-//!   toprf-node --init-seal --upload-url gs://bucket/sealed.bin
+//!   toprf-node --port 3001 --key-file /path/to/share.json --coordinator-config /path/to/coord.json
+//!   toprf-node --init-seal --s3-bucket my-node-bucket --upload-url s3://my-node-bucket/sealed.bin
 //!
 //! Supported storage URLs (--upload-url and SEALED_KEY_URL):
 //!   gs://bucket/object             — GCP Cloud Storage (VM service account)
@@ -42,12 +40,14 @@
 //!   file:///path                   — local file (dev/testing only)
 //!
 //! Environment variables:
-//!   PORT                       — HTTP listen port (default: 3001)
-//!   SEALED_KEY_URL             — URL to a sealed key blob (see schemes above)
+//!   PORT                        — HTTP listen port (default: 3001)
+//!   SEALED_KEY_URL              — URL to a sealed key blob (see schemes above)
 //!   EXPECTED_VERIFICATION_SHARE — hex-encoded k_i * G for key verification
+//!   COORDINATOR_CONFIG          — path to coordinator config JSON (peer endpoints)
 //!   (attestation uses /dev/sev-guest ioctl automatically)
 
 mod cloud_storage;
+mod coordinator;
 
 use std::env;
 use std::io::BufReader;
@@ -70,11 +70,17 @@ use zeroize::{Zeroize, Zeroizing};
 use toprf_core::partial_eval::partial_evaluate;
 use toprf_core::{hex_to_point, hex_to_scalar, NodeKeyShare, PartialEvaluation};
 
+use coordinator::CoordinatorConfig;
+
 // -- Application state --
 
-struct NodeState {
+pub struct NodeState {
     /// The loaded key material. Set exactly once at boot.
     loaded_key: OnceLock<LoadedKey>,
+    /// Coordinator config (peer endpoints). None if running as peer-only.
+    pub coordinator: Option<CoordinatorConfig>,
+    /// HTTP client for calling peer nodes.
+    pub http_client: reqwest::Client,
 }
 
 struct LoadedKey {
@@ -116,6 +122,8 @@ struct HealthResponse {
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_id: Option<u16>,
+    /// Whether this node can act as coordinator (has peer config).
+    coordinator: bool,
 }
 
 #[derive(Serialize)]
@@ -130,14 +138,17 @@ struct InfoResponse {
 // -- Handlers --
 
 async fn health(State(state): State<Arc<NodeState>>) -> Json<HealthResponse> {
+    let is_coordinator = state.coordinator.is_some();
     match state.loaded_key.get() {
         Some(key) => Json(HealthResponse {
             status: "ready".into(),
             node_id: Some(key.node_id),
+            coordinator: is_coordinator,
         }),
         None => Json(HealthResponse {
             status: "waiting_for_key".into(),
             node_id: None,
+            coordinator: is_coordinator,
         }),
     }
 }
@@ -195,180 +206,52 @@ async fn eval(
 // -- Auto-unseal helpers --
 // Cloud storage download/upload is in the `cloud_storage` module.
 
-// -- Init-seal mode --
+// -- Init-seal mode (S3-mediated ECIES) --
 
-/// State for the init-seal ephemeral server.
-struct InitSealState {
-    /// Upload URL for the sealed blob.
-    upload_url: String,
-    /// Raw attestation report bytes (for /attest endpoint).
-    attestation_report_bytes: Vec<u8>,
-    /// Measurement from the attestation report (for v1 sealing fallback).
-    measurement: [u8; 48],
-    /// Policy from the attestation report (for v1 sealing fallback).
-    policy: u64,
-    /// Shutdown signal sender — triggers server exit after /init-key completes.
-    shutdown_tx: tokio::sync::watch::Sender<bool>,
-}
+/// Run init-seal mode: generate ephemeral keypair, get attestation,
+/// upload to S3, poll for encrypted share, decrypt, seal, upload sealed blob.
+async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
+    info!("init-seal: starting S3-mediated ECIES init-seal mode");
 
-/// GET /attest — returns the raw attestation report (binary).
-async fn attest_handler(State(state): State<Arc<InitSealState>>) -> impl IntoResponse {
-    info!("init-seal: /attest endpoint called, returning attestation report");
-    (
-        StatusCode::OK,
-        [("content-type", "application/octet-stream")],
-        state.attestation_report_bytes.clone(),
-    )
-}
+    let s3_attestation_url = format!("s3://{s3_bucket}/init/attestation.bin");
+    let s3_pubkey_url = format!("s3://{s3_bucket}/init/pubkey.bin");
+    let s3_encrypted_share_url = format!("s3://{s3_bucket}/init/encrypted-share.bin");
 
-/// POST /init-key — accepts key share JSON, seals it, uploads, then signals shutdown.
-async fn init_key_handler(
-    State(state): State<Arc<InitSealState>>,
-    body: axum::body::Bytes,
-) -> Result<(StatusCode, String), (StatusCode, String)> {
-    info!("init-seal: /init-key endpoint called, processing key share");
-
-    // Validate the body is valid JSON and a valid NodeKeyShare
-    let mut share_bytes = Zeroizing::new(body.to_vec());
-    let _share: NodeKeyShare = serde_json::from_slice(&share_bytes).map_err(|e| {
-        error!("init-seal: invalid NodeKeyShare JSON: {e}");
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid NodeKeyShare JSON: {e}"),
-        )
-    })?;
-    info!("init-seal: key share JSON parsed successfully");
-
-    // Step 1+2: Seal the key share.
-    // Try v2 (hardware-derived key via MSG_KEY_REQ) first; fall back to v1
-    // (HKDF from measurement) on platforms without /dev/sev-guest (e.g. Azure).
-    let sealed_blob = match toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT) {
-        Ok(derived_key) => {
-            info!("init-seal: hardware-derived key obtained (v2 sealing)");
-            toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
-                .map_err(|e| {
-                    error!("init-seal: v2 sealing failed: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("sealing failed: {e}"),
-                    )
-                })?
-        }
-        Err(e) => {
-            warn!(
-                "init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing (HKDF from measurement)"
-            );
-            toprf_seal::sealing::seal(&share_bytes, &state.measurement, state.policy).map_err(
-                |e| {
-                    error!("init-seal: v1 sealing failed: {e}");
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("sealing failed: {e}"),
-                    )
-                },
-            )?
-        }
-    };
+    // Step 1: Generate ephemeral X25519 keypair
+    info!("init-seal: generating ephemeral X25519 keypair");
+    let (ephemeral_secret, pubkey_bytes) = toprf_seal::ecies::generate_keypair();
     info!(
-        sealed_blob_size = sealed_blob.len(),
-        "init-seal: key share sealed successfully"
+        pubkey = %hex::encode(pubkey_bytes),
+        "init-seal: ephemeral X25519 keypair generated"
     );
 
-    // Zeroize the plaintext key share bytes
-    share_bytes.zeroize();
-    drop(share_bytes);
-    info!("init-seal: plaintext key share zeroized from memory");
-
-    // Step 3: Upload the sealed blob
-    let upload_url = &state.upload_url;
-    info!(url = %cloud_storage::display_url(upload_url), "init-seal: uploading sealed blob");
-
-    cloud_storage::upload_blob(upload_url, sealed_blob)
-        .await
-        .map_err(|e| {
-            error!("init-seal: upload failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("upload failed: {e}"),
-            )
-        })?;
-
-    info!("init-seal: sealed blob uploaded successfully");
-    info!("init-seal: initialization complete — shutting down");
-
-    // Signal the server to shut down
-    let _ = state.shutdown_tx.send(true);
-
-    Ok((
-        StatusCode::OK,
-        "sealed blob uploaded successfully, node shutting down".into(),
-    ))
-}
-
-/// Run the init-seal mode: generate ephemeral TLS cert, get attestation,
-/// serve /attest and /init-key, then exit after key is sealed and uploaded.
-async fn run_init_seal(port: &str, upload_url: String) {
-    use axum_server::tls_rustls::RustlsConfig;
-
-    info!("init-seal: starting initial deployment mode");
-
-    // Validate upload URL scheme
-    if !cloud_storage::is_valid_storage_url(&upload_url) {
-        eprintln!("Error: --upload-url must use https://, gs://, s3://, or file://");
-        std::process::exit(1);
-    }
-    info!(
-        url = %cloud_storage::display_url(&upload_url),
-        "init-seal: upload URL validated"
-    );
-
-    // Step 1: Generate ephemeral TLS keypair with self-signed certificate
-    info!("init-seal: generating ephemeral TLS keypair and self-signed certificate");
-    let key_pair = rcgen::KeyPair::generate().expect("failed to generate keypair");
-    let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("failed to create cert params");
-    let cert = cert_params
-        .self_signed(&key_pair)
-        .expect("failed to generate self-signed certificate");
-
-    let cert_der = cert.der().clone();
-    let key_der = key_pair.serialize_der();
-
-    // Step 2: Compute SHA-256 of the TLS certificate's public key
-    let tls_pubkey_bytes = key_pair.public_key_der();
-    let tls_pubkey_hash = {
+    // Step 2: Compute SHA-256(pubkey) for REPORT_DATA binding
+    let pubkey_hash = {
         let mut hasher = Sha256::new();
-        hasher.update(&tls_pubkey_bytes);
+        hasher.update(&pubkey_bytes);
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&result);
         hash
     };
-    info!(
-        pubkey_hash = %hex::encode(tls_pubkey_hash),
-        "init-seal: TLS public key SHA-256 hash computed"
-    );
 
-    // Step 3: Get attestation report with TLS pubkey hash as REPORT_DATA
+    // Step 3: Get attestation report with pubkey hash as REPORT_DATA
     let mut report_data = [0u8; 64];
-    report_data[..32].copy_from_slice(&tls_pubkey_hash);
-    // Remaining 32 bytes are zeros
+    report_data[..32].copy_from_slice(&pubkey_hash);
 
-    info!("init-seal: requesting attestation report with TLS pubkey hash as REPORT_DATA");
+    info!("init-seal: requesting attestation report with pubkey hash as REPORT_DATA");
     let report = toprf_seal::provider::get_attestation_report(Some(&report_data))
         .await
         .expect("init-seal: failed to get attestation report");
 
-    // Serialize the raw report body + signature for the /attest endpoint
-    let mut attestation_bytes = Vec::with_capacity(report.body_bytes.len() + 96);
+    // Serialize the full attestation report (body + signature, padded)
+    let mut attestation_bytes = Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
     attestation_bytes.extend_from_slice(&report.body_bytes);
-    // Pad to REPORT_BODY_SIZE if needed (should already be exact)
     while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
         attestation_bytes.push(0);
     }
     attestation_bytes.extend_from_slice(&report.signature_r);
     attestation_bytes.extend_from_slice(&report.signature_s);
-    // Pad to full report size
     while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
         attestation_bytes.push(0);
     }
@@ -378,65 +261,136 @@ async fn run_init_seal(port: &str, upload_url: String) {
         "init-seal: attestation report obtained"
     );
 
-    // Step 4: Set up the ephemeral HTTPS server
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // Step 4: Upload attestation report and public key to S3
+    info!("init-seal: uploading attestation report to {s3_attestation_url}");
+    cloud_storage::upload_blob(&s3_attestation_url, attestation_bytes)
+        .await
+        .expect("init-seal: failed to upload attestation report to S3");
 
-    let init_state = Arc::new(InitSealState {
-        upload_url,
-        attestation_report_bytes: attestation_bytes,
-        measurement: report.measurement,
-        policy: report.policy,
-        shutdown_tx,
-    });
+    info!("init-seal: uploading ephemeral X25519 public key to {s3_pubkey_url}");
+    cloud_storage::upload_blob(&s3_pubkey_url, pubkey_bytes.to_vec())
+        .await
+        .expect("init-seal: failed to upload public key to S3");
 
-    let app = Router::new()
-        .route("/attest", get(attest_handler))
-        .route("/init-key", post(init_key_handler))
-        .layer(DefaultBodyLimit::max(64 * 1024)) // 64KB max for key share JSON
-        .with_state(init_state);
+    info!("init-seal: waiting for operator to upload encrypted share to {s3_encrypted_share_url}");
+    info!("init-seal: operator should run:");
+    info!("  aws s3 cp {s3_attestation_url} ./attestation.bin");
+    info!("  aws s3 cp {s3_pubkey_url} ./pubkey.bin");
+    info!("  toprf-init-encrypt --attestation ./attestation.bin --pubkey ./pubkey.bin \\");
+    info!("      --output ./encrypted-share.bin --share-file <share.json> --expected-measurement <hex>");
+    info!("  aws s3 cp ./encrypted-share.bin {s3_encrypted_share_url}");
 
-    let bind_addr = format!("0.0.0.0:{port}");
-    let addr: SocketAddr = bind_addr
-        .parse()
-        .unwrap_or_else(|e| panic!("invalid bind address {bind_addr}: {e}"));
+    // Step 5: Poll S3 for the encrypted share
+    let encrypted_share = poll_s3_for_blob(&s3_encrypted_share_url).await;
 
-    // Build rustls config from the ephemeral cert
-    let rustls_config = {
-        let cert_chain = vec![cert_der];
-        let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_der);
+    // Step 6: Decrypt with ECIES
+    info!("init-seal: decrypting key share with ECIES");
+    let mut share_bytes = toprf_seal::ecies::decrypt(&ephemeral_secret, &encrypted_share)
+        .expect("init-seal: ECIES decryption failed");
 
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain.into_iter().collect(), private_key.into())
-            .expect("failed to build rustls ServerConfig for init-seal");
+    // Validate the decrypted data is a valid NodeKeyShare
+    let _share: NodeKeyShare = serde_json::from_slice(&share_bytes)
+        .expect("init-seal: decrypted data is not valid NodeKeyShare JSON");
+    info!("init-seal: key share decrypted and validated");
 
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config
+    // Step 7: Seal with hardware-derived key and verify round-trip
+    let sealed_blob = match toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT) {
+        Ok(derived_key) => {
+            info!("init-seal: hardware-derived key obtained (v2 sealing)");
+            let blob =
+                toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
+                    .expect("init-seal: v2 sealing failed");
+
+            // Verify we can unseal what we just sealed
+            let unsealed = toprf_seal::unseal_derived(&blob, &derived_key)
+                .expect("init-seal: v2 unseal verification failed — sealed blob is corrupt");
+            assert_eq!(
+                unsealed,
+                &share_bytes[..],
+                "init-seal: unseal round-trip mismatch"
+            );
+            info!("init-seal: v2 seal/unseal round-trip verified");
+            blob
+        }
+        Err(e) => {
+            warn!(
+                "init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing"
+            );
+            let blob =
+                toprf_seal::sealing::seal(&share_bytes, &report.measurement, report.policy)
+                    .expect("init-seal: v1 sealing failed");
+
+            // Verify we can unseal what we just sealed
+            let unsealed =
+                toprf_seal::sealing::unseal(&blob, &report.measurement, report.policy)
+                    .expect("init-seal: v1 unseal verification failed — sealed blob is corrupt");
+            assert_eq!(
+                unsealed,
+                &share_bytes[..],
+                "init-seal: unseal round-trip mismatch"
+            );
+            info!("init-seal: v1 seal/unseal round-trip verified");
+            blob
+        }
     };
-
-    let tls_config = RustlsConfig::from_config(Arc::new(rustls_config));
-
     info!(
-        addr = %bind_addr,
-        "init-seal: ephemeral HTTPS server starting — waiting for operator"
+        sealed_blob_size = sealed_blob.len(),
+        "init-seal: key share sealed and verified"
     );
-    info!("init-seal: endpoints available:");
-    info!("  GET  /attest   — fetch raw attestation report");
-    info!("  POST /init-key — submit key share JSON");
 
-    // Serve until shutdown signal
-    let server = axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service());
+    // Zeroize the plaintext
+    share_bytes.zeroize();
+    drop(share_bytes);
 
-    tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                error!("init-seal: server error: {e}");
+    // Step 8: Upload the sealed blob
+    info!(
+        url = %cloud_storage::display_url(upload_url),
+        "init-seal: uploading sealed blob"
+    );
+    cloud_storage::upload_blob(upload_url, sealed_blob)
+        .await
+        .expect("init-seal: failed to upload sealed blob");
+
+    // Step 9: Clean up init artifacts from S3
+    info!("init-seal: cleaning up init artifacts from S3");
+    // Best-effort cleanup — don't fail if these can't be deleted
+    let _ = cloud_storage::delete_blob(&s3_attestation_url).await;
+    let _ = cloud_storage::delete_blob(&s3_pubkey_url).await;
+    let _ = cloud_storage::delete_blob(&s3_encrypted_share_url).await;
+
+    info!("init-seal: complete — sealed blob uploaded, node shutting down");
+}
+
+/// Poll S3 for a blob, waiting up to 30 minutes with 5-second intervals.
+async fn poll_s3_for_blob(url: &str) -> Vec<u8> {
+    let max_attempts = 360; // 30 minutes at 5s intervals
+    for attempt in 1..=max_attempts {
+        match cloud_storage::download_blob(url).await {
+            Ok(data) if !data.is_empty() => {
+                info!(
+                    attempt,
+                    size = data.len(),
+                    "init-seal: encrypted share found"
+                );
+                return data;
+            }
+            Ok(_) => {
+                // Empty response — not uploaded yet
+            }
+            Err(_) => {
+                // 404 or other error — not uploaded yet
             }
         }
-        _ = shutdown_rx.wait_for(|&v| v) => {
-            info!("init-seal: shutdown signal received, exiting");
+        if attempt % 12 == 0 {
+            // Log every minute
+            info!(
+                minutes = attempt / 12,
+                "init-seal: still waiting for encrypted share..."
+            );
         }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+    panic!("init-seal: timed out waiting for encrypted share after 30 minutes");
 }
 
 // -- Main --
@@ -456,7 +410,10 @@ async fn main() {
     let mut client_ca: Option<String> = None;
     let mut key_file: Option<String> = None;
     let mut init_seal = false;
+    let mut s3_bucket: Option<String> = None;
     let mut upload_url: Option<String> = None;
+    let mut coordinator_config_path: Option<String> =
+        env::var("COORDINATOR_CONFIG").ok();
 
     let mut i = 1;
     while i < args.len() {
@@ -504,6 +461,14 @@ async fn main() {
             "--init-seal" => {
                 init_seal = true;
             }
+            "--s3-bucket" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --s3-bucket");
+                    std::process::exit(1);
+                }
+                s3_bucket = Some(args[i].clone());
+            }
             "--upload-url" => {
                 i += 1;
                 if i >= args.len() {
@@ -512,14 +477,22 @@ async fn main() {
                 }
                 upload_url = Some(args[i].clone());
             }
+            "--coordinator-config" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --coordinator-config");
+                    std::process::exit(1);
+                }
+                coordinator_config_path = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 eprintln!("Usage: toprf-node [OPTIONS]");
                 eprintln!();
                 eprintln!("Key loading (at boot only — no runtime key endpoints):");
-                eprintln!("  1. Init-seal: --init-seal --upload-url <URL> to run the initial");
-                eprintln!("     deployment flow. The node generates an ephemeral TLS cert,");
-                eprintln!("     serves /attest and /init-key, seals the key share with");
-                eprintln!("     MSG_KEY_REQ, uploads to object storage, then exits.");
+                eprintln!("  1. Init-seal: --init-seal --s3-bucket <BUCKET> to run the");
+                eprintln!("     S3-mediated ECIES init-seal flow. The node generates an");
+                eprintln!("     ephemeral keypair, gets attestation, uploads both to S3,");
+                eprintln!("     then polls for the operator's ECIES-encrypted share.");
                 eprintln!("  2. Auto-unseal: set SEALED_KEY_URL to fetch and decrypt a sealed");
                 eprintln!("     key blob at boot using AMD SEV-SNP attestation.");
                 eprintln!("  3. Key file: --key-file <PATH> to load a NodeKeyShare JSON file");
@@ -528,10 +501,12 @@ async fn main() {
                 eprintln!("Options:");
                 eprintln!("  -p, --port <PORT>         Listen port (default: 3001)");
                 eprintln!(
-                    "      --init-seal           Run initial deployment (seal + upload) mode"
+                    "      --init-seal           Run S3-mediated ECIES init-seal mode"
                 );
-                eprintln!("      --upload-url <URL>    Storage URL for sealed blob (gs://, s3://, https://, file://)");
+                eprintln!("      --s3-bucket <BUCKET>  S3 bucket for init-seal artifacts");
+                eprintln!("      --upload-url <URL>    Storage URL for sealed blob (default: s3://<bucket>/sealed.bin)");
                 eprintln!("      --key-file <PATH>     Load key share from JSON file at boot");
+                eprintln!("      --coordinator-config <PATH>  Peer config JSON (enables /evaluate endpoint)");
                 eprintln!("      --tls-cert <PATH>     TLS server certificate (PEM)");
                 eprintln!("      --tls-key <PATH>      TLS server private key (PEM)");
                 eprintln!("      --client-ca <PATH>    CA cert for client auth (enables mTLS)");
@@ -541,6 +516,7 @@ async fn main() {
                 eprintln!("  PORT                        Listen port (default: 3001)");
                 eprintln!("  SEALED_KEY_URL              URL to sealed key blob (gs://, s3://, https://, file://)");
                 eprintln!("  EXPECTED_VERIFICATION_SHARE Hex-encoded k_i * G for key verification");
+                eprintln!("  COORDINATOR_CONFIG          Path to coordinator config JSON (peer endpoints)");
                 eprintln!("  (attestation uses /dev/sev-guest ioctl automatically)");
                 eprintln!();
                 eprintln!("When --tls-cert and --tls-key are provided, the node serves HTTPS.");
@@ -566,13 +542,17 @@ async fn main() {
             eprintln!("Error: --init-seal cannot be used with SEALED_KEY_URL");
             std::process::exit(1);
         }
-        if upload_url.is_none() {
-            eprintln!("Error: --init-seal requires --upload-url <URL>");
+        let bucket = s3_bucket.unwrap_or_else(|| {
+            eprintln!("Error: --init-seal requires --s3-bucket <BUCKET>");
             std::process::exit(1);
-        }
+        });
+        let seal_url = upload_url.unwrap_or_else(|| {
+            // Default to s3://<bucket>/sealed.bin
+            format!("s3://{bucket}/sealed.bin")
+        });
 
         // Run init-seal mode and exit
-        run_init_seal(&port, upload_url.unwrap()).await;
+        run_init_seal(&bucket, &seal_url).await;
         return;
     }
 
@@ -580,9 +560,42 @@ async fn main() {
         eprintln!("Error: --upload-url can only be used with --init-seal");
         std::process::exit(1);
     }
+    if s3_bucket.is_some() {
+        eprintln!("Error: --s3-bucket can only be used with --init-seal");
+        std::process::exit(1);
+    }
+
+    // Load coordinator config (if provided)
+    let coordinator = coordinator_config_path.as_ref().map(|path| {
+        let data = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read coordinator config {path}: {e}"));
+        let config: CoordinatorConfig = serde_json::from_str(&data)
+            .unwrap_or_else(|e| panic!("invalid coordinator config JSON in {path}: {e}"));
+        info!(
+            peers = config.peers.len(),
+            "loaded coordinator config — /evaluate endpoint enabled"
+        );
+        for peer in &config.peers {
+            info!(
+                peer_node_id = peer.node_id,
+                endpoint = %peer.endpoint,
+                "registered peer"
+            );
+        }
+        config
+    });
+
+    // Build HTTP client for peer calls (5s connect, 10s total timeout)
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client");
 
     let state = Arc::new(NodeState {
         loaded_key: OnceLock::new(),
+        coordinator,
+        http_client,
     });
 
     // -- Load key from file (testing/dev) --
@@ -770,6 +783,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/info", get(node_info))
+        .route("/evaluate", post(coordinator::evaluate_handler))
         .route("/partial-evaluate", post(eval))
         .layer(DefaultBodyLimit::max(8192))
         .with_state(state);

@@ -23,6 +23,7 @@ k256 = { workspace = true }
 thiserror = { workspace = true }
 pem = { workspace = true }
 zeroize = { workspace = true }
+x25519-dalek = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -37,3 +38,7 @@ path = "src/bin/toprf-measure.rs"
 [[bin]]
 name = "toprf-seal"
 path = "src/bin/toprf-seal.rs"
+
+[[bin]]
+name = "toprf-init-encrypt"
+path = "src/bin/toprf-init-encrypt.rs"
