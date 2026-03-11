@@ -13,7 +13,7 @@ TMPDIR="$(mktemp -d)"
 # Binary paths (built in step 1)
 KEYGEN="$REPO_ROOT/target/release/toprf-keygen"
 NODE="$REPO_ROOT/target/release/toprf-node"
-PROXY="$REPO_ROOT/target/release/toprf-proxy"
+PROXY_REPO="https://github.com/jeganggs64/ruonid-proxy.git"
 
 NODE1_PORT=7101
 NODE2_PORT=7102
@@ -87,12 +87,22 @@ cargo build --release 2>&1 | tail -5
 echo "  Build complete."
 
 # Verify binaries exist
-for bin in "$KEYGEN" "$NODE" "$PROXY"; do
+for bin in "$KEYGEN" "$NODE"; do
     if [[ ! -x "$bin" ]]; then
         echo "  FATAL: binary not found: $bin"
         exit 1
     fi
 done
+
+echo ""
+echo "=== Step 1b: Building proxy from ruonid-proxy repo ==="
+cargo install --git "$PROXY_REPO" --root "$TMPDIR/proxy-install" 2>&1 | tail -5
+PROXY="$TMPDIR/proxy-install/bin/toprf-proxy"
+if [[ ! -x "$PROXY" ]]; then
+    echo "  FATAL: proxy binary not found at $PROXY"
+    exit 1
+fi
+echo "  Proxy built."
 
 # ---------- 2. Generate keys ----------
 

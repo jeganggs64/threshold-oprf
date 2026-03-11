@@ -19,9 +19,9 @@ services:
   # Proxy -- aggregates partial OPRF evaluations from the node quorum
   # ---------------------------------------------------------------------------
   proxy:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.proxy
+    # Proxy lives in its own repo: github.com/jeganggs64/ruonid-proxy
+    # Build locally: git clone ... && docker build -t toprf-proxy .
+    image: toprf-proxy:latest
     container_name: toprf-proxy
     ports:
       - "3000:3000"
