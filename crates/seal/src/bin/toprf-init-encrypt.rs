@@ -1,14 +1,15 @@
 //! Operator-side tool for the S3-mediated init-seal ceremony.
 //!
-//! Fetches an attestation report and ephemeral public key from S3 (uploaded by
-//! the node in init-seal mode), verifies the attestation, and encrypts a key
-//! share to the node's attested X25519 public key using ECIES. The encrypted
-//! blob is uploaded to S3 for the node to pick up.
+//! Fetches an attestation report, ephemeral public key, and certificate chain
+//! from S3 (uploaded by the node in init-seal mode), verifies the attestation,
+//! and encrypts a key share to the node's attested X25519 public key using ECIES.
+//! The encrypted blob is uploaded to S3 for the node to pick up.
 //!
 //! Usage:
 //!   toprf-init-encrypt \
 //!       --attestation ./attestation.bin \
 //!       --pubkey ./pubkey.bin \
+//!       --certs ./certs.bin \
 //!       --output ./encrypted-share.bin \
 //!       --share-file ./node-shares/node-1-share.json \
 //!       --expected-measurement <hex>
@@ -19,7 +20,7 @@ use std::process;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey;
 
-use toprf_seal::attestation::AttestationVerifier;
+use toprf_seal::attestation::{parse_cert_table, AttestationVerifier};
 use toprf_seal::ecies;
 use toprf_seal::snp_report::SnpReport;
 
@@ -32,21 +33,24 @@ fn print_help() {
     eprintln!("Options:");
     eprintln!("  --attestation <PATH>       Path to attestation report (binary, 1184 bytes)");
     eprintln!("  --pubkey <PATH>            Path to node's ephemeral X25519 public key (32 bytes)");
+    eprintln!("  --certs <PATH>             Path to certificate chain from extended report");
     eprintln!("  --output <PATH>            Path to write the ECIES-encrypted share");
     eprintln!("  --share-file <PATH>        Path to the node's key share JSON file");
     eprintln!("  --expected-measurement <HEX>  Expected measurement (96 hex chars)");
     eprintln!("  --skip-attestation-verify  Skip AMD certificate chain verification (dev only)");
     eprintln!("  -h, --help                 Show this help");
     eprintln!();
-    eprintln!("The operator downloads attestation.bin and pubkey.bin from S3,");
+    eprintln!("The operator downloads attestation.bin, pubkey.bin, and certs.bin from S3,");
     eprintln!("runs this tool locally, then uploads the output to S3.");
     eprintln!();
     eprintln!("Example:");
     eprintln!("  aws s3 cp s3://bucket/init/attestation.bin ./attestation.bin");
     eprintln!("  aws s3 cp s3://bucket/init/pubkey.bin ./pubkey.bin");
+    eprintln!("  aws s3 cp s3://bucket/init/certs.bin ./certs.bin");
     eprintln!("  toprf-init-encrypt \\");
     eprintln!("      --attestation ./attestation.bin \\");
     eprintln!("      --pubkey ./pubkey.bin \\");
+    eprintln!("      --certs ./certs.bin \\");
     eprintln!("      --output ./encrypted-share.bin \\");
     eprintln!("      --share-file ./node-shares/node-1-share.json \\");
     eprintln!("      --expected-measurement <hex>");
@@ -61,6 +65,7 @@ async fn main() {
 
     let mut attestation_path: Option<String> = None;
     let mut pubkey_path: Option<String> = None;
+    let mut certs_path: Option<String> = None;
     let mut output_path: Option<String> = None;
     let mut share_file: Option<String> = None;
     let mut expected_measurement: Option<String> = None;
@@ -84,6 +89,14 @@ async fn main() {
                     process::exit(1);
                 }
                 pubkey_path = Some(args[i].clone());
+            }
+            "--certs" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: missing value for --certs");
+                    process::exit(1);
+                }
+                certs_path = Some(args[i].clone());
             }
             "--output" => {
                 i += 1;
@@ -182,15 +195,43 @@ async fn main() {
         eprintln!(
             "  WARNING: skipping AMD certificate chain verification (--skip-attestation-verify)"
         );
-    } else {
+    } else if let Some(ref certs_file) = certs_path {
+        // Use certificate chain from extended report (required for AWS EC2
+        // where the chip ID is masked and AMD KDS is unavailable)
+        eprintln!("  Reading certificate chain from {certs_file}");
+        let cert_table_bytes = std::fs::read(certs_file).unwrap_or_else(|e| {
+            eprintln!("Error: failed to read certs file: {e}");
+            process::exit(1);
+        });
+
+        let certs = parse_cert_table(&cert_table_bytes).unwrap_or_else(|e| {
+            eprintln!("Error: failed to parse certificate table: {e}");
+            process::exit(1);
+        });
+        eprintln!(
+            "  Certificates: VCEK={} bytes, ASK={} bytes, ARK={} bytes",
+            certs.vcek.len(),
+            certs.ask.len(),
+            certs.ark.len()
+        );
+
         eprintln!("  Verifying AMD certificate chain (VCEK -> ASK -> ARK)...");
+        AttestationVerifier::verify_report_with_certs(&report, &certs).unwrap_or_else(|e| {
+            eprintln!("Error: attestation verification failed: {e}");
+            process::exit(1);
+        });
+        eprintln!("  Attestation report signature verified (using provided certs).");
+    } else {
+        // Fall back to fetching from AMD KDS (requires non-zero chip ID)
+        eprintln!("  Verifying AMD certificate chain (fetching from AMD KDS)...");
         AttestationVerifier::verify_report(&report)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("Error: attestation verification failed: {e}");
+                eprintln!("  Hint: if chip ID is all zeros (AWS EC2), provide --certs from the node's extended report");
                 process::exit(1);
             });
-        eprintln!("  Attestation report signature verified.");
+        eprintln!("  Attestation report signature verified (via AMD KDS).");
     }
 
     // 4. Read the node's ephemeral X25519 public key
