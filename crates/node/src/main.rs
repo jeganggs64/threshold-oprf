@@ -313,17 +313,13 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
             blob
         }
         Err(e) => {
-            warn!(
-                "init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing"
-            );
-            let blob =
-                toprf_seal::sealing::seal(&share_bytes, &report.measurement, report.policy)
-                    .expect("init-seal: v1 sealing failed");
+            warn!("init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing");
+            let blob = toprf_seal::sealing::seal(&share_bytes, &report.measurement, report.policy)
+                .expect("init-seal: v1 sealing failed");
 
             // Verify we can unseal what we just sealed
-            let unsealed =
-                toprf_seal::sealing::unseal(&blob, &report.measurement, report.policy)
-                    .expect("init-seal: v1 unseal verification failed — sealed blob is corrupt");
+            let unsealed = toprf_seal::sealing::unseal(&blob, &report.measurement, report.policy)
+                .expect("init-seal: v1 unseal verification failed — sealed blob is corrupt");
             assert_eq!(
                 unsealed,
                 &share_bytes[..],
@@ -412,8 +408,7 @@ async fn main() {
     let mut init_seal = false;
     let mut s3_bucket: Option<String> = None;
     let mut upload_url: Option<String> = None;
-    let mut coordinator_config_path: Option<String> =
-        env::var("COORDINATOR_CONFIG").ok();
+    let mut coordinator_config_path: Option<String> = env::var("COORDINATOR_CONFIG").ok();
 
     let mut i = 1;
     while i < args.len() {
@@ -500,9 +495,7 @@ async fn main() {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -p, --port <PORT>         Listen port (default: 3001)");
-                eprintln!(
-                    "      --init-seal           Run S3-mediated ECIES init-seal mode"
-                );
+                eprintln!("      --init-seal           Run S3-mediated ECIES init-seal mode");
                 eprintln!("      --s3-bucket <BUCKET>  S3 bucket for init-seal artifacts");
                 eprintln!("      --upload-url <URL>    Storage URL for sealed blob (default: s3://<bucket>/sealed.bin)");
                 eprintln!("      --key-file <PATH>     Load key share from JSON file at boot");

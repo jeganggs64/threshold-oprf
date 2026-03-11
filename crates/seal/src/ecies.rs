@@ -151,7 +151,10 @@ mod tests {
 
         // Verify wire format structure
         assert!(ciphertext.len() > PUBKEY_LEN + NONCE_LEN + 16);
-        assert_eq!(ciphertext.len(), PUBKEY_LEN + NONCE_LEN + plaintext.len() + 16);
+        assert_eq!(
+            ciphertext.len(),
+            PUBKEY_LEN + NONCE_LEN + plaintext.len() + 16
+        );
 
         let decrypted = decrypt(&secret, &ciphertext).unwrap();
         assert_eq!(decrypted.as_slice(), plaintext);
