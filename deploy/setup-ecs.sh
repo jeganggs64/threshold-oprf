@@ -503,20 +503,16 @@ step_upload_config() {
     if [[ ! -f "$proxy_config" ]]; then
         die "proxy-config.production.json not found. Run './deploy.sh proxy-config' first."
     fi
-    if [[ ! -d "$certs_dir/ca" ]]; then
-        die "certs/ not found. Run './deploy.sh certs' first."
+    if [[ ! -f "$certs_dir/ca/ca.pem" ]]; then
+        die "certs/ca/ca.pem not found. Run './deploy.sh certs' first."
     fi
 
     aws s3 cp "$proxy_config" "s3://${CONFIG_BUCKET}/proxy-config.json" --region "$REGION"
     aws s3 cp "$certs_dir/ca/ca.pem" "s3://${CONFIG_BUCKET}/certs/ca/ca.pem" --region "$REGION"
-    aws s3 cp "$certs_dir/proxy/proxy-client.pem" "s3://${CONFIG_BUCKET}/certs/proxy/proxy-client.pem" --region "$REGION"
-    aws s3 cp "$certs_dir/proxy/proxy-client.key" "s3://${CONFIG_BUCKET}/certs/proxy/proxy-client.key" --region "$REGION"
 
     echo "  Uploaded:"
     echo "    s3://${CONFIG_BUCKET}/proxy-config.json"
     echo "    s3://${CONFIG_BUCKET}/certs/ca/ca.pem"
-    echo "    s3://${CONFIG_BUCKET}/certs/proxy/proxy-client.pem"
-    echo "    s3://${CONFIG_BUCKET}/certs/proxy/proxy-client.key"
     echo "  Done."
 }
 
@@ -598,7 +594,7 @@ step_task() {
       "name": "config-init",
       "image": "amazon/aws-cli:latest",
       "essential": false,
-      "command": ["sh", "-c", "aws s3 cp s3://${CONFIG_BUCKET}/proxy-config.json /config/proxy-config.json && aws s3 cp --recursive s3://${CONFIG_BUCKET}/certs/ /config/certs/"],
+      "command": ["sh", "-c", "mkdir -p /config/certs/ca && aws s3 cp s3://${CONFIG_BUCKET}/proxy-config.json /config/proxy-config.json && aws s3 cp s3://${CONFIG_BUCKET}/certs/ca/ca.pem /config/certs/ca/ca.pem"],
       "mountPoints": [{"sourceVolume": "config", "containerPath": "/config"}],
       "logConfiguration": {
         "logDriver": "awslogs",

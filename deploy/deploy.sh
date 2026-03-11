@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# deploy.sh — Automated deployment for the threshold OPRF system.
+# deploy.sh — Automated deployment for threshold OPRF nodes on AWS.
 #
-# Assumes VMs, IAM roles, and SSH access are already provisioned.
-# See config.env.example for required configuration.
+# Deploys 3 TEE nodes across AWS regions with VPC peering to the proxy.
+# All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
 #
 # Usage:
 #   ./deploy.sh <step> [step...]
@@ -15,16 +15,12 @@
 # =============================================================================
 set -euo pipefail
 
-# Add gcloud to PATH if installed via google-cloud-sdk
-[[ -d "$HOME/google-cloud-sdk/bin" ]] && export PATH="$HOME/google-cloud-sdk/bin:$PATH"
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Show help without requiring config
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
-    usage() {
-        cat <<'EOF'
+    cat <<'EOF'
 Usage: deploy.sh [--nodes 1,2,3] <step> [step...]
 
 Options:
@@ -33,31 +29,25 @@ Options:
 Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
-  storage       Create storage buckets + bind VM identities
-  certs         Generate mTLS certs (with real IPs) + distribute
+  storage       Create S3 buckets for sealed key blobs
+  certs         Generate TLS certs (with IPs as SANs) + distribute
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
-  firewall      Open port 3001 from proxy IP to each node
+  firewall      Allow port 3001 from proxy VPC CIDR to each node
+  peering       Set up VPC peering between proxy and node VPCs
   proxy-config  Generate docker/proxy-config.production.json
-  verify        Health check all nodes via mTLS
+  verify        Health check all nodes
 
 Utilities:
-  auto-config   Auto-populate config.env (IPs, account ID, SG, proxy IP)
-  show-ips      Fetch public IPs from all 3 providers
+  auto-config   Auto-populate config.env from AWS
+  show-ips      Fetch public/private IPs for all nodes
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → certs
-  post-seal     start → firewall → proxy-config → verify
+  post-seal     start → firewall → peering → proxy-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
-
-Examples:
-  ./deploy.sh all                     # Full deployment, all nodes
-  ./deploy.sh --nodes 2 init-seal     # Init-seal node 2 only
-  ./deploy.sh --nodes 1,3 start       # Start nodes 1 and 3
 EOF
-    }
-    usage
     exit 0
 fi
 
@@ -84,6 +74,14 @@ info()  { echo "==> $*"; }
 warn()  { echo "  WARN: $*"; }
 die()   { echo "  ERROR: $*" >&2; exit 1; }
 
+node_region() {
+    case "$1" in
+        1) echo "$NODE1_REGION" ;;
+        2) echo "$NODE2_REGION" ;;
+        3) echo "$NODE3_REGION" ;;
+    esac
+}
+
 node_ip() {
     case "$1" in
         1) echo "$NODE1_IP" ;;
@@ -92,11 +90,63 @@ node_ip() {
     esac
 }
 
+node_private_ip() {
+    case "$1" in
+        1) echo "$NODE1_PRIVATE_IP" ;;
+        2) echo "$NODE2_PRIVATE_IP" ;;
+        3) echo "$NODE3_PRIVATE_IP" ;;
+    esac
+}
+
+node_ssh_key() {
+    case "$1" in
+        1) echo "$NODE1_SSH_KEY" ;;
+        2) echo "$NODE2_SSH_KEY" ;;
+        3) echo "$NODE3_SSH_KEY" ;;
+    esac
+}
+
+node_sg_id() {
+    case "$1" in
+        1) echo "$NODE1_SG_ID" ;;
+        2) echo "$NODE2_SG_ID" ;;
+        3) echo "$NODE3_SG_ID" ;;
+    esac
+}
+
+node_vpc_id() {
+    case "$1" in
+        1) echo "$NODE1_VPC_ID" ;;
+        2) echo "$NODE2_VPC_ID" ;;
+        3) echo "$NODE3_VPC_ID" ;;
+    esac
+}
+
+node_s3_bucket() {
+    case "$1" in
+        1) echo "$NODE1_S3_BUCKET" ;;
+        2) echo "$NODE2_S3_BUCKET" ;;
+        3) echo "$NODE3_S3_BUCKET" ;;
+    esac
+}
+
+node_snp_provider() {
+    case "$1" in
+        1) echo "${NODE1_SNP_PROVIDER:-raw}" ;;
+        2) echo "${NODE2_SNP_PROVIDER:-raw}" ;;
+        3) echo "${NODE3_SNP_PROVIDER:-raw}" ;;
+    esac
+}
+
+sealed_url() {
+    local bucket
+    bucket=$(node_s3_bucket "$1")
+    echo "s3://${bucket}/node-${1}-sealed.bin"
+}
+
 # Node filter: set via --nodes flag (e.g. --nodes 1,3)
 _NODE_FILTER=""
 
-# Returns space-separated list of node IDs to operate on.
-# Respects --nodes filter; otherwise returns all nodes with IPs configured.
 active_nodes() {
     if [[ -n "$_NODE_FILTER" ]]; then
         echo "$_NODE_FILTER"
@@ -109,42 +159,20 @@ active_nodes() {
     echo $nodes
 }
 
-node_snp_provider() {
-    case "$1" in
-        1) echo "${NODE1_SNP_PROVIDER:-gcp}" ;;
-        2) echo "${NODE2_SNP_PROVIDER:-raw}" ;;
-        3) echo "${NODE3_SNP_PROVIDER:-raw}" ;;
-    esac
-}
-
-sealed_url() {
-    case "$1" in
-        1) echo "gs://${GCP_BUCKET}/node-1-sealed.bin" ;;
-        2) echo "https://${AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/${AZURE_STORAGE_CONTAINER}/node-2-sealed.bin" ;;
-        3) echo "s3://${AWS_S3_BUCKET}/node-3-sealed.bin" ;;
-    esac
-}
-
 ssh_node() {
     local n="$1"; shift
-    case "$n" in
-        1) gcloud compute ssh "$GCP_VM_NAME" --zone="$GCP_ZONE" --project="$GCP_PROJECT" --command="$*" ;;
-        2) ssh -o StrictHostKeyChecking=accept-new "${AZURE_USER}@${NODE2_IP}" "$*" ;;
-        3) ssh -o StrictHostKeyChecking=accept-new -i "$AWS_SSH_KEY" "ubuntu@${NODE3_IP}" "$*" ;;
-    esac
+    local key ip
+    key=$(node_ssh_key "$n")
+    ip=$(node_ip "$n")
+    ssh -o StrictHostKeyChecking=accept-new -i "$key" "ubuntu@${ip}" "$*"
 }
 
 scp_to_node() {
     local n="$1"; shift
-    case "$n" in
-        1)
-            # gcloud compute scp takes files then instance:path
-            gcloud compute scp "$@" "${GCP_VM_NAME}:/tmp/" \
-                --zone="$GCP_ZONE" --project="$GCP_PROJECT"
-            ;;
-        2) scp -o StrictHostKeyChecking=accept-new "$@" "${AZURE_USER}@${NODE2_IP}:/tmp/" ;;
-        3) scp -o StrictHostKeyChecking=accept-new -i "$AWS_SSH_KEY" "$@" "ubuntu@${NODE3_IP}:/tmp/" ;;
-    esac
+    local key ip
+    key=$(node_ssh_key "$n")
+    ip=$(node_ip "$n")
+    scp -o StrictHostKeyChecking=accept-new -i "$key" "$@" "ubuntu@${ip}:/tmp/"
 }
 
 # Load node shares data from public-config.json
@@ -174,7 +202,7 @@ node_vs() {
 # Steps
 # =============================================================================
 
-# ─── 1. Pull Docker image ──────────────────────────────────────────────────
+# ─── 1. Pull Docker image ────────────────────────────────────────────────────
 
 step_pull() {
     echo ""
@@ -190,66 +218,25 @@ step_pull() {
     echo "  Done."
 }
 
-# ─── 3. Create storage buckets ──────────────────────────────────────────────
+# ─── 2. Create S3 storage buckets ────────────────────────────────────────────
 
 step_storage() {
     echo ""
-    info "Creating storage buckets"
+    info "Creating S3 buckets for sealed key blobs"
 
-    # GCP
-    echo "  GCP: gs://${GCP_BUCKET}"
-    gcloud storage buckets create "gs://${GCP_BUCKET}" \
-        --location=asia-southeast1 --project="$GCP_PROJECT" 2>/dev/null \
-        || warn "bucket may already exist"
-
-    local sa_email
-    sa_email=$(gcloud compute instances describe "$GCP_VM_NAME" \
-        --zone="$GCP_ZONE" --project="$GCP_PROJECT" \
-        --format='get(serviceAccounts[0].email)' 2>/dev/null) || true
-    if [[ -n "$sa_email" ]]; then
-        gcloud storage buckets add-iam-policy-binding "gs://${GCP_BUCKET}" \
-            --member="serviceAccount:${sa_email}" \
-            --role="roles/storage.objectAdmin" \
-            --project="$GCP_PROJECT" 2>/dev/null \
-            || warn "IAM binding may already exist"
-    fi
-
-    # Azure
-    echo "  Azure: ${AZURE_STORAGE_ACCOUNT}/${AZURE_STORAGE_CONTAINER}"
-    az storage account create \
-        --name "$AZURE_STORAGE_ACCOUNT" --resource-group "$AZURE_RG" \
-        --location eastus --sku Standard_LRS 2>/dev/null \
-        || warn "storage account may already exist"
-    az storage container create \
-        --name "$AZURE_STORAGE_CONTAINER" \
-        --account-name "$AZURE_STORAGE_ACCOUNT" \
-        --public-access off 2>/dev/null \
-        || warn "container may already exist"
-
-    az vm identity assign --resource-group "$AZURE_RG" --name "$AZURE_VM_NAME" 2>/dev/null || true
-    local vm_identity
-    vm_identity=$(az vm show --resource-group "$AZURE_RG" --name "$AZURE_VM_NAME" \
-        --query identity.principalId -o tsv 2>/dev/null) || true
-    if [[ -n "$vm_identity" ]]; then
-        local sub_id
-        sub_id=$(az account show --query id -o tsv)
-        az role assignment create \
-            --assignee "$vm_identity" \
-            --role "Storage Blob Data Contributor" \
-            --scope "/subscriptions/${sub_id}/resourceGroups/${AZURE_RG}/providers/Microsoft.Storage/storageAccounts/${AZURE_STORAGE_ACCOUNT}" \
-            2>/dev/null \
-            || warn "role assignment may already exist"
-    fi
-
-    # AWS
-    echo "  AWS: s3://${AWS_S3_BUCKET}"
-    aws s3 mb "s3://${AWS_S3_BUCKET}" --region "$AWS_NODE_REGION" 2>/dev/null \
-        || warn "bucket may already exist"
+    for i in $(active_nodes); do
+        local bucket region
+        bucket=$(node_s3_bucket "$i")
+        region=$(node_region "$i")
+        echo "  Node $i: s3://${bucket} ($region)"
+        aws s3 mb "s3://${bucket}" --region "$region" 2>/dev/null \
+            || warn "bucket may already exist"
+    done
 
     echo "  Done."
 }
 
-# ─── 4. Setup VMs (Docker + AWS CLI) ────────────────────────────────────────
+# ─── 3. Setup VMs (Docker) ───────────────────────────────────────────────────
 
 step_setup_vms() {
     echo ""
@@ -262,8 +249,6 @@ step_setup_vms() {
 
         ssh_node "$i" "$(cat <<'SETUP'
 set -e
-
-# Docker
 if ! command -v docker &>/dev/null; then
     echo "    Installing Docker..."
     curl -fsSL https://get.docker.com | sudo sh
@@ -271,7 +256,6 @@ if ! command -v docker &>/dev/null; then
 else
     echo "    Docker already installed."
 fi
-
 echo "    Done."
 SETUP
 )"
@@ -280,19 +264,18 @@ SETUP
     echo "  Done."
 }
 
-# ─── 6. Generate + distribute mTLS certs ────────────────────────────────────
+# ─── 4. Generate + distribute TLS certs ──────────────────────────────────────
 
 step_certs() {
     echo ""
-    info "Generating mTLS certificates (with real node IPs as SANs)"
+    info "Generating TLS certificates (with node IPs as SANs)"
 
     local CERTS_DIR="$REPO_ROOT/certs"
     local CA_DIR="$CERTS_DIR/ca"
     local NODES_DIR="$CERTS_DIR/nodes"
-    local PROXY_DIR="$CERTS_DIR/proxy"
 
     rm -rf "$CERTS_DIR"
-    mkdir -p "$CA_DIR" "$NODES_DIR" "$PROXY_DIR"
+    mkdir -p "$CA_DIR" "$NODES_DIR"
 
     # CA
     echo "  Generating CA..."
@@ -301,11 +284,12 @@ step_certs() {
     openssl req -new -x509 -key "$CA_DIR/ca.key" -out "$CA_DIR/ca.pem" \
         -days 1095 -subj "/CN=toprf-ca/O=Threshold OPRF/OU=CA" -sha256
 
-    # Node certs — SANs include real public IPs so the proxy can verify them
+    # Node certs — SANs include public and private IPs
     for i in $(active_nodes); do
-        local ip
+        local ip private_ip
         ip=$(node_ip "$i")
-        echo "  Node $i cert (SAN: $ip)..."
+        private_ip=$(node_private_ip "$i")
+        echo "  Node $i cert (SAN: $ip, $private_ip)..."
 
         openssl ecparam -genkey -name prime256v1 -noout \
             -out "$NODES_DIR/node${i}.key" 2>/dev/null
@@ -315,6 +299,7 @@ step_certs() {
             -out "$NODES_DIR/node${i}.csr" \
             -subj "/CN=node${i}/O=Threshold OPRF/OU=Node" -sha256
 
+        # Include both public IP (for init-seal) and private IP (for proxy via VPC peering)
         cat > "$NODES_DIR/node${i}.ext" <<EXTEOF
 authorityKeyIdentifier=keyid,issuer
 basicConstraints=CA:FALSE
@@ -327,6 +312,7 @@ DNS.1 = localhost
 DNS.2 = node${i}
 IP.1  = 127.0.0.1
 IP.2  = ${ip}
+IP.3  = ${private_ip}
 EXTEOF
 
         openssl x509 -req -in "$NODES_DIR/node${i}.csr" \
@@ -337,29 +323,7 @@ EXTEOF
         rm -f "$NODES_DIR/node${i}.csr" "$NODES_DIR/node${i}.ext"
     done
 
-    # Proxy client cert (mTLS)
-    echo "  Proxy client cert..."
-    openssl ecparam -genkey -name prime256v1 -noout \
-        -out "$PROXY_DIR/proxy-client.key" 2>/dev/null
-    chmod 600 "$PROXY_DIR/proxy-client.key"
-
-    openssl req -new -key "$PROXY_DIR/proxy-client.key" \
-        -out "$PROXY_DIR/proxy-client.csr" \
-        -subj "/CN=toprf-proxy/O=Threshold OPRF/OU=Proxy" -sha256
-
-    cat > "$PROXY_DIR/proxy-client.ext" <<EXTEOF
-authorityKeyIdentifier=keyid,issuer
-basicConstraints=CA:FALSE
-keyUsage=digitalSignature
-extendedKeyUsage=clientAuth
-EXTEOF
-
-    openssl x509 -req -in "$PROXY_DIR/proxy-client.csr" \
-        -CA "$CA_DIR/ca.pem" -CAkey "$CA_DIR/ca.key" -CAcreateserial \
-        -out "$PROXY_DIR/proxy-client.pem" -days 365 -sha256 \
-        -extfile "$PROXY_DIR/proxy-client.ext" 2>/dev/null
-
-    rm -f "$PROXY_DIR/proxy-client.csr" "$PROXY_DIR/proxy-client.ext" "$CA_DIR/ca.srl"
+    rm -f "$CA_DIR/ca.srl"
 
     # Distribute certs to VMs
     echo "  Distributing certs to VMs..."
@@ -379,38 +343,105 @@ EXTEOF
     echo "  Local certs at: $CERTS_DIR"
 }
 
-# ─── 7. Open firewall (proxy → nodes on port 3001) ──────────────────────────
+# ─── 5. Open firewall (proxy VPC → nodes on port 3001) ───────────────────────
 
 step_firewall() {
     echo ""
-    info "Opening port 3001 from proxy to nodes"
+    info "Allowing port 3001 from proxy VPC CIDR to nodes"
 
-    [[ -n "${PROXY_IP:-}" ]] || die "PROXY_IP not set in config.env"
+    [[ -n "${PROXY_VPC_CIDR:-}" ]] || die "PROXY_VPC_CIDR not set in config.env"
 
-    echo "  GCP..."
-    gcloud compute firewall-rules create allow-toprf-proxy \
-        --allow=tcp:3001 --source-ranges="${PROXY_IP}/32" \
-        --target-tags=toprf-node --project="$GCP_PROJECT" 2>/dev/null \
-        || warn "rule may already exist"
-
-    echo "  Azure..."
-    az network nsg rule create --resource-group "$AZURE_RG" \
-        --nsg-name "${AZURE_VM_NAME}NSG" --name allow-toprf-proxy \
-        --priority 100 --access Allow --protocol Tcp \
-        --destination-port-ranges 3001 \
-        --source-address-prefixes "${PROXY_IP}/32" 2>/dev/null \
-        || warn "rule may already exist"
-
-    echo "  AWS..."
-    aws ec2 authorize-security-group-ingress \
-        --group-id "$AWS_SG_ID" --protocol tcp --port 3001 \
-        --cidr "${PROXY_IP}/32" --region "$AWS_NODE_REGION" 2>/dev/null \
-        || warn "rule may already exist"
+    for i in $(active_nodes); do
+        local sg_id region
+        sg_id=$(node_sg_id "$i")
+        region=$(node_region "$i")
+        echo "  Node $i: SG $sg_id ($region)..."
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$sg_id" --protocol tcp --port 3001 \
+            --cidr "$PROXY_VPC_CIDR" --region "$region" 2>/dev/null \
+            || warn "rule may already exist"
+    done
 
     echo "  Done."
 }
 
-# ─── 8. Init-seal (interactive) ─────────────────────────────────────────────
+# ─── 6. VPC peering (proxy ↔ node VPCs) ──────────────────────────────────────
+
+step_peering() {
+    echo ""
+    info "Setting up VPC peering between proxy and node VPCs"
+
+    local ecs_state="${SCRIPT_DIR}/ecs-state.env"
+    [[ -f "$ecs_state" ]] || die "ecs-state.env not found. Run setup-ecs.sh vpc first."
+    source "$ecs_state"
+
+    local proxy_vpc_id="${VPC_ID:?VPC_ID not found in ecs-state.env}"
+    local proxy_priv_rt="${PRIV_RT:?PRIV_RT not found in ecs-state.env}"
+
+    for i in $(active_nodes); do
+        local region vpc_id
+        region=$(node_region "$i")
+        vpc_id=$(node_vpc_id "$i")
+
+        [[ -n "$vpc_id" ]] || die "NODE${i}_VPC_ID not set in config.env"
+
+        # Skip if node is in the same VPC (shouldn't happen but guard)
+        if [[ "$vpc_id" == "$proxy_vpc_id" ]]; then
+            echo "  Node $i: same VPC as proxy, skipping peering"
+            continue
+        fi
+
+        echo "  Node $i: Peering $vpc_id ($region) ↔ $proxy_vpc_id ($PROXY_REGION)..."
+
+        # Create peering connection (from proxy region)
+        local peering_id
+        peering_id=$(aws ec2 create-vpc-peering-connection \
+            --region "$PROXY_REGION" \
+            --vpc-id "$proxy_vpc_id" \
+            --peer-vpc-id "$vpc_id" \
+            --peer-region "$region" \
+            --query 'VpcPeeringConnection.VpcPeeringConnectionId' --output text 2>/dev/null) \
+            || { warn "peering may already exist for node $i"; continue; }
+
+        echo "    Peering: $peering_id"
+
+        # Accept peering (from node's region)
+        aws ec2 accept-vpc-peering-connection \
+            --region "$region" \
+            --vpc-peering-connection-id "$peering_id" > /dev/null
+        echo "    Accepted."
+
+        # Get node VPC CIDR
+        local node_cidr
+        node_cidr=$(aws ec2 describe-vpcs --region "$region" \
+            --vpc-ids "$vpc_id" \
+            --query 'Vpcs[0].CidrBlock' --output text)
+
+        # Route: proxy private subnets → node VPC via peering
+        aws ec2 create-route --region "$PROXY_REGION" \
+            --route-table-id "$proxy_priv_rt" \
+            --destination-cidr-block "$node_cidr" \
+            --vpc-peering-connection-id "$peering_id" 2>/dev/null \
+            || warn "proxy → node route may exist"
+
+        # Route: node VPC → proxy VPC via peering
+        local node_rt
+        node_rt=$(aws ec2 describe-route-tables --region "$region" \
+            --filters "Name=vpc-id,Values=$vpc_id" \
+            --query 'RouteTables[0].RouteTableId' --output text)
+        aws ec2 create-route --region "$region" \
+            --route-table-id "$node_rt" \
+            --destination-cidr-block "$PROXY_VPC_CIDR" \
+            --vpc-peering-connection-id "$peering_id" 2>/dev/null \
+            || warn "node → proxy route may exist"
+
+        echo "    Routes: proxy ↔ $node_cidr"
+    done
+
+    echo "  Done."
+}
+
+# ─── 7. Init-seal (interactive) ──────────────────────────────────────────────
 
 step_init_seal() {
     echo ""
@@ -441,7 +472,7 @@ step_init_seal() {
         # Clean up any previous init-seal container
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
-        # Build device/volume flags conditionally per cloud provider
+        # Detect SEV-SNP hardware interfaces
         local dev_flags=""
         if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
             dev_flags="--device /dev/sev-guest:/dev/sev-guest"
@@ -450,20 +481,12 @@ step_init_seal() {
         if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
             tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
         fi
-        # Azure vTPM: pass TPM device for HCL report reading
-        local tpm_flags=""
-        if ssh_node "$i" "test -e /dev/tpmrm0" < /dev/null 2>/dev/null; then
-            tpm_flags="--device /dev/tpmrm0:/dev/tpmrm0"
-        elif ssh_node "$i" "test -e /dev/tpm0" < /dev/null 2>/dev/null; then
-            tpm_flags="--device /dev/tpm0:/dev/tpm0"
-        fi
 
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e SNP_PROVIDER=${provider} \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             ${tsm_flags} \
             ${dev_flags} \
-            ${tpm_flags} \
             --privileged --user root \
             -p 3001:3001 \
             ${NODE_IMAGE} \
@@ -474,7 +497,6 @@ step_init_seal() {
         echo "  Waiting for attestation endpoint..."
         local waited=0
         while ! ssh_node "$i" "curl -sk https://localhost:3001/attest > /dev/null 2>&1" < /dev/null; do
-            # Check if the container has exited (early failure detection)
             local running
             running=$(ssh_node "$i" "sudo docker inspect -f '{{.State.Running}}' toprf-init-seal 2>/dev/null || echo false" < /dev/null)
             if [[ "$running" != "true" ]]; then
@@ -515,7 +537,6 @@ step_init_seal() {
         fi
 
         echo "  Sending key share to node $i..."
-        # Copy key share to node, then curl localhost from inside the VM
         scp_to_node "$i" "$share" < /dev/null
         local share_filename
         share_filename=$(basename "$share")
@@ -535,7 +556,6 @@ step_init_seal() {
             echo "  Response: $body"
         fi
 
-        # Container exits after sealing; give it a moment then clean up
         sleep 3
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
         echo ""
@@ -544,7 +564,7 @@ step_init_seal() {
     echo "  Init-seal complete."
 }
 
-# ─── 9. Start nodes in normal mode ──────────────────────────────────────────
+# ─── 8. Start nodes in normal mode ───────────────────────────────────────────
 
 step_start() {
     echo ""
@@ -561,10 +581,9 @@ step_start() {
 
         echo "  Node $i ($ip)..."
 
-        # Stop old container if running
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
 
-        # Build device/volume flags conditionally
+        # Detect SEV-SNP hardware interfaces
         local dev_flags=""
         if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
             dev_flags="--device /dev/sev-guest:/dev/sev-guest"
@@ -573,12 +592,6 @@ step_start() {
         if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
             tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
         fi
-        local tpm_flags=""
-        if ssh_node "$i" "test -e /dev/tpmrm0" < /dev/null 2>/dev/null; then
-            tpm_flags="--device /dev/tpmrm0:/dev/tpmrm0"
-        elif ssh_node "$i" "test -e /dev/tpm0" < /dev/null 2>/dev/null; then
-            tpm_flags="--device /dev/tpm0:/dev/tpm0"
-        fi
 
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
@@ -586,15 +599,13 @@ step_start() {
             -e SNP_PROVIDER=${provider} \
             ${tsm_flags} \
             ${dev_flags} \
-            ${tpm_flags} \
             --privileged --user root \
             -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --port 3001 \
             --tls-cert /etc/toprf/certs/node${i}.pem \
-            --tls-key /etc/toprf/certs/node${i}.key \
-            --client-ca /etc/toprf/certs/ca.pem"
+            --tls-key /etc/toprf/certs/node${i}.key"
     done
 
     echo "  Waiting for nodes to boot..."
@@ -602,7 +613,7 @@ step_start() {
     echo "  Done. Run './deploy.sh verify' to check health."
 }
 
-# ─── 10. Generate proxy config ──────────────────────────────────────────────
+# ─── 9. Generate proxy config ────────────────────────────────────────────────
 
 step_proxy_config() {
     echo ""
@@ -612,17 +623,19 @@ step_proxy_config() {
 
     local out="$REPO_ROOT/docker/proxy-config.production.json"
 
-    # Build nodes array dynamically from active nodes
+    # Build nodes array using private IPs (proxy connects via VPC peering)
     local nodes_json=""
     local first=true
     for i in $(active_nodes); do
-        local ip=$(node_ip "$i")
-        local vs=$(node_vs "$i")
+        local private_ip vs
+        private_ip=$(node_private_ip "$i")
+        vs=$(node_vs "$i")
+        [[ -n "$private_ip" ]] || die "NODE${i}_PRIVATE_IP not set in config.env"
         $first || nodes_json+=","
         nodes_json+="
     {
       \"node_id\": $i,
-      \"endpoint\": \"https://${ip}:3001\",
+      \"endpoint\": \"https://${private_ip}:3001\",
       \"verification_share\": \"${vs}\"
     }"
         first=false
@@ -635,19 +648,16 @@ step_proxy_config() {
   "require_attestation": false,
   "rate_limit": { "per_hour": 1000, "per_day": 10000 },
   "node_ca_cert": "/etc/toprf/certs/ca/ca.pem",
-  "proxy_client_cert": "/etc/toprf/certs/proxy/proxy-client.pem",
-  "proxy_client_key": "/etc/toprf/certs/proxy/proxy-client.key",
   "nodes": [${nodes_json}
   ]
 }
 CFGEOF
 
     echo "  Written to: $out"
-    echo "  Copy to proxy host: /etc/toprf/proxy-config.json"
     echo "  Done."
 }
 
-# ─── 11. Verify ─────────────────────────────────────────────────────────────
+# ─── 10. Verify ──────────────────────────────────────────────────────────────
 
 step_verify() {
     echo ""
@@ -668,8 +678,6 @@ step_verify() {
         local resp
         resp=$(curl -sk --connect-timeout 5 \
             --cacert "$certs_dir/ca/ca.pem" \
-            --cert "$certs_dir/proxy/proxy-client.pem" \
-            --key "$certs_dir/proxy/proxy-client.key" \
             "https://${ip}:3001/health" 2>&1) || true
 
         if echo "$resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
@@ -693,46 +701,40 @@ step_verify() {
     fi
 }
 
-# ─── 12. Show IPs ───────────────────────────────────────────────────────────
+# ─── 11. Show IPs ────────────────────────────────────────────────────────────
 
 step_show_ips() {
     echo ""
-    info "Fetching VM public IPs"
+    info "Fetching VM IPs from AWS"
 
-    echo "  Node 1 (GCP ${GCP_ZONE}):"
-    local ip1
-    ip1=$(gcloud compute instances describe "$GCP_VM_NAME" \
-        --zone="$GCP_ZONE" --project="$GCP_PROJECT" \
-        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null) || true
-    echo "    ${ip1:-NOT FOUND}"
+    for i in $(active_nodes); do
+        local region
+        region=$(node_region "$i")
+        echo "  Node $i ($region):"
 
-    echo "  Node 2 (Azure ${AZURE_RG}):"
-    local ip2
-    ip2=$(az vm show -d --resource-group "$AZURE_RG" --name "$AZURE_VM_NAME" \
-        --query publicIps -o tsv 2>/dev/null) || true
-    echo "    ${ip2:-NOT FOUND}"
+        local result
+        result=$(aws ec2 describe-instances --region "$region" \
+            --filters "Name=tag:Name,Values=toprf-node-${i}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].[PublicIpAddress,PrivateIpAddress]' \
+            --output text 2>/dev/null) || true
 
-    echo "  Node 3 (AWS ${AWS_NODE_REGION}):"
-    local ip3
-    ip3=$(aws ec2 describe-instances --region "$AWS_NODE_REGION" \
-        --filters "Name=instance-state-name,Values=running" \
-        --query 'Reservations[*].Instances[*].PublicIpAddress' --output text 2>/dev/null) || true
-    echo "    ${ip3:-NOT FOUND}"
-
-    echo ""
-    echo "  Paste into config.env:"
-    echo "    NODE1_IP=${ip1:-}"
-    echo "    NODE2_IP=${ip2:-}"
-    echo "    NODE3_IP=${ip3:-}"
+        if [[ -n "$result" && "$result" != *"None"* ]]; then
+            local pub_ip priv_ip
+            pub_ip=$(echo "$result" | awk '{print $1}')
+            priv_ip=$(echo "$result" | awk '{print $2}')
+            echo "    Public:  ${pub_ip}"
+            echo "    Private: ${priv_ip}"
+        else
+            echo "    NOT FOUND"
+        fi
+    done
 }
 
-# ─── 13. Auto-config ────────────────────────────────────────────────────────
+# ─── 12. Auto-config ─────────────────────────────────────────────────────────
 
-# Helper: update or append a key=value in config.env
 _set_config() {
     local key="$1" value="$2"
     if grep -q "^${key}=" "$CONFIG_FILE"; then
-        # Only update if currently empty
         if grep -q "^${key}=$" "$CONFIG_FILE" || grep -q "^${key}=\s*$" "$CONFIG_FILE"; then
             sed -i.bak "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
             echo "  ${key}=${value}"
@@ -744,7 +746,7 @@ _set_config() {
 
 step_auto_config() {
     echo ""
-    info "Auto-populating config.env with values from cloud providers"
+    info "Auto-populating config.env from AWS"
     echo ""
 
     # AWS Account ID
@@ -754,55 +756,37 @@ step_auto_config() {
     if [[ -n "$aws_id" ]]; then
         _set_config "AWS_ACCOUNT_ID" "$aws_id"
     else
-        warn "Could not fetch AWS account ID (aws sts get-caller-identity failed)"
+        warn "Could not fetch AWS account ID"
     fi
 
-    # Node IPs
-    echo "  Fetching Node 1 IP (GCP)..."
-    local ip1
-    ip1=$(gcloud compute instances describe "$GCP_VM_NAME" \
-        --zone="$GCP_ZONE" --project="$GCP_PROJECT" \
-        --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null) || true
-    if [[ -n "$ip1" ]]; then
-        _set_config "NODE1_IP" "$ip1"
-    else
-        warn "Could not fetch Node 1 IP"
-    fi
+    # Per-node IPs, SGs, VPCs
+    for i in 1 2 3; do
+        local region
+        region=$(node_region "$i")
+        echo "  Fetching Node $i info ($region)..."
 
-    echo "  Fetching Node 2 IP (Azure)..."
-    local ip2
-    ip2=$(az vm show -d --resource-group "$AZURE_RG" --name "$AZURE_VM_NAME" \
-        --query publicIps -o tsv 2>/dev/null) || true
-    if [[ -n "$ip2" ]]; then
-        _set_config "NODE2_IP" "$ip2"
-    else
-        warn "Could not fetch Node 2 IP"
-    fi
+        local instance_data
+        instance_data=$(aws ec2 describe-instances --region "$region" \
+            --filters "Name=tag:Name,Values=toprf-node-${i}" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0]' --output json 2>/dev/null) || true
 
-    echo "  Fetching Node 3 IP (AWS)..."
-    local ip3
-    ip3=$(aws ec2 describe-instances --region "$AWS_NODE_REGION" \
-        --filters "Name=tag:Name,Values=${AWS_VM_NAME:-toprf-node-3}" "Name=instance-state-name,Values=running" \
-        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null) || true
-    if [[ -n "$ip3" && "$ip3" != "None" ]]; then
-        _set_config "NODE3_IP" "$ip3"
-    else
-        warn "Could not fetch Node 3 IP"
-    fi
+        if [[ -n "$instance_data" && "$instance_data" != "null" ]]; then
+            local pub_ip priv_ip sg_id vpc_id
+            pub_ip=$(echo "$instance_data" | jq -r '.PublicIpAddress // empty')
+            priv_ip=$(echo "$instance_data" | jq -r '.PrivateIpAddress // empty')
+            sg_id=$(echo "$instance_data" | jq -r '.SecurityGroups[0].GroupId // empty')
+            vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
 
-    # AWS Security Group ID (from the node instance)
-    echo "  Fetching AWS security group ID..."
-    local sg_id
-    sg_id=$(aws ec2 describe-instances --region "$AWS_NODE_REGION" \
-        --filters "Name=tag:Name,Values=${AWS_VM_NAME:-toprf-node-3}" "Name=instance-state-name,Values=running" \
-        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text 2>/dev/null) || true
-    if [[ -n "$sg_id" && "$sg_id" != "None" ]]; then
-        _set_config "AWS_SG_ID" "$sg_id"
-    else
-        warn "Could not fetch AWS security group ID"
-    fi
+            [[ -n "$pub_ip" ]] && _set_config "NODE${i}_IP" "$pub_ip"
+            [[ -n "$priv_ip" ]] && _set_config "NODE${i}_PRIVATE_IP" "$priv_ip"
+            [[ -n "$sg_id" ]] && _set_config "NODE${i}_SG_ID" "$sg_id"
+            [[ -n "$vpc_id" ]] && _set_config "NODE${i}_VPC_ID" "$vpc_id"
+        else
+            warn "Could not find Node $i in $region"
+        fi
+    done
 
-    # Proxy IP (NAT Gateway EIP from ECS state file)
+    # Proxy IP from ecs-state.env
     local ecs_state="${SCRIPT_DIR}/ecs-state.env"
     if [[ -f "$ecs_state" ]]; then
         echo "  Reading PROXY_IP from ecs-state.env..."
@@ -817,7 +801,7 @@ step_auto_config() {
     echo "  Done. Review config.env and fill in any remaining empty fields."
 }
 
-# ─── 13. Redeploy (pull latest image + restart) ─────────────────────────────
+# ─── 13. Redeploy ────────────────────────────────────────────────────────────
 
 step_redeploy() {
     echo ""
@@ -844,28 +828,24 @@ Options:
 Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
-  storage       Create storage buckets + bind VM identities
-  certs         Generate mTLS certs (with real IPs) + distribute
+  storage       Create S3 buckets for sealed key blobs
+  certs         Generate TLS certs (with IPs as SANs) + distribute
   init-seal     Interactive: inject key shares via attested TLS
   start         Start nodes in normal mode (unseal + serve)
-  firewall      Open port 3001 from proxy IP to each node
+  firewall      Allow port 3001 from proxy VPC CIDR to each node
+  peering       Set up VPC peering between proxy and node VPCs
   proxy-config  Generate docker/proxy-config.production.json
-  verify        Health check all nodes via mTLS
+  verify        Health check all nodes
 
 Utilities:
-  auto-config   Auto-populate config.env (IPs, account ID, SG, proxy IP)
-  show-ips      Fetch public IPs from all 3 providers
+  auto-config   Auto-populate config.env from AWS
+  show-ips      Fetch public/private IPs for all nodes
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → certs
-  post-seal     start → firewall → proxy-config → verify
+  post-seal     start → firewall → peering → proxy-config → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
-
-Examples:
-  ./deploy.sh all                     # Full deployment, all nodes
-  ./deploy.sh --nodes 2 init-seal     # Init-seal node 2 only
-  ./deploy.sh --nodes 1,3 start       # Start nodes 1 and 3
 EOF
 }
 
@@ -880,7 +860,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --nodes|-n)
             shift
-            # Accept comma-separated (1,3) or space-separated
             _NODE_FILTER=$(echo "$1" | tr ',' ' ')
             shift
             ;;
@@ -907,6 +886,7 @@ for step in "${steps[@]}"; do
         setup-vms)    step_setup_vms ;;
         certs)        step_certs ;;
         firewall)     step_firewall ;;
+        peering)      step_peering ;;
         init-seal)    step_init_seal ;;
         start)        step_start ;;
         proxy-config) step_proxy_config ;;
@@ -923,6 +903,7 @@ for step in "${steps[@]}"; do
         post-seal)
             step_start
             step_firewall
+            step_peering
             step_proxy_config
             step_verify
             ;;
@@ -939,6 +920,7 @@ for step in "${steps[@]}"; do
             step_init_seal
             step_start
             step_firewall
+            step_peering
             step_proxy_config
             step_verify
             ;;
