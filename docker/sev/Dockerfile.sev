@@ -47,13 +47,15 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/Cargo.toml
 COPY crates/keygen/Cargo.toml crates/keygen/Cargo.toml
 COPY crates/node/Cargo.toml crates/node/Cargo.toml
+COPY crates/proxy/Cargo.toml crates/proxy/Cargo.toml
 COPY crates/seal/Cargo.toml crates/seal/Cargo.toml
 COPY crates/monitor/Cargo.toml crates/monitor/Cargo.toml
 
-RUN mkdir -p crates/core/src crates/keygen/src crates/node/src && \
+RUN mkdir -p crates/core/src crates/keygen/src crates/node/src crates/proxy/src && \
     echo "// stub" > crates/core/src/lib.rs && \
     echo "fn main() {}" > crates/keygen/src/main.rs && \
     echo "fn main() {}" > crates/node/src/main.rs && \
+    echo "fn main() {}" > crates/proxy/src/main.rs && \
     mkdir -p crates/seal/src && echo "" > crates/seal/src/lib.rs && \
     mkdir -p crates/seal/src/bin && echo "fn main(){}" > crates/seal/src/bin/toprf-measure.rs && echo "fn main(){}" > crates/seal/src/bin/toprf-seal.rs && \
     mkdir -p crates/monitor/src && echo "fn main(){}" > crates/monitor/src/main.rs
@@ -64,7 +66,8 @@ COPY crates/ crates/
 
 RUN touch crates/core/src/lib.rs \
     crates/node/src/main.rs \
-    crates/keygen/src/main.rs
+    crates/keygen/src/main.rs \
+    crates/proxy/src/main.rs
 
 RUN cargo build --release -p toprf-node
 
