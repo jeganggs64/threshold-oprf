@@ -45,19 +45,25 @@ Internet → ALB (443) → ECS Fargate (eu-west-2):
 
 ## 1. Provision VMs
 
-Launch a `c6a.large` (or `m6a.large`) instance in each region with an AMD SEV-SNP AMI (Ubuntu 24.04).
+Provision nodes using the provisioning script:
 
-**Critical for each node:**
+```bash
+./provision.sh 1    # Node 1 in ap-southeast-1
+./provision.sh 2    # Node 2 in us-east-1
+./provision.sh 3    # Node 3 in eu-west-1
+./provision.sh all  # All 3 nodes
+```
 
-1. Attach an IAM instance profile with S3 read/write for its sealed blob bucket
-2. Set IMDS hop limit to 2 (required for Docker containers):
-   ```bash
-   aws ec2 modify-instance-metadata-options \
-       --instance-id <INSTANCE_ID> \
-       --http-put-response-hop-limit 2 \
-       --region <REGION>
-   ```
-3. Tag the instance `Name=toprf-node-<N>` for auto-config discovery
+Each node is a `c6a.large` (or `m6a.large`) instance running Amazon Linux 2023 with AMD SEV-SNP.
+
+The provisioning script handles AMI selection, IMDS hop limit, IAM profile attachment, and tagging automatically. See `provision.sh --help` for details.
+
+To manage individual nodes:
+
+```bash
+./provision.sh 2 --status     # Check node 2
+./provision.sh 1 --terminate  # Tear down node 1 + clear sealed blob
+```
 
 ---
 
@@ -143,7 +149,7 @@ This runs: `setup-vms` → `pull` → `storage` → `certs` → `init-seal` → 
 ## 4. What each step does
 
 ### `setup-vms`
-Installs Docker on each VM via `curl -fsSL https://get.docker.com | sudo sh`.
+Installs Docker on each VM via `dnf install docker` (Amazon Linux 2023).
 
 ### `pull`
 Runs `docker pull ghcr.io/<owner>/toprf-node:latest` on each VM.

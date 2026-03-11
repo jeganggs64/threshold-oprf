@@ -2,8 +2,8 @@
 # =============================================================================
 # deploy.sh — Automated deployment for threshold OPRF nodes on AWS.
 #
-# Deploys 3 TEE nodes across AWS regions with VPC peering to the proxy.
-# All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
+# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions with VPC peering
+# to the proxy. All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
 #
 # Usage:
 #   ./deploy.sh <step> [step...]
@@ -164,7 +164,7 @@ ssh_node() {
     local key ip
     key=$(node_ssh_key "$n")
     ip=$(node_ip "$n")
-    ssh -o StrictHostKeyChecking=accept-new -i "$key" "ubuntu@${ip}" "$*"
+    ssh -o StrictHostKeyChecking=accept-new -i "$key" "ec2-user@${ip}" "$*"
 }
 
 scp_to_node() {
@@ -172,7 +172,7 @@ scp_to_node() {
     local key ip
     key=$(node_ssh_key "$n")
     ip=$(node_ip "$n")
-    scp -o StrictHostKeyChecking=accept-new -i "$key" "$@" "ubuntu@${ip}:/tmp/"
+    scp -o StrictHostKeyChecking=accept-new -i "$key" "$@" "ec2-user@${ip}:/tmp/"
 }
 
 # Load node shares data from public-config.json
@@ -251,7 +251,9 @@ step_setup_vms() {
 set -e
 if ! command -v docker &>/dev/null; then
     echo "    Installing Docker..."
-    curl -fsSL https://get.docker.com | sudo sh
+    sudo dnf install -y docker
+    sudo systemctl enable docker
+    sudo systemctl start docker
     sudo usermod -aG docker $USER
 else
     echo "    Docker already installed."
