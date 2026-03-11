@@ -562,6 +562,7 @@ step_init_seal() {
         # Poll for attestation.bin in S3
         local s3_attestation="s3://${bucket}/init/attestation.bin"
         local s3_pubkey="s3://${bucket}/init/pubkey.bin"
+        local s3_certs="s3://${bucket}/init/certs.bin"
         local s3_encrypted="s3://${bucket}/init/encrypted-share.bin"
         local tmpdir
         tmpdir=$(mktemp -d)
@@ -591,12 +592,14 @@ step_init_seal() {
         done
 
         aws s3 cp "$s3_pubkey" "$tmpdir/pubkey.bin" --quiet
-        echo "  Attestation and pubkey downloaded from S3."
+        aws s3 cp "$s3_certs" "$tmpdir/certs.bin" --quiet
+        echo "  Attestation, pubkey, and certs downloaded from S3."
 
         # Run the operator-side verification + encryption
         local encrypt_args=(
             --attestation "$tmpdir/attestation.bin"
             --pubkey "$tmpdir/pubkey.bin"
+            --certs "$tmpdir/certs.bin"
             --output "$tmpdir/encrypted-share.bin"
             --share-file "$share"
         )

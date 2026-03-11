@@ -49,6 +49,21 @@ pub async fn get_attestation_report(
     get_report_sev_guest(report_data)
 }
 
+/// Fetch an attestation report AND the certificate chain from the local hardware
+/// via `SNP_GET_EXT_REPORT`.
+///
+/// The certificate chain (VCEK, ASK, ARK) is returned as a raw byte blob in
+/// AMD's cert table format. Use `attestation::parse_cert_table()` to extract
+/// individual certificates.
+///
+/// This is required on AWS EC2 where the chip ID is masked (all zeros), making
+/// it impossible to fetch the VCEK from AMD's Key Distribution Service.
+pub async fn get_ext_attestation_report(
+    report_data: Option<&[u8; 64]>,
+) -> Result<(SnpReport, Vec<u8>), SealError> {
+    get_ext_report_sev_guest(report_data)
+}
+
 // ---------------------------------------------------------------------------
 // MSG_KEY_REQ / SNP_GET_DERIVED_KEY (Linux only)
 // ---------------------------------------------------------------------------
@@ -282,6 +297,154 @@ fn get_report_sev_guest(report_data: Option<&[u8; 64]>) -> Result<SnpReport, Sea
 fn get_report_sev_guest(_report_data: Option<&[u8; 64]>) -> Result<SnpReport, SealError> {
     Err(SealError::ProviderError(
         "SEV-SNP attestation only available on Linux".into(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// SNP_GET_EXT_REPORT — extended report with certificate chain
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn get_ext_report_sev_guest(
+    report_data: Option<&[u8; 64]>,
+) -> Result<(SnpReport, Vec<u8>), SealError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    // SNP_GET_EXT_REPORT = _IOWR('S', 0x2, struct snp_guest_request_ioctl) = 0xC020_5302
+    const SNP_GET_EXT_REPORT: libc::c_ulong = 0xC020_5302;
+
+    // Extended report request: regular report request + cert buffer pointer
+    #[repr(C)]
+    struct SnpExtReportReq {
+        // snp_report_req fields
+        user_data: [u8; 64],
+        vmpl: u32,
+        rsvd: [u8; 28],
+        // extended fields
+        certs_address: u64,
+        certs_len: u32,
+    }
+
+    #[repr(C)]
+    struct SnpReportResp {
+        data: [u8; 4000],
+    }
+
+    #[repr(C)]
+    struct SnpGuestRequestIoctl {
+        msg_version: u8,
+        _pad: [u8; 7],
+        req_data: u64,
+        resp_data: u64,
+        exitinfo2: u64,
+    }
+
+    let fd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/sev-guest")
+        .map_err(|e| SealError::ProviderError(format!("failed to open /dev/sev-guest: {e}")))?;
+
+    // Allocate cert buffer (8KB should be more than enough for VCEK + ASK + ARK)
+    let mut cert_buf = vec![0u8; 8192];
+
+    let mut req = SnpExtReportReq {
+        user_data: [0u8; 64],
+        vmpl: 0,
+        rsvd: [0u8; 28],
+        certs_address: cert_buf.as_mut_ptr() as u64,
+        certs_len: cert_buf.len() as u32,
+    };
+    if let Some(data) = report_data {
+        req.user_data = *data;
+    }
+
+    let mut resp = SnpReportResp { data: [0u8; 4000] };
+
+    let mut ioctl_req = SnpGuestRequestIoctl {
+        msg_version: 1,
+        _pad: [0u8; 7],
+        req_data: &req as *const SnpExtReportReq as u64,
+        resp_data: &mut resp as *mut SnpReportResp as u64,
+        exitinfo2: 0,
+    };
+
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            SNP_GET_EXT_REPORT,
+            &mut ioctl_req as *mut SnpGuestRequestIoctl,
+        )
+    };
+
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        // ENOSPC means our cert buffer was too small — retry with the size the kernel told us
+        if errno.raw_os_error() == Some(libc::ENOSPC) && req.certs_len > cert_buf.len() as u32 {
+            let needed = req.certs_len as usize;
+            tracing::info!(
+                needed_bytes = needed,
+                "SNP_GET_EXT_REPORT: cert buffer too small, retrying"
+            );
+            cert_buf.resize(needed, 0);
+            req.certs_address = cert_buf.as_mut_ptr() as u64;
+            req.certs_len = needed as u32;
+
+            let ret2 = unsafe {
+                libc::ioctl(
+                    fd.as_raw_fd(),
+                    SNP_GET_EXT_REPORT,
+                    &mut ioctl_req as *mut SnpGuestRequestIoctl,
+                )
+            };
+            if ret2 != 0 {
+                let errno2 = std::io::Error::last_os_error();
+                return Err(SealError::ProviderError(format!(
+                    "SNP_GET_EXT_REPORT ioctl failed (retry): {errno2}"
+                )));
+            }
+        } else {
+            return Err(SealError::ProviderError(format!(
+                "SNP_GET_EXT_REPORT ioctl failed: {errno}"
+            )));
+        }
+    }
+
+    // Check firmware status
+    let fw_status = u32::from_le_bytes(resp.data[0..4].try_into().unwrap());
+    if fw_status != 0 {
+        return Err(SealError::ProviderError(format!(
+            "SNP_GET_EXT_REPORT firmware error: status=0x{fw_status:X}"
+        )));
+    }
+
+    // Parse the report from the response
+    let report_start = MSG_REPORT_RSP_HEADER_SIZE;
+    let report_end = report_start + REPORT_TOTAL_SIZE;
+    if resp.data.len() < report_end {
+        return Err(SealError::ProviderError(format!(
+            "SNP ext report response too small: {} bytes",
+            resp.data.len()
+        )));
+    }
+    let report = SnpReport::from_bytes(&resp.data[report_start..report_end])?;
+
+    // Truncate cert buffer to the actual size returned
+    let actual_cert_len = req.certs_len as usize;
+    if actual_cert_len <= cert_buf.len() {
+        cert_buf.truncate(actual_cert_len);
+    }
+
+    Ok((report, cert_buf))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_ext_report_sev_guest(
+    _report_data: Option<&[u8; 64]>,
+) -> Result<(SnpReport, Vec<u8>), SealError> {
+    Err(SealError::ProviderError(
+        "SEV-SNP extended attestation only available on Linux".into(),
     ))
 }
 

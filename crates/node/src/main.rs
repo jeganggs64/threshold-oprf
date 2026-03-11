@@ -215,6 +215,7 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
 
     let s3_attestation_url = format!("s3://{s3_bucket}/init/attestation.bin");
     let s3_pubkey_url = format!("s3://{s3_bucket}/init/pubkey.bin");
+    let s3_certs_url = format!("s3://{s3_bucket}/init/certs.bin");
     let s3_encrypted_share_url = format!("s3://{s3_bucket}/init/encrypted-share.bin");
 
     // Step 1: Generate ephemeral X25519 keypair
@@ -239,10 +240,14 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
     let mut report_data = [0u8; 64];
     report_data[..32].copy_from_slice(&pubkey_hash);
 
-    info!("init-seal: requesting attestation report with pubkey hash as REPORT_DATA");
-    let report = toprf_seal::provider::get_attestation_report(Some(&report_data))
+    info!("init-seal: requesting extended attestation report with pubkey hash as REPORT_DATA");
+    let (report, cert_table) = toprf_seal::provider::get_ext_attestation_report(Some(&report_data))
         .await
-        .expect("init-seal: failed to get attestation report");
+        .expect("init-seal: failed to get extended attestation report");
+    info!(
+        cert_table_size = cert_table.len(),
+        "init-seal: certificate chain obtained from host firmware"
+    );
 
     // Serialize the full attestation report (body + signature, padded)
     let mut attestation_bytes = Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
@@ -271,6 +276,11 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
     cloud_storage::upload_blob(&s3_pubkey_url, pubkey_bytes.to_vec())
         .await
         .expect("init-seal: failed to upload public key to S3");
+
+    info!("init-seal: uploading certificate chain to {s3_certs_url}");
+    cloud_storage::upload_blob(&s3_certs_url, cert_table)
+        .await
+        .expect("init-seal: failed to upload certificate chain to S3");
 
     info!("init-seal: waiting for operator to upload encrypted share to {s3_encrypted_share_url}");
     info!("init-seal: operator should run:");
@@ -352,6 +362,7 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
     // Best-effort cleanup — don't fail if these can't be deleted
     let _ = cloud_storage::delete_blob(&s3_attestation_url).await;
     let _ = cloud_storage::delete_blob(&s3_pubkey_url).await;
+    let _ = cloud_storage::delete_blob(&s3_certs_url).await;
     let _ = cloud_storage::delete_blob(&s3_encrypted_share_url).await;
 
     info!("init-seal: complete — sealed blob uploaded, node shutting down");

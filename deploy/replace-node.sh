@@ -248,6 +248,7 @@ else
     # Wait for attestation artifacts in S3
     S3_ATTESTATION="s3://${S3_BUCKET}/init/attestation.bin"
     S3_PUBKEY="s3://${S3_BUCKET}/init/pubkey.bin"
+    S3_CERTS="s3://${S3_BUCKET}/init/certs.bin"
     S3_ENCRYPTED="s3://${S3_BUCKET}/init/encrypted-share.bin"
     TMPDIR=$(mktemp -d)
 
@@ -270,12 +271,14 @@ else
     done
 
     aws s3 cp "$S3_PUBKEY" "$TMPDIR/pubkey.bin" --quiet
-    echo "  Attestation and pubkey downloaded."
+    aws s3 cp "$S3_CERTS" "$TMPDIR/certs.bin" --quiet
+    echo "  Attestation, pubkey, and certs downloaded."
 
     # Verify attestation + encrypt share
     encrypt_args=(
         --attestation "$TMPDIR/attestation.bin"
         --pubkey "$TMPDIR/pubkey.bin"
+        --certs "$TMPDIR/certs.bin"
         --output "$TMPDIR/encrypted-share.bin"
         --share-file "$SHARE_FILE"
     )

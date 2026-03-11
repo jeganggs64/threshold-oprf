@@ -12,18 +12,126 @@ use x509_parser::time::ASN1Time;
 use crate::snp_report::SnpReport;
 use crate::SealError;
 
+// ---------------------------------------------------------------------------
+// Certificate table parsing (from SNP_GET_EXT_REPORT)
+// ---------------------------------------------------------------------------
+
+/// Certificate chain extracted from the SNP extended report cert table.
+pub struct CertChain {
+    /// VCEK certificate (DER-encoded).
+    pub vcek: Vec<u8>,
+    /// ASK certificate (DER-encoded).
+    pub ask: Vec<u8>,
+    /// ARK certificate (DER-encoded).
+    pub ark: Vec<u8>,
+}
+
+/// Known AMD certificate GUIDs (mixed-endian UUID byte representation).
+const GUID_VCEK: [u8; 16] = [
+    0x8d, 0x75, 0xda, 0x63, 0x64, 0xe6, 0x64, 0x45, 0xad, 0xc5, 0xf4, 0xb9, 0x3b, 0xe8, 0xac, 0xcd,
+];
+const GUID_ASK: [u8; 16] = [
+    0x79, 0xb3, 0xb7, 0x4a, 0xac, 0xbb, 0xe4, 0x4f, 0xa0, 0x2f, 0x05, 0xae, 0xf3, 0x27, 0xc7, 0x82,
+];
+const GUID_ARK: [u8; 16] = [
+    0xa4, 0x06, 0xb4, 0xc0, 0x03, 0xa8, 0x52, 0x49, 0x97, 0x43, 0x3f, 0xb6, 0x01, 0x4c, 0xd0, 0xae,
+];
+
+/// Size of a cert table entry: 16 (GUID) + 4 (offset) + 4 (length) = 24 bytes.
+const CERT_TABLE_ENTRY_SIZE: usize = 24;
+
+/// Parse the certificate table from an `SNP_GET_EXT_REPORT` response.
+///
+/// The table is a sequence of `{guid[16], offset[4], length[4]}` entries,
+/// terminated by an all-zero GUID. Certificate data follows at the
+/// specified offsets within the same buffer.
+pub fn parse_cert_table(raw: &[u8]) -> Result<CertChain, SealError> {
+    let mut vcek: Option<Vec<u8>> = None;
+    let mut ask: Option<Vec<u8>> = None;
+    let mut ark: Option<Vec<u8>> = None;
+
+    let zero_guid = [0u8; 16];
+    let mut pos = 0;
+
+    loop {
+        if pos + CERT_TABLE_ENTRY_SIZE > raw.len() {
+            break;
+        }
+
+        let guid: [u8; 16] = raw[pos..pos + 16].try_into().unwrap();
+        if guid == zero_guid {
+            break; // end of table
+        }
+
+        let offset = u32::from_le_bytes(raw[pos + 16..pos + 20].try_into().unwrap()) as usize;
+        let length = u32::from_le_bytes(raw[pos + 20..pos + 24].try_into().unwrap()) as usize;
+
+        if offset + length > raw.len() {
+            return Err(SealError::AttestationFailed(format!(
+                "cert table entry at offset {pos} references data beyond buffer \
+                 (offset={offset}, length={length}, buf_len={})",
+                raw.len()
+            )));
+        }
+
+        let cert_data = raw[offset..offset + length].to_vec();
+
+        if guid == GUID_VCEK {
+            vcek = Some(cert_data);
+        } else if guid == GUID_ASK {
+            ask = Some(cert_data);
+        } else if guid == GUID_ARK {
+            ark = Some(cert_data);
+        }
+        // Skip unknown GUIDs
+
+        pos += CERT_TABLE_ENTRY_SIZE;
+    }
+
+    Ok(CertChain {
+        vcek: vcek
+            .ok_or_else(|| SealError::AttestationFailed("VCEK not found in cert table".into()))?,
+        ask: ask
+            .ok_or_else(|| SealError::AttestationFailed("ASK not found in cert table".into()))?,
+        ark: ark
+            .ok_or_else(|| SealError::AttestationFailed("ARK not found in cert table".into()))?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Attestation verifier
+// ---------------------------------------------------------------------------
+
 pub struct AttestationVerifier;
 
 impl AttestationVerifier {
-    /// Verify the SNP report's signature against AMD's certificate chain.
+    /// Verify the SNP report using a pre-provided certificate chain.
     ///
-    /// 1. Extract chip_id and TCB from report
-    /// 2. Fetch VCEK certificate from AMD KDS
-    /// 3. Fetch and verify the AMD certificate chain (ASK + ARK)
-    /// 4. Verify VCEK is signed by ASK, ASK is signed by ARK, ARK is self-signed
-    /// 5. Verify ARK fingerprint against pinned value (if configured)
-    /// 6. Parse VCEK cert, extract P-384 public key
-    /// 7. Verify ECDSA-P384-SHA384 signature over report body
+    /// Use this when the cert chain comes from `SNP_GET_EXT_REPORT` (e.g., on
+    /// AWS EC2 where the chip ID is masked and AMD KDS is unavailable).
+    pub fn verify_report_with_certs(
+        report: &SnpReport,
+        certs: &CertChain,
+    ) -> Result<(), SealError> {
+        // Verify ARK is self-signed
+        Self::verify_cert_signature(&certs.ark, &certs.ark)?;
+        // Verify ASK is signed by ARK
+        Self::verify_cert_signature(&certs.ask, &certs.ark)?;
+        // Verify VCEK is signed by ASK
+        Self::verify_cert_signature(&certs.vcek, &certs.ask)?;
+
+        // Verify ARK fingerprint (if pinned)
+        Self::verify_ark_fingerprint(&certs.ark)?;
+
+        // Verify report signature with VCEK
+        let pubkey_bytes = Self::extract_vcek_pubkey(&certs.vcek)?;
+        Self::verify_signature(report, &pubkey_bytes)
+    }
+
+    /// Verify the SNP report by fetching certificates from AMD KDS.
+    ///
+    /// This requires a non-zero chip ID (won't work on AWS EC2).
+    /// Use `verify_report_with_certs()` with certs from `SNP_GET_EXT_REPORT` instead.
     pub async fn verify_report(report: &SnpReport) -> Result<(), SealError> {
         let vcek_der = Self::fetch_vcek_cert(report).await?;
         let product = Self::detect_product(report);
