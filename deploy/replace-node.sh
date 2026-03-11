@@ -7,12 +7,14 @@
 #   2. Install Docker and pull the node image
 #   3. Run init-seal (S3-mediated ECIES key injection)
 #   4. Update the NLB target group (swap old IP → new IP)
-#   5. Start the node with its coordinator config
-#   6. Verify health
+#   5. Ensure the node's security group allows NLB/peer traffic
+#   6. Start the node with its coordinator config
+#   7. Verify health
 #
 # The other nodes and their coordinator configs don't change — the NLB
-# target swap is invisible to peers since the PrivateLink endpoint DNS
-# stays the same.
+# target swap is invisible to peers. Same-VPC peers reach this node via
+# NLB DNS; cross-VPC peers reach it via PrivateLink (the Endpoint Service
+# DNS stays the same).
 #
 # Usage:
 #   ./replace-node.sh <node_number> --share-file <path>
@@ -375,9 +377,30 @@ aws elbv2 register-targets --region "$REGION" \
 
 echo "  Target group updated."
 
-# ─── Step 5: Start the node ────────────────────────────────────────────────
+# ─── Step 5: Ensure SG allows NLB/peer traffic ───────────────────────────
 
-info "Step 5: Starting node"
+info "Step 5: Checking security group rules"
+
+NODE_SG=$(node_var SG_ID)
+NODE_VPC=$(node_var VPC_ID)
+[[ -n "$NODE_SG" ]]  || die "NODE${NODE_NUM}_SG_ID not set in config.env"
+[[ -n "$NODE_VPC" ]] || die "NODE${NODE_NUM}_VPC_ID not set in config.env"
+
+VPC_CIDR=$(aws ec2 describe-vpcs --region "$REGION" \
+    --vpc-ids "$NODE_VPC" \
+    --query 'Vpcs[0].CidrBlock' --output text)
+
+aws ec2 authorize-security-group-ingress \
+    --region "$REGION" \
+    --group-id "$NODE_SG" \
+    --protocol tcp --port 3001 \
+    --cidr "$VPC_CIDR" 2>/dev/null \
+    && echo "  Added SG rule: TCP 3001 from $VPC_CIDR" \
+    || echo "  SG rule already exists: TCP 3001 from $VPC_CIDR"
+
+# ─── Step 6: Start the node ────────────────────────────────────────────────
+
+info "Step 6: Starting node"
 
 # Upload coordinator config (if it exists)
 COORD_CONFIG="${SCRIPT_DIR}/coordinator-configs/coordinator-node-${NODE_NUM}.json"
@@ -407,9 +430,9 @@ ssh_node "sudo docker run -d --name toprf-node --restart=unless-stopped \
 echo "  Node started. Waiting for health check..."
 sleep 5
 
-# ─── Step 6: Verify health ─────────────────────────────────────────────────
+# ─── Step 7: Verify health ─────────────────────────────────────────────────
 
-info "Step 6: Verifying node health"
+info "Step 7: Verifying node health"
 
 waited=0
 while true; do
@@ -442,8 +465,9 @@ echo "  Public IP:    $(node_var IP)"
 echo "  Private IP:   $NODE_PRIVATE_IP"
 echo "  Status:       ready"
 echo ""
-echo "  The PrivateLink endpoint DNS is unchanged."
-echo "  Other nodes will route to the new instance automatically."
+echo "  NLB target updated to new instance's private IP."
+echo "  Same-VPC peers route via internal NLB; cross-VPC peers"
+echo "  route via PrivateLink. No DNS changes needed."
 echo ""
 echo "  To verify end-to-end:"
 echo "    ./deploy.sh e2e"

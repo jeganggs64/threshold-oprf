@@ -2,8 +2,18 @@
 # =============================================================================
 # deploy.sh — Automated deployment for threshold OPRF nodes on AWS.
 #
-# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions with AWS PrivateLink.
-# All nodes run in AMD SEV-SNP Confidential VMs with sealed key shares.
+# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions. Each node can
+# act as coordinator: receiving a client request, computing its own partial
+# evaluation, calling a peer node via PrivateLink, verifying the peer's DLEQ
+# proof, and returning the combined OPRF evaluation.
+#
+# Architecture:
+#   Client → API Gateway → NLB → Coordinator Node → PrivateLink → Peer Node
+#
+# Node-to-node communication:
+#   Same-VPC peers use internal NLB DNS directly.
+#   Cross-VPC peers use AWS PrivateLink (Endpoint Service + Interface VPC
+#   Endpoints in the consumer VPC).
 #
 # Usage:
 #   ./deploy.sh <step> [step...]
@@ -31,9 +41,9 @@ Steps (run in order for fresh deployment):
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
   init-seal     S3-mediated ECIES key injection (attested)
-  start         Start nodes in normal mode (unseal + serve)
-  privatelink   Create NLBs, Endpoint Services, VPC Endpoints
+  privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
+  start         Start nodes in coordinator mode (unseal + serve)
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
 
@@ -44,7 +54,7 @@ Utilities:
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage
-  post-seal     start → privatelink → coordinator-config → verify
+  post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
@@ -136,6 +146,8 @@ node_s3_bucket() {
     esac
 }
 
+# Convert VPC ID to variable-safe identifier: vpc-0abc → vpc_0abc
+vpc_ident() { echo "${1//-/_}"; }
 
 sealed_url() {
     local bucket
@@ -266,40 +278,29 @@ SETUP
 }
 
 # ─── 4. AWS PrivateLink (NLBs + Endpoint Services + VPC Endpoints) ──────────
+#
+# Architecture: node-to-node PrivateLink for coordinator mode.
+#
+#   Same-VPC peers (e.g. nodes 1↔2 in eu-west-1): reachable via internal
+#   NLB DNS directly — no PrivateLink needed.
+#
+#   Cross-VPC peers (e.g. nodes 1,2 ↔ node 3): reachable via Interface
+#   VPC Endpoints in the consumer VPC connecting to the provider's
+#   Endpoint Service.
+#
+# Creates per node:  NLB → Target Group → Listener → Endpoint Service
+# Creates per cross-VPC pair:  Security Group + Interface VPC Endpoint
 
 step_privatelink() {
     echo ""
-    info "Setting up AWS PrivateLink (NLBs → Endpoint Services → VPC Endpoints)"
+    info "Setting up AWS PrivateLink (node-to-node)"
 
-    local ecs_state="${SCRIPT_DIR}/ecs-state.env"
-    [[ -f "$ecs_state" ]] || die "ecs-state.env not found. Run setup-ecs.sh vpc first."
-    source "$ecs_state"
-
-    local proxy_vpc_id="${VPC_ID:?VPC_ID not found in ecs-state.env}"
     local pl_state="${SCRIPT_DIR}/privatelink-state.env"
 
-    # Load existing PrivateLink state
+    # Load existing state for idempotency
     [[ -f "$pl_state" ]] && source "$pl_state"
 
-    # Create security group for VPC endpoints (once)
-    if [[ -z "${VPCE_SG:-}" ]]; then
-        echo "  Creating VPC endpoint security group..."
-        VPCE_SG=$(aws ec2 create-security-group \
-            --region "$PROXY_REGION" \
-            --vpc-id "$proxy_vpc_id" \
-            --group-name "toprf-privatelink-sg" \
-            --description "Allow ECS tasks to reach TOPRF nodes via PrivateLink" \
-            --query 'GroupId' --output text)
-        aws ec2 authorize-security-group-ingress \
-            --region "$PROXY_REGION" \
-            --group-id "$VPCE_SG" \
-            --protocol tcp --port 3001 \
-            --source-group "${ECS_SG:?ECS_SG not found in ecs-state.env}"
-        echo "VPCE_SG=${VPCE_SG}" >> "$pl_state"
-        echo "    SG: $VPCE_SG"
-    else
-        echo "  VPC endpoint SG: $VPCE_SG (exists)"
-    fi
+    # ── Phase 1: Per-node NLB + Target Group + Listener + Endpoint Service ──
 
     for i in $(active_nodes); do
         local region vpc_id subnet_id private_ip
@@ -313,11 +314,11 @@ step_privatelink() {
         echo ""
         echo "  ━━━ Node $i ($region, $private_ip) ━━━"
 
-        # ── 1. Network Load Balancer (needs ≥2 AZs for cross-region PrivateLink) ──
+        # ── 1. Network Load Balancer ──
         local nlb_var="NLB_ARN_NODE${i}"
         local nlb_arn="${!nlb_var:-}"
         if [[ -z "$nlb_arn" ]]; then
-            # Find a second subnet in a different AZ within the same VPC
+            # NLB needs ≥2 AZs for cross-region PrivateLink
             local second_subnet
             second_subnet=$(aws ec2 describe-subnets --region "$region" \
                 --filters "Name=vpc-id,Values=$vpc_id" \
@@ -336,6 +337,36 @@ step_privatelink() {
         else
             echo "    NLB: $nlb_arn (exists)"
         fi
+
+        # Save NLB DNS (needed for same-VPC peer resolution)
+        local nlb_dns_var="NLB_DNS_NODE${i}"
+        if [[ -z "${!nlb_dns_var:-}" ]]; then
+            local nlb_dns
+            nlb_dns=$(aws elbv2 describe-load-balancers --region "$region" \
+                --load-balancer-arns "$nlb_arn" \
+                --query 'LoadBalancers[0].DNSName' --output text)
+            echo "${nlb_dns_var}=${nlb_dns}" >> "$pl_state"
+            eval "${nlb_dns_var}=${nlb_dns}"
+            echo "    NLB DNS: $nlb_dns"
+        else
+            echo "    NLB DNS: ${!nlb_dns_var} (exists)"
+        fi
+
+        # ── Ensure node SG allows port 3001 from its own VPC CIDR ──
+        # NLB health checks and same-VPC peer traffic originate from within the VPC.
+        local sg_id
+        sg_id=$(node_sg_id "$i")
+        local vpc_cidr
+        vpc_cidr=$(aws ec2 describe-vpcs --region "$region" \
+            --vpc-ids "$vpc_id" \
+            --query 'Vpcs[0].CidrBlock' --output text)
+        aws ec2 authorize-security-group-ingress \
+            --region "$region" \
+            --group-id "$sg_id" \
+            --protocol tcp --port 3001 \
+            --cidr "$vpc_cidr" 2>/dev/null \
+            && echo "    SG: allowed TCP 3001 from $vpc_cidr" \
+            || true  # rule may already exist
 
         # ── 2. Target Group ──
         local tg_var="PL_TG_ARN_NODE${i}"
@@ -409,19 +440,29 @@ step_privatelink() {
                 --add-allowed-principals "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
             echo "    Allowed principal: account ${AWS_ACCOUNT_ID}"
 
-            # Cross-region: allow the proxy's region to connect
-            if [[ "$region" != "$PROXY_REGION" ]]; then
-                aws ec2 modify-vpc-endpoint-service-configuration \
-                    --region "$region" \
-                    --service-id "$svc_id" \
-                    --add-supported-regions "$PROXY_REGION"
-                echo "    Added supported region: $PROXY_REGION"
-            fi
+            # Add supported regions for cross-region consumers
+            local added_regions=""
+            for j in $(active_nodes); do
+                [[ "$j" != "$i" ]] || continue
+                local peer_vpc peer_region
+                peer_vpc=$(node_vpc_id "$j")
+                peer_region=$(node_region "$j")
+                if [[ "$peer_vpc" != "$vpc_id" && "$peer_region" != "$region" ]]; then
+                    if [[ ! " $added_regions " =~ " $peer_region " ]]; then
+                        aws ec2 modify-vpc-endpoint-service-configuration \
+                            --region "$region" \
+                            --service-id "$svc_id" \
+                            --add-supported-regions "$peer_region"
+                        added_regions="$added_regions $peer_region"
+                        echo "    Added supported region: $peer_region"
+                    fi
+                fi
+            done
         else
             echo "    Endpoint Service: $svc_id (exists)"
         fi
 
-        # Get the service name (needed to create the VPC endpoint)
+        # Get the service name (needed to create VPC endpoints)
         local svc_name_var="ENDPOINT_SVC_NAME_NODE${i}"
         local svc_name="${!svc_name_var:-}"
         if [[ -z "$svc_name" ]]; then
@@ -430,67 +471,164 @@ step_privatelink() {
                 --service-ids "$svc_id" \
                 --query 'ServiceConfigurations[0].ServiceName' --output text)
             echo "${svc_name_var}=${svc_name}" >> "$pl_state"
+            eval "${svc_name_var}='${svc_name}'"
         fi
         echo "    Service name: $svc_name"
+    done
 
-        # ── 6. Interface VPC Endpoint (in proxy VPC) ──
-        local vpce_var="VPCE_ID_NODE${i}"
-        local vpce_id="${!vpce_var:-}"
-        if [[ -z "$vpce_id" ]]; then
-            echo "  Creating Interface VPC Endpoint in proxy VPC ($PROXY_REGION)..."
+    # ── Phase 2: Per-VPC security groups for VPC endpoints ──
 
-            local vpce_args=(
-                --region "$PROXY_REGION"
-                --vpc-id "$proxy_vpc_id"
-                --service-name "$svc_name"
-                --vpc-endpoint-type Interface
-                --subnet-ids "${PRIV_SUBNET_1}" "${PRIV_SUBNET_2}"
-                --security-group-ids "$VPCE_SG"
-                --no-private-dns-enabled
-            )
+    echo ""
+    echo "  ━━━ Cross-VPC security groups ━━━"
 
-            # Cross-region PrivateLink requires --service-region
-            if [[ "$region" != "$PROXY_REGION" ]]; then
-                vpce_args+=(--service-region "$region")
-                echo "    Cross-region: $region → $PROXY_REGION"
+    # Collect unique VPCs that need VPCEs (have peers in a different VPC)
+    local vpcs_done=""
+    for i in $(active_nodes); do
+        local my_vpc my_region
+        my_vpc=$(node_vpc_id "$i")
+        my_region=$(node_region "$i")
+        local my_vi
+        my_vi=$(vpc_ident "$my_vpc")
+
+        # Skip if we already handled this VPC
+        [[ ! " $vpcs_done " =~ " $my_vpc " ]] || continue
+
+        # Check if this VPC has any cross-VPC peers
+        local needs_vpce=false
+        for j in $(active_nodes); do
+            [[ "$j" != "$i" ]] || continue
+            if [[ "$(node_vpc_id "$j")" != "$my_vpc" ]]; then
+                needs_vpce=true
+                break
+            fi
+        done
+        $needs_vpce || continue
+
+        local sg_var="VPCE_SG_${my_vi}"
+        if [[ -z "${!sg_var:-}" ]]; then
+            local vpc_cidr
+            vpc_cidr=$(aws ec2 describe-vpcs --region "$my_region" \
+                --vpc-ids "$my_vpc" \
+                --query 'Vpcs[0].CidrBlock' --output text)
+
+            echo "  Creating VPCE security group in $my_vpc ($my_region)..."
+            local sg_id
+            sg_id=$(aws ec2 create-security-group \
+                --region "$my_region" \
+                --vpc-id "$my_vpc" \
+                --group-name "toprf-privatelink-vpce-${my_vi}" \
+                --description "Allow nodes to reach peers via PrivateLink" \
+                --query 'GroupId' --output text)
+            aws ec2 authorize-security-group-ingress \
+                --region "$my_region" \
+                --group-id "$sg_id" \
+                --protocol tcp --port 3001 \
+                --cidr "$vpc_cidr"
+            echo "${sg_var}=${sg_id}" >> "$pl_state"
+            eval "${sg_var}=${sg_id}"
+            echo "    SG: $sg_id (allows TCP 3001 from $vpc_cidr)"
+        else
+            echo "    SG in $my_vpc: ${!sg_var} (exists)"
+        fi
+
+        vpcs_done="$vpcs_done $my_vpc"
+    done
+
+    # ── Phase 3: Cross-VPC Interface VPC Endpoints ──
+
+    echo ""
+    echo "  ━━━ Cross-VPC endpoints ━━━"
+
+    for i in $(active_nodes); do
+        local my_vpc my_region my_subnet
+        my_vpc=$(node_vpc_id "$i")
+        my_region=$(node_region "$i")
+        my_subnet=$(node_subnet_id "$i")
+        local my_vi
+        my_vi=$(vpc_ident "$my_vpc")
+
+        for j in $(active_nodes); do
+            [[ "$j" != "$i" ]] || continue
+            local peer_vpc
+            peer_vpc=$(node_vpc_id "$j")
+
+            # Skip same-VPC peers — reachable via NLB DNS directly
+            [[ "$my_vpc" != "$peer_vpc" ]] || continue
+
+            local vpce_id_var="VPCE_ID_NODE${j}_IN_${my_vi}"
+            local vpce_id="${!vpce_id_var:-}"
+
+            if [[ -z "$vpce_id" ]]; then
+                local peer_region svc_name_var svc_name sg_var sg_id
+                peer_region=$(node_region "$j")
+                svc_name_var="ENDPOINT_SVC_NAME_NODE${j}"
+                svc_name="${!svc_name_var}"
+                sg_var="VPCE_SG_${my_vi}"
+                sg_id="${!sg_var}"
+
+                echo "  Creating VPCE for node $j in $my_vpc ($my_region)..."
+
+                # Find a second subnet in a different AZ within the consumer VPC
+                local second_subnet
+                second_subnet=$(aws ec2 describe-subnets --region "$my_region" \
+                    --filters "Name=vpc-id,Values=$my_vpc" \
+                    --query "Subnets[?SubnetId!='${my_subnet}'] | [0].SubnetId" --output text)
+
+                local vpce_args=(
+                    --region "$my_region"
+                    --vpc-id "$my_vpc"
+                    --service-name "$svc_name"
+                    --vpc-endpoint-type Interface
+                    --subnet-ids "$my_subnet" "$second_subnet"
+                    --security-group-ids "$sg_id"
+                    --no-private-dns-enabled
+                )
+
+                # Cross-region PrivateLink requires --service-region
+                if [[ "$peer_region" != "$my_region" ]]; then
+                    vpce_args+=(--service-region "$peer_region")
+                    echo "    Cross-region: $peer_region → $my_region"
+                fi
+
+                vpce_id=$(aws ec2 create-vpc-endpoint \
+                    "${vpce_args[@]}" \
+                    --query 'VpcEndpoint.VpcEndpointId' --output text)
+                echo "${vpce_id_var}=${vpce_id}" >> "$pl_state"
+                eval "${vpce_id_var}=${vpce_id}"
+                echo "    VPCE: $vpce_id"
+            else
+                echo "    VPCE for node $j in $my_vpc: $vpce_id (exists)"
             fi
 
-            vpce_id=$(aws ec2 create-vpc-endpoint \
-                "${vpce_args[@]}" \
-                --query 'VpcEndpoint.VpcEndpointId' --output text)
-            echo "${vpce_var}=${vpce_id}" >> "$pl_state"
-            echo "    VPC Endpoint: $vpce_id"
-        else
-            echo "    VPC Endpoint: $vpce_id (exists)"
-        fi
-
-        # ── 7. Wait for endpoint to become available + get DNS ──
-        echo "  Waiting for VPC endpoint DNS..."
-        local vpce_dns_var="VPCE_DNS_NODE${i}"
-        local vpce_dns="${!vpce_dns_var:-}"
-        if [[ -z "$vpce_dns" ]]; then
-            local attempts=0
-            while true; do
-                vpce_dns=$(aws ec2 describe-vpc-endpoints \
-                    --region "$PROXY_REGION" \
-                    --vpc-endpoint-ids "$vpce_id" \
-                    --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text 2>/dev/null)
-                if [[ -n "$vpce_dns" && "$vpce_dns" != "None" && "$vpce_dns" != "null" ]]; then
-                    echo "${vpce_dns_var}=${vpce_dns}" >> "$pl_state"
-                    break
-                fi
-                attempts=$((attempts + 1))
-                if [[ $attempts -ge 60 ]]; then
-                    warn "Could not get DNS for $vpce_id after 5 minutes"
-                    vpce_dns=""
-                    break
-                fi
-                sleep 5
-            done
-        fi
-        if [[ -n "$vpce_dns" ]]; then
-            echo "    DNS: $vpce_dns"
-        fi
+            # Wait for DNS
+            local vpce_dns_var="VPCE_DNS_NODE${j}_IN_${my_vi}"
+            local vpce_dns="${!vpce_dns_var:-}"
+            if [[ -z "$vpce_dns" ]]; then
+                echo "    Waiting for VPCE DNS..."
+                local attempts=0
+                while true; do
+                    vpce_dns=$(aws ec2 describe-vpc-endpoints \
+                        --region "$my_region" \
+                        --vpc-endpoint-ids "$vpce_id" \
+                        --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text 2>/dev/null)
+                    if [[ -n "$vpce_dns" && "$vpce_dns" != "None" && "$vpce_dns" != "null" ]]; then
+                        echo "${vpce_dns_var}=${vpce_dns}" >> "$pl_state"
+                        eval "${vpce_dns_var}='${vpce_dns}'"
+                        break
+                    fi
+                    attempts=$((attempts + 1))
+                    if [[ $attempts -ge 60 ]]; then
+                        warn "Could not get DNS for $vpce_id after 5 minutes"
+                        vpce_dns=""
+                        break
+                    fi
+                    sleep 5
+                done
+            fi
+            if [[ -n "$vpce_dns" ]]; then
+                echo "    DNS: $vpce_dns"
+            fi
+        done
     done
 
     echo ""
@@ -717,43 +855,35 @@ step_coordinator_config() {
     local config_dir="$SCRIPT_DIR/coordinator-configs"
     mkdir -p "$config_dir"
 
-    # For each node, generate a coordinator config listing its peers
     for i in $(active_nodes); do
         local out="${config_dir}/coordinator-node-${i}.json"
+        local my_vpc
+        my_vpc=$(node_vpc_id "$i")
+        local my_vi
+        my_vi=$(vpc_ident "$my_vpc")
         local peers_json=""
         local first=true
 
         for j in $(active_nodes); do
             [[ "$j" != "$i" ]] || continue
 
-            local vs peer_endpoint
+            local vs peer_endpoint peer_vpc
             vs=$(node_vs "$j")
+            peer_vpc=$(node_vpc_id "$j")
 
-            # Determine peer endpoint: same-VPC nodes use NLB DNS,
-            # cross-VPC nodes use PrivateLink VPCE DNS.
-            # With full PrivateLink mesh, all peers use VPCE DNS from the
-            # node's own VPC. The VPCEs are named by which VPC they're in.
-            local node_region peer_region vpce_dns
-            node_region=$(node_region "$i")
-            peer_region=$(node_region "$j")
-
-            # VPCE DNS for node j as seen from node i's VPC
-            # These are stored as VPCE_DNS_NODE<j>_FROM_NODE<i>_VPC
-            # For the initial deployment, we use the proxy VPC endpoints
-            # which will be replaced with node-to-node VPCEs
-            local vpce_dns_var="VPCE_DNS_NODE${j}_FROM_VPC_${node_region//-/_}"
-            vpce_dns="${!vpce_dns_var:-}"
-
-            # Fall back to the existing proxy VPC endpoints if node-to-node
-            # VPCEs haven't been created yet
-            if [[ -z "$vpce_dns" ]]; then
-                vpce_dns_var="VPCE_DNS_NODE${j}"
-                vpce_dns="${!vpce_dns_var:-}"
+            if [[ "$my_vpc" == "$peer_vpc" ]]; then
+                # Same VPC: use internal NLB DNS (directly reachable)
+                local nlb_dns_var="NLB_DNS_NODE${j}"
+                local nlb_dns="${!nlb_dns_var:-}"
+                [[ -n "$nlb_dns" ]] || die "NLB_DNS_NODE${j} not found. Run './deploy.sh privatelink' first."
+                peer_endpoint="http://${nlb_dns}:3001"
+            else
+                # Different VPC: use PrivateLink VPCE DNS
+                local vpce_dns_var="VPCE_DNS_NODE${j}_IN_${my_vi}"
+                local vpce_dns="${!vpce_dns_var:-}"
+                [[ -n "$vpce_dns" ]] || die "No VPCE DNS for node $j in VPC $my_vpc. Run './deploy.sh privatelink' first."
+                peer_endpoint="http://${vpce_dns}:3001"
             fi
-
-            [[ -n "$vpce_dns" ]] || die "No VPCE DNS for node $j reachable from node $i. Run './deploy.sh privatelink' first."
-
-            peer_endpoint="http://${vpce_dns}:3001"
 
             $first || peers_json+=","
             peers_json+="
@@ -1048,7 +1178,7 @@ step_lock() {
 
     echo ""
     echo "  All nodes locked. SSH access removed."
-    echo "  Nodes are now only reachable via port 3001 through PrivateLink."
+    echo "  Nodes are now only reachable via port 3001 (NLB / PrivateLink)."
 }
 
 # ─── 14. Redeploy ────────────────────────────────────────────────────────────
@@ -1080,9 +1210,9 @@ Steps (run in order for fresh deployment):
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
   init-seal     S3-mediated ECIES key injection (attested)
-  start         Start nodes in normal mode (unseal + serve)
-  privatelink   Create NLBs, Endpoint Services, VPC Endpoints
+  privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
+  start         Start nodes in coordinator mode (unseal + serve)
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
 
@@ -1093,7 +1223,7 @@ Utilities:
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage
-  post-seal     start → privatelink → coordinator-config → verify
+  post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
