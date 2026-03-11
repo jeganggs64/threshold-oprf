@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 #
-# Integration test for threshold-OPRF nodes.
+# Integration test for threshold-OPRF system.
 #
-# Builds the workspace, generates keys, starts 3 nodes,
-# and runs end-to-end HTTP tests (health checks + partial evaluations).
-#
-# The proxy is tested separately in the ruonid-proxy repo.
+# Builds the workspace, generates keys, starts 3 nodes + 1 proxy,
+# and runs end-to-end HTTP tests.
 #
 set -euo pipefail
 
@@ -15,10 +13,12 @@ TMPDIR="$(mktemp -d)"
 # Binary paths (built in step 1)
 KEYGEN="$REPO_ROOT/target/release/toprf-keygen"
 NODE="$REPO_ROOT/target/release/toprf-node"
+PROXY_REPO="https://github.com/jeganggs64/ruonid-proxy.git"
 
 NODE1_PORT=7101
 NODE2_PORT=7102
 NODE3_PORT=7103
+PROXY_PORT=7100
 
 PIDS=()
 PASS=0
@@ -94,6 +94,16 @@ for bin in "$KEYGEN" "$NODE"; do
     fi
 done
 
+echo ""
+echo "=== Step 1b: Building proxy from ruonid-proxy repo ==="
+cargo install --git "$PROXY_REPO" --root "$TMPDIR/proxy-install" 2>&1 | tail -5
+PROXY="$TMPDIR/proxy-install/bin/toprf-proxy"
+if [[ ! -x "$PROXY" ]]; then
+    echo "  FATAL: proxy binary not found at $PROXY"
+    exit 1
+fi
+echo "  Proxy built."
+
 # ---------- 2. Generate keys ----------
 
 echo ""
@@ -129,6 +139,13 @@ TOTAL_SHARES=$(jq -r '.total_shares' "$PUBLIC_CONFIG")
 echo "  Group public key: $GROUP_PUBLIC_KEY"
 echo "  Threshold: $THRESHOLD, Total shares: $TOTAL_SHARES"
 
+# Extract verification shares per node
+VS_1=$(jq -r '.verification_shares[] | select(.node_id == 1) | .verification_share' "$PUBLIC_CONFIG")
+VS_2=$(jq -r '.verification_shares[] | select(.node_id == 2) | .verification_share' "$PUBLIC_CONFIG")
+VS_3=$(jq -r '.verification_shares[] | select(.node_id == 3) | .verification_share' "$PUBLIC_CONFIG")
+
+echo "  Verification shares extracted for nodes 1, 2, 3."
+
 # ---------- 3. Start 3 node servers (with key files) ----------
 
 echo ""
@@ -159,78 +176,139 @@ wait_for_health "http://127.0.0.1:$NODE1_PORT/health" "Node 1"
 wait_for_health "http://127.0.0.1:$NODE2_PORT/health" "Node 2"
 wait_for_health "http://127.0.0.1:$NODE3_PORT/health" "Node 3"
 
-# ---------- 4. Run test requests ----------
+# ---------- 4. Create proxy config ----------
 
 echo ""
-echo "=== Step 4: Running tests ==="
+echo "=== Step 4: Creating proxy config ==="
 
-# 4a. GET /health on each node
+PROXY_CONFIG="$TMPDIR/proxy-config.json"
+cat > "$PROXY_CONFIG" <<CONFIGEOF
+{
+  "group_public_key": "$GROUP_PUBLIC_KEY",
+  "threshold": $THRESHOLD,
+  "require_attestation": false,
+  "rate_limit": {
+    "per_hour": 100,
+    "per_day": 1000
+  },
+  "nodes": [
+    {
+      "node_id": 1,
+      "endpoint": "http://127.0.0.1:$NODE1_PORT",
+      "verification_share": "$VS_1"
+    },
+    {
+      "node_id": 2,
+      "endpoint": "http://127.0.0.1:$NODE2_PORT",
+      "verification_share": "$VS_2"
+    },
+    {
+      "node_id": 3,
+      "endpoint": "http://127.0.0.1:$NODE3_PORT",
+      "verification_share": "$VS_3"
+    }
+  ]
+}
+CONFIGEOF
+
+echo "  Proxy config written to $PROXY_CONFIG"
+echo "  Config contents:"
+jq . "$PROXY_CONFIG"
+
+# ---------- 5. Start the proxy ----------
+
 echo ""
-echo "--- Test 4a: Node health checks ---"
-for i in 1 2 3; do
-    eval PORT=\$NODE${i}_PORT
-    HEALTH_RESP=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PORT/health")
-    assert_eq "node $i /health returns 200" "200" "$HEALTH_RESP"
+echo "=== Step 5: Starting proxy ==="
 
-    HEALTH_BODY=$(curl -sf "http://127.0.0.1:$PORT/health")
-    HEALTH_STATUS=$(echo "$HEALTH_BODY" | jq -r '.status')
-    assert_eq "node $i status is 'ready'" "ready" "$HEALTH_STATUS"
+"$PROXY" --config "$PROXY_CONFIG" --port $PROXY_PORT > "$TMPDIR/proxy.log" 2>&1 &
+PIDS+=($!)
+echo "  Proxy started (PID $!, port $PROXY_PORT)"
 
-    NODE_ID=$(echo "$HEALTH_BODY" | jq -r '.node_id')
-    assert_eq "node $i reports node_id=$i" "$i" "$NODE_ID"
-done
+wait_for_health "http://127.0.0.1:$PROXY_PORT/health" "Proxy"
 
-# 4b. POST /partial-evaluate on each node
+# ---------- 6. Run test requests ----------
+
 echo ""
-echo "--- Test 4b: Partial evaluations ---"
+echo "=== Step 6: Running tests ==="
+
+# 6a. GET /health on proxy
+echo ""
+echo "--- Test 6a: GET /health ---"
+HEALTH_RESP=$(curl -sf -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health")
+assert_eq "proxy /health returns 200" "200" "$HEALTH_RESP"
+
+HEALTH_BODY=$(curl -sf "http://127.0.0.1:$PROXY_PORT/health")
+HEALTH_STATUS=$(echo "$HEALTH_BODY" | jq -r '.status')
+assert_eq "proxy health status is 'ok'" "ok" "$HEALTH_STATUS"
+
+HEALTH_THRESHOLD=$(echo "$HEALTH_BODY" | jq -r '.threshold')
+assert_eq "proxy health threshold is 2" "2" "$HEALTH_THRESHOLD"
+
+HEALTH_NODES=$(echo "$HEALTH_BODY" | jq -r '.total_nodes')
+assert_eq "proxy health total_nodes is 3" "3" "$HEALTH_NODES"
+
+# 6b. GET /oprf/public-key
+echo ""
+echo "--- Test 6b: GET /oprf/public-key ---"
+PK_RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/oprf/public-key")
+PK_VALUE=$(echo "$PK_RESP" | jq -r '.group_public_key')
+assert_eq "public-key matches group key" "$GROUP_PUBLIC_KEY" "$PK_VALUE"
+
+# Verify the public key looks like a valid compressed secp256k1 point
+assert_match "public key is 66 hex chars" '^(02|03)[0-9a-f]{64}$' "$PK_VALUE"
+
+# 6c. GET /oprf/challenge
+echo ""
+echo "--- Test 6c: GET /oprf/challenge ---"
+CHALLENGE_RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/oprf/challenge")
+NONCE=$(echo "$CHALLENGE_RESP" | jq -r '.nonce')
+assert_match "challenge nonce is non-empty hex" '^[0-9a-f]+$' "$NONCE"
+
+# 6d. POST /oprf/evaluate with a blinded point
+echo ""
+echo "--- Test 6d: POST /oprf/evaluate ---"
 
 # Use the secp256k1 generator point as a valid test blinded point.
+# The generator in compressed SEC1 form:
+# 02 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 TEST_BLINDED_POINT="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
-for i in 1 2 3; do
-    eval PORT=\$NODE${i}_PORT
-    EVAL_HTTP_CODE=$(curl -s -o "$TMPDIR/eval_node${i}.json" -w "%{http_code}" \
-        -X POST "http://127.0.0.1:$PORT/partial-evaluate" \
-        -H "Content-Type: application/json" \
-        -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}")
+EVAL_HTTP_CODE=$(curl -s -o "$TMPDIR/eval_resp.json" -w "%{http_code}" \
+    -X POST "http://127.0.0.1:$PROXY_PORT/oprf/evaluate" \
+    -H "Content-Type: application/json" \
+    -d "{\"blinded_point\": \"$TEST_BLINDED_POINT\"}")
 
-    if [[ "$EVAL_HTTP_CODE" != "200" ]]; then
-        echo "  DEBUG: node $i evaluate returned HTTP $EVAL_HTTP_CODE"
-        echo "  DEBUG: response: $(cat "$TMPDIR/eval_node${i}.json" 2>/dev/null)"
-    fi
-    assert_eq "node $i /partial-evaluate returns 200" "200" "$EVAL_HTTP_CODE"
+if [[ "$EVAL_HTTP_CODE" != "200" ]]; then
+    echo "  DEBUG: evaluate returned HTTP $EVAL_HTTP_CODE"
+    echo "  DEBUG: response body: $(cat "$TMPDIR/eval_resp.json" 2>/dev/null)"
+    echo "  DEBUG: proxy log (last 20 lines):"
+    tail -20 "$TMPDIR/proxy.log" 2>/dev/null || echo "(no log)"
+fi
+assert_eq "evaluate returns 200" "200" "$EVAL_HTTP_CODE"
 
-    if [[ -f "$TMPDIR/eval_node${i}.json" ]]; then
-        PARTIAL=$(cat "$TMPDIR/eval_node${i}.json")
-        PARTIAL_POINT=$(echo "$PARTIAL" | jq -r '.partial_point')
-        assert_match "node $i partial_point is valid compressed point" \
+if [[ -f "$TMPDIR/eval_resp.json" ]]; then
+    EVAL_RESP=$(cat "$TMPDIR/eval_resp.json")
+    EVAL_THRESHOLD=$(echo "$EVAL_RESP" | jq -r '.threshold')
+    assert_eq "evaluate response threshold is 2" "2" "$EVAL_THRESHOLD"
+
+    PARTIALS_COUNT=$(echo "$EVAL_RESP" | jq '.partials | length')
+    assert_match "partials array has >= 2 entries" '^[2-9][0-9]*$|^[2-3]$' "$PARTIALS_COUNT"
+
+    # 6e. Verify each partial_point is a valid compressed secp256k1 point
+    echo ""
+    echo "--- Test 6e: Verify partial points ---"
+    for idx in $(seq 0 $((PARTIALS_COUNT - 1))); do
+        NODE_ID=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].node_id")
+        PARTIAL_POINT=$(echo "$EVAL_RESP" | jq -r ".partials[$idx].partial_point")
+        assert_match "partial_point from node $NODE_ID is valid compressed point (66 hex, starts with 02 or 03)" \
             '^(02|03)[0-9a-f]{64}$' "$PARTIAL_POINT"
-
-        PROOF_C=$(echo "$PARTIAL" | jq -r '.proof.c')
-        assert_match "node $i DLEQ proof.c is non-empty hex" '^[0-9a-f]+$' "$PROOF_C"
-    fi
-done
-
-# 4c. Verify all nodes produce different partial points (different shares)
-echo ""
-echo "--- Test 4c: Partial points are distinct ---"
-P1=$(jq -r '.partial_point' "$TMPDIR/eval_node1.json" 2>/dev/null || echo "")
-P2=$(jq -r '.partial_point' "$TMPDIR/eval_node2.json" 2>/dev/null || echo "")
-P3=$(jq -r '.partial_point' "$TMPDIR/eval_node3.json" 2>/dev/null || echo "")
-
-if [[ -n "$P1" && -n "$P2" && -n "$P3" ]]; then
-    if [[ "$P1" != "$P2" && "$P2" != "$P3" && "$P1" != "$P3" ]]; then
-        echo "  PASS: all 3 partial points are distinct"
-        PASS=$((PASS + 1))
-    else
-        echo "  FAIL: partial points are not all distinct"
-        FAIL=$((FAIL + 1))
-    fi
+    done
 else
-    echo "  SKIP: could not compare (missing partial points)"
+    echo "  FAIL: evaluate response file not found"
+    FAIL=$((FAIL + 1))
 fi
 
-# ---------- 5. Summary ----------
+# ---------- 7. Summary ----------
 
 echo ""
 echo "========================================"
@@ -248,6 +326,8 @@ if [[ $FAIL -gt 0 ]]; then
         echo "--- Node $i log (last 10 lines) ---"
         tail -10 "$TMPDIR/node${i}.log" 2>/dev/null || echo "(no log)"
     done
+    echo "--- Proxy log (last 10 lines) ---"
+    tail -10 "$TMPDIR/proxy.log" 2>/dev/null || echo "(no log)"
     exit 1
 else
     echo "  RESULT: PASS"
