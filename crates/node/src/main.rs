@@ -45,7 +45,7 @@
 //!   PORT                       — HTTP listen port (default: 3001)
 //!   SEALED_KEY_URL             — URL to a sealed key blob (see schemes above)
 //!   EXPECTED_VERIFICATION_SHARE — hex-encoded k_i * G for key verification
-//!   SNP_PROVIDER               — attestation provider: "gcp" or "raw" (default: "raw")
+//!   (attestation uses /dev/sev-guest ioctl automatically)
 
 mod cloud_storage;
 
@@ -354,12 +354,8 @@ async fn run_init_seal(port: &str, upload_url: String) {
     report_data[..32].copy_from_slice(&tls_pubkey_hash);
     // Remaining 32 bytes are zeros
 
-    // Provider selection is now auto-detected (TSM configfs → ioctl fallback).
-    // SNP_PROVIDER env var is kept for backwards compatibility but ignored.
-    let provider = toprf_seal::provider::SnpProvider::DevSevGuest;
-
     info!("init-seal: requesting attestation report with TLS pubkey hash as REPORT_DATA");
-    let report = toprf_seal::provider::get_attestation_report(provider, Some(&report_data))
+    let report = toprf_seal::provider::get_attestation_report(Some(&report_data))
         .await
         .expect("init-seal: failed to get attestation report");
 
@@ -545,7 +541,7 @@ async fn main() {
                 eprintln!("  PORT                        Listen port (default: 3001)");
                 eprintln!("  SEALED_KEY_URL              URL to sealed key blob (gs://, s3://, https://, file://)");
                 eprintln!("  EXPECTED_VERIFICATION_SHARE Hex-encoded k_i * G for key verification");
-                eprintln!("  SNP_PROVIDER                Attestation provider: \"gcp\" or \"raw\" (default: \"raw\")");
+                eprintln!("  (attestation uses /dev/sev-guest ioctl automatically)");
                 eprintln!();
                 eprintln!("When --tls-cert and --tls-key are provided, the node serves HTTPS.");
                 eprintln!("When --client-ca is also provided, clients must present a certificate");
@@ -692,8 +688,7 @@ async fn main() {
                 info!("auto-unseal: v1 blob detected, using HKDF-based unseal (legacy)");
 
                 // Get attestation measurement for v1 unseal
-                let provider = toprf_seal::provider::SnpProvider::DevSevGuest;
-                let report = toprf_seal::provider::get_attestation_report(provider, None)
+                let report = toprf_seal::provider::get_attestation_report(None)
                     .await
                     .expect("failed to get attestation report");
 

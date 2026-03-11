@@ -95,6 +95,23 @@ provision_node() {
         return 1
     fi
 
+    # Create EC2 key pair if it doesn't exist
+    local key_file="${SCRIPT_DIR}/${key_name}.pem"
+    if ! aws ec2 describe-key-pairs --region "$region" --key-names "$key_name" > /dev/null 2>&1; then
+        echo "  Creating EC2 key pair: $key_name..."
+        aws ec2 create-key-pair --region "$region" \
+            --key-name "$key_name" \
+            --key-type ed25519 \
+            --query 'KeyMaterial' --output text > "$key_file"
+        chmod 600 "$key_file"
+        echo "  Key saved to: $key_file"
+    else
+        echo "  Key pair $key_name already exists in $region"
+        if [[ ! -f "$key_file" ]]; then
+            warn "Key pair exists but $key_file not found locally — you may not be able to SSH"
+        fi
+    fi
+
     # Find latest Amazon Linux 2023 AMI
     echo "  Finding latest AL2023 AMI..."
     local ami
@@ -131,6 +148,20 @@ provision_node() {
         --region "$region" \
         --instance-id "$instance_id" \
         --http-put-response-hop-limit 2 > /dev/null
+
+    # Open SSH from the caller's public IP
+    local my_ip sg_id_inst
+    my_ip=$(curl -s https://checkip.amazonaws.com)
+    sg_id_inst=$(aws ec2 describe-instances --region "$region" \
+        --instance-ids "$instance_id" \
+        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text)
+    if [[ -n "$my_ip" && -n "$sg_id_inst" && "$sg_id_inst" != "None" ]]; then
+        echo "  Opening SSH from $my_ip..."
+        aws ec2 authorize-security-group-ingress --region "$region" \
+            --group-id "$sg_id_inst" --protocol tcp --port 22 \
+            --cidr "${my_ip}/32" 2>/dev/null \
+            || warn "SSH rule may already exist"
+    fi
 
     # Attach IAM instance profile if configured
     local iam_profile="${IAM_INSTANCE_PROFILE:-}"

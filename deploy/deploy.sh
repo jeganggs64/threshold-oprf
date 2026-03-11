@@ -41,6 +41,7 @@ Steps (run in order for fresh deployment):
 Utilities:
   auto-config   Auto-populate config.env from AWS
   show-ips      Fetch public/private IPs for all nodes
+  lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → certs
@@ -66,7 +67,7 @@ source "$CONFIG_FILE"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com"
 NODE_IMAGE="${NODE_IMAGE:-ghcr.io/${GHCR_OWNER:-jeganggs64}/toprf-node:latest}"
-PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-toprf/toprf-proxy}:latest"
+PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-ruonid/proxy}:latest"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -130,13 +131,6 @@ node_s3_bucket() {
     esac
 }
 
-node_snp_provider() {
-    case "$1" in
-        1) echo "${NODE1_SNP_PROVIDER:-raw}" ;;
-        2) echo "${NODE2_SNP_PROVIDER:-raw}" ;;
-        3) echo "${NODE3_SNP_PROVIDER:-raw}" ;;
-    esac
-}
 
 sealed_url() {
     local bucket
@@ -459,9 +453,8 @@ step_init_seal() {
     load_ceremony
 
     for i in $(active_nodes); do
-        local ip provider vs url share
+        local ip vs url share
         ip=$(node_ip "$i")
-        provider=$(node_snp_provider "$i")
         vs=$(node_vs "$i")
         url=$(sealed_url "$i")
         share="${NODE_SHARES_DIR}/node-${i}-share.json"
@@ -474,21 +467,9 @@ step_init_seal() {
         # Clean up any previous init-seal container
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
-        # Detect SEV-SNP hardware interfaces
-        local dev_flags=""
-        if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
-            dev_flags="--device /dev/sev-guest:/dev/sev-guest"
-        fi
-        local tsm_flags=""
-        if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
-            tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
-        fi
-
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
-            -e SNP_PROVIDER=${provider} \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
-            ${tsm_flags} \
-            ${dev_flags} \
+            --device /dev/sev-guest:/dev/sev-guest \
             --privileged --user root \
             -p 3001:3001 \
             ${NODE_IMAGE} \
@@ -575,9 +556,8 @@ step_start() {
     load_ceremony
 
     for i in $(active_nodes); do
-        local ip provider vs url
+        local ip vs url
         ip=$(node_ip "$i")
-        provider=$(node_snp_provider "$i")
         vs=$(node_vs "$i")
         url=$(sealed_url "$i")
 
@@ -585,22 +565,10 @@ step_start() {
 
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
 
-        # Detect SEV-SNP hardware interfaces
-        local dev_flags=""
-        if ssh_node "$i" "test -e /dev/sev-guest" < /dev/null 2>/dev/null; then
-            dev_flags="--device /dev/sev-guest:/dev/sev-guest"
-        fi
-        local tsm_flags=""
-        if ssh_node "$i" "test -d /sys/kernel/config/tsm/report" < /dev/null 2>/dev/null; then
-            tsm_flags="-e TSM_REPORT_PATH=/run/tsm/report -v /sys/kernel/config/tsm/report:/run/tsm/report"
-        fi
-
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
-            -e SNP_PROVIDER=${provider} \
-            ${tsm_flags} \
-            ${dev_flags} \
+            --device /dev/sev-guest:/dev/sev-guest \
             --privileged --user root \
             -v /etc/toprf/certs:/etc/toprf/certs:ro \
             -p 3001:3001 \
@@ -803,7 +771,50 @@ step_auto_config() {
     echo "  Done. Review config.env and fill in any remaining empty fields."
 }
 
-# ─── 13. Redeploy ────────────────────────────────────────────────────────────
+# ─── 13. Lock nodes (remove SSH access) ──────────────────────────────────────
+
+step_lock() {
+    echo ""
+    info "Locking nodes — removing SSH access"
+    echo ""
+    echo "  WARNING: This will permanently remove SSH access to all nodes."
+    echo "  You will NOT be able to SSH in again. If a node fails, reprovision it."
+    echo ""
+    echo "  Press Enter to confirm, or Ctrl-C to abort:"
+    read -r _ < /dev/tty
+
+    for i in $(active_nodes); do
+        local ip region key_name
+        ip=$(node_ip "$i")
+        region=$(node_region "$i")
+        key_name=$(node_key_name "$i")
+        echo "  Node $i ($ip)..."
+
+        # Remove SSH authorized keys and disable sshd
+        ssh_node "$i" "sudo rm -f /home/ec2-user/.ssh/authorized_keys && \
+            sudo systemctl stop sshd && \
+            sudo systemctl disable sshd" < /dev/null || warn "Failed to lock node $i"
+
+        # Delete the EC2 key pair from AWS
+        aws ec2 delete-key-pair --region "$region" --key-name "$key_name" 2>/dev/null \
+            || warn "Could not delete key pair $key_name in $region"
+
+        # Delete the local .pem file
+        local key_file="${SCRIPT_DIR}/${key_name}.pem"
+        if [[ -f "$key_file" ]]; then
+            rm -f "$key_file"
+            echo "    Deleted: $key_file"
+        fi
+
+        echo "    Locked."
+    done
+
+    echo ""
+    echo "  All nodes locked. SSH access removed."
+    echo "  Nodes are now only reachable via port 3001 from the proxy VPC."
+}
+
+# ─── 14. Redeploy ────────────────────────────────────────────────────────────
 
 step_redeploy() {
     echo ""
@@ -842,6 +853,7 @@ Steps (run in order for fresh deployment):
 Utilities:
   auto-config   Auto-populate config.env from AWS
   show-ips      Fetch public/private IPs for all nodes
+  lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → certs
@@ -896,6 +908,7 @@ for step in "${steps[@]}"; do
         auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
         redeploy)     step_redeploy ;;
+        lock)         step_lock ;;
         pre-seal)
             step_setup_vms
             step_pull

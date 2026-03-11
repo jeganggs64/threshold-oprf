@@ -1,6 +1,6 @@
 //! CLI tool to capture the measurement from a running SEV-SNP VM.
 //!
-//! Usage: toprf-measure [--provider gcp|raw] [--json]
+//! Usage: toprf-measure [--json]
 //!
 //! Fetches an AMD SEV-SNP attestation report and prints the MEASUREMENT
 //! and POLICY fields.
@@ -8,7 +8,7 @@
 use std::env;
 use std::process;
 
-use toprf_seal::provider::{get_attestation_report, SnpProvider};
+use toprf_seal::provider::get_attestation_report;
 
 fn print_help() {
     eprintln!("Usage: toprf-measure [OPTIONS]");
@@ -17,7 +17,6 @@ fn print_help() {
     eprintln!("and POLICY fields.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --provider <gcp|raw>  Attestation provider (default: raw)");
     eprintln!("  --json                Output as JSON");
     eprintln!("  --help                Show this help");
 }
@@ -28,16 +27,11 @@ async fn main() {
 
     let args: Vec<String> = env::args().collect();
 
-    let provider = SnpProvider::DevSevGuest;
     let mut json_output = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--provider" => {
-                // Kept for backwards compatibility; value is ignored (auto-detected).
-                i += 1;
-            }
             "--json" => {
                 json_output = true;
             }
@@ -55,7 +49,7 @@ async fn main() {
         i += 1;
     }
 
-    let report = match get_attestation_report(provider, None).await {
+    let report = match get_attestation_report(None).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: failed to get attestation report: {e}");

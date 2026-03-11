@@ -1,4 +1,4 @@
-#![allow(deprecated)] // aes-gcm uses old generic-array with deprecated from_slice/as_slice
+#![allow(deprecated)] // aes-gcm uses generic-array with deprecated from_slice/as_slice
 
 pub mod attestation;
 pub mod error;
