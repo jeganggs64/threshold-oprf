@@ -36,7 +36,7 @@ crates/
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
   monitor/    Maintenance event monitor with webhook alerts
 docker/       Dockerfiles, docker-compose, SEV-SNP config
-deploy/       Deployment automation scripts (deploy.sh, setup-ecs.sh)
+deploy/       Deployment automation (provision.sh, deploy.sh, setup-ecs.sh)
 scripts/      Dev utilities (gen-certs.sh, integration-test.sh)
 ```
 
@@ -114,21 +114,32 @@ Three TEE VMs (one per AWS region) run the node binary. An ECS Fargate service r
 
 ### Prerequisites
 
-- 3 AWS SEV-SNP instances provisioned (c6a.large or m6a.large) across regions
-- IAM instance profiles attached with S3 access
-- SSH access to all 3 VMs
 - `aws` CLI authenticated locally
 - `jq`, `openssl`, `curl` installed locally
+- SSH key pairs created in each AWS region
 - Key ceremony completed
+
+### VM Provisioning (`deploy/provision.sh`)
+
+Provisions Amazon Linux 2023 instances with AMD SEV-SNP across 3 AWS regions. Nodes can be provisioned individually.
+
+```bash
+cd deploy
+cp config.env.example config.env
+# Fill in KEY_NAMEs, SSH_KEYs, S3_BUCKETs, IAM_INSTANCE_PROFILE
+
+./provision.sh 1          # Provision node 1 (ap-southeast-1)
+./provision.sh 2          # Provision node 2 (us-east-1)
+./provision.sh 3          # Provision node 3 (eu-west-1)
+./provision.sh all        # Or all at once
+```
 
 ### TEE Node Deployment (`deploy/deploy.sh`)
 
 Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates TLS certs, handles init-seal key injection, and starts nodes.
 
 ```bash
-cd deploy
-cp config.env.example config.env
-# Fill in the [manual] fields, then auto-populate the rest:
+# Auto-populate IPs, SGs, VPC IDs from provisioned VMs:
 ./deploy.sh auto-config
 
 ./deploy.sh all           # Full deployment
@@ -187,7 +198,10 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
        --output-dir ./node-shares-v2
    ```
 
-2. **Provision 3 new VMs** across AWS regions.
+2. **Provision 3 new VMs**:
+   ```bash
+   ./provision.sh all
+   ```
 
 3. **Update `deploy/config.env`** with the new VM IPs and `NODE_SHARES_DIR=./node-shares-v2`. Run `./deploy.sh auto-config` to fill in IPs automatically.
 
@@ -209,7 +223,10 @@ Key rotation deploys to fresh nodes rather than resealing existing ones. The old
    ```
    Traffic switches to new nodes instantly on ECS redeploy.
 
-7. **Decommission old VMs** and delete their sealed blobs from S3.
+7. **Decommission old VMs**:
+   ```bash
+   ./provision.sh all --terminate
+   ```
 
 ## Security Properties
 
