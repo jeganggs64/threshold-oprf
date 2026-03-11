@@ -54,7 +54,7 @@ jobs:
       - name: Run integration tests
         run: bash scripts/integration-test.sh
 
-  docker:
+  docker-node:
     name: Build & Push Node Image
     needs: [check, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -77,3 +77,27 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/toprf-node:latest
             ghcr.io/${{ github.repository_owner }}/toprf-node:${{ github.sha }}
+
+  docker-proxy:
+    name: Build & Push Proxy Image
+    needs: [check, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_ROLE_ARN }}
+          aws-region: eu-west-2
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.proxy
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/ruonid/proxy:latest
+            ${{ steps.ecr.outputs.registry }}/ruonid/proxy:${{ github.sha }}
