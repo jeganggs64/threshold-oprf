@@ -36,7 +36,8 @@ Steps (run in order for fresh deployment):
   firewall      Allow port 3001 from proxy VPC CIDR to each node
   peering       Set up VPC peering between proxy and node VPCs
   proxy-config  Generate docker/proxy-config.production.json
-  verify        Health check all nodes
+  verify        Health check all nodes (via SSH)
+  e2e           End-to-end verify: nodes + proxy + OPRF evaluate
 
 Utilities:
   auto-config   Auto-populate config.env from AWS
@@ -374,64 +375,124 @@ step_peering() {
     local proxy_vpc_id="${VPC_ID:?VPC_ID not found in ecs-state.env}"
     local proxy_priv_rt="${PRIV_RT:?PRIV_RT not found in ecs-state.env}"
 
+    # Track which VPCs we've already peered (bash 3 compatible)
+    local peered_vpcs=""
+
     for i in $(active_nodes); do
-        local region vpc_id
+        local region vpc_id private_ip
         region=$(node_region "$i")
         vpc_id=$(node_vpc_id "$i")
+        private_ip=$(node_private_ip "$i")
 
         [[ -n "$vpc_id" ]] || die "NODE${i}_VPC_ID not set in config.env"
 
-        # Skip if node is in the same VPC (shouldn't happen but guard)
         if [[ "$vpc_id" == "$proxy_vpc_id" ]]; then
             echo "  Node $i: same VPC as proxy, skipping peering"
             continue
         fi
 
-        echo "  Node $i: Peering $vpc_id ($region) ↔ $proxy_vpc_id ($PROXY_REGION)..."
+        # --- Peering (once per unique VPC) ---
+        local peering_id=""
+        local already_peered=false
+        if echo "$peered_vpcs" | grep -q "$vpc_id"; then
+            already_peered=true
+        fi
 
-        # Create peering connection (from proxy region)
-        local peering_id
-        peering_id=$(aws ec2 create-vpc-peering-connection \
+        # Check for existing active/pending peering
+        local existing_peering
+        existing_peering=$(aws ec2 describe-vpc-peering-connections \
             --region "$PROXY_REGION" \
-            --vpc-id "$proxy_vpc_id" \
-            --peer-vpc-id "$vpc_id" \
-            --peer-region "$region" \
-            --query 'VpcPeeringConnection.VpcPeeringConnectionId' --output text 2>/dev/null) \
-            || { warn "peering may already exist for node $i"; continue; }
+            --filters "Name=requester-vpc-info.vpc-id,Values=$proxy_vpc_id" \
+                      "Name=accepter-vpc-info.vpc-id,Values=$vpc_id" \
+                      "Name=status-code,Values=active,pending-acceptance" \
+            --query 'VpcPeeringConnections[0].VpcPeeringConnectionId' --output text 2>/dev/null)
 
-        echo "    Peering: $peering_id"
+        if [[ -n "$existing_peering" && "$existing_peering" != "None" ]]; then
+            peering_id="$existing_peering"
+            if [[ "$already_peered" == "false" ]]; then
+                echo "  Node $i: Using existing peering $peering_id for $vpc_id ($region)"
+            fi
+        elif [[ "$already_peered" == "false" ]]; then
+            echo "  Node $i: Peering $vpc_id ($region) ↔ $proxy_vpc_id ($PROXY_REGION)..."
+            peering_id=$(aws ec2 create-vpc-peering-connection \
+                --region "$PROXY_REGION" \
+                --vpc-id "$proxy_vpc_id" \
+                --peer-vpc-id "$vpc_id" \
+                --peer-region "$region" \
+                --query 'VpcPeeringConnection.VpcPeeringConnectionId' --output text)
+            echo "    Created: $peering_id"
+        fi
 
-        # Accept peering (from node's region)
-        aws ec2 accept-vpc-peering-connection \
-            --region "$region" \
-            --vpc-peering-connection-id "$peering_id" > /dev/null
-        echo "    Accepted."
+        [[ -n "$peering_id" ]] || { warn "No peering found for node $i"; continue; }
 
-        # Get node VPC CIDR
-        local node_cidr
-        node_cidr=$(aws ec2 describe-vpcs --region "$region" \
-            --vpc-ids "$vpc_id" \
-            --query 'Vpcs[0].CidrBlock' --output text)
+        # Accept if pending (once per VPC)
+        if [[ "$already_peered" == "false" ]]; then
+            local status
+            status=$(aws ec2 describe-vpc-peering-connections \
+                --region "$PROXY_REGION" \
+                --vpc-peering-connection-ids "$peering_id" \
+                --query 'VpcPeeringConnections[0].Status.Code' --output text 2>/dev/null)
 
-        # Route: proxy private subnets → node VPC via peering
+            if [[ "$status" == "pending-acceptance" ]]; then
+                echo "    Waiting for peering to propagate to $region..."
+                local attempts=0
+                while ! aws ec2 describe-vpc-peering-connections \
+                        --region "$region" \
+                        --vpc-peering-connection-ids "$peering_id" > /dev/null 2>&1; do
+                    attempts=$((attempts + 1))
+                    if [[ $attempts -ge 12 ]]; then
+                        die "Peering $peering_id not visible in $region after 60s"
+                    fi
+                    sleep 5
+                done
+                aws ec2 accept-vpc-peering-connection \
+                    --region "$region" \
+                    --vpc-peering-connection-id "$peering_id" > /dev/null
+                echo "    Accepted."
+            elif [[ "$status" == "active" ]]; then
+                echo "    Already active."
+            fi
+
+            # Reverse route: node VPC → proxy VPC
+            local node_rt
+            node_rt=$(aws ec2 describe-route-tables --region "$region" \
+                --filters "Name=vpc-id,Values=$vpc_id" "Name=association.main,Values=true" \
+                --query 'RouteTables[0].RouteTableId' --output text)
+            aws ec2 create-route --region "$region" \
+                --route-table-id "$node_rt" \
+                --destination-cidr-block "$PROXY_VPC_CIDR" \
+                --vpc-peering-connection-id "$peering_id" 2>/dev/null \
+                || warn "node → proxy route may exist"
+
+            peered_vpcs="${peered_vpcs} ${vpc_id}"
+        fi
+
+        # --- Subnet-specific proxy→node route (per node) ---
+        # Multiple node VPCs may share the same top-level CIDR (e.g. default
+        # VPCs all use 172.31.0.0/16), so we route the specific subnet
+        # containing each node's private IP to the correct peering.
+        local subnet_id subnet_cidr
+        subnet_id=$(aws ec2 describe-instances --region "$region" \
+            --filters "Name=tag:Name,Values=toprf-node-${i}" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].SubnetId' --output text 2>/dev/null)
+        if [[ -n "$subnet_id" && "$subnet_id" != "None" ]]; then
+            subnet_cidr=$(aws ec2 describe-subnets --region "$region" \
+                --subnet-ids "$subnet_id" \
+                --query 'Subnets[0].CidrBlock' --output text 2>/dev/null)
+        fi
+
+        if [[ -z "$subnet_cidr" || "$subnet_cidr" == "None" ]]; then
+            warn "Could not determine subnet CIDR for node $i ($private_ip)"
+            continue
+        fi
+
+        echo "    Node $i ($private_ip): route $subnet_cidr → $peering_id"
         aws ec2 create-route --region "$PROXY_REGION" \
             --route-table-id "$proxy_priv_rt" \
-            --destination-cidr-block "$node_cidr" \
+            --destination-cidr-block "$subnet_cidr" \
             --vpc-peering-connection-id "$peering_id" 2>/dev/null \
-            || warn "proxy → node route may exist"
-
-        # Route: node VPC → proxy VPC via peering
-        local node_rt
-        node_rt=$(aws ec2 describe-route-tables --region "$region" \
-            --filters "Name=vpc-id,Values=$vpc_id" \
-            --query 'RouteTables[0].RouteTableId' --output text)
-        aws ec2 create-route --region "$region" \
-            --route-table-id "$node_rt" \
-            --destination-cidr-block "$PROXY_VPC_CIDR" \
-            --vpc-peering-connection-id "$peering_id" 2>/dev/null \
-            || warn "node → proxy route may exist"
-
-        echo "    Routes: proxy ↔ $node_cidr"
+            || warn "proxy → node $i subnet route may exist"
     done
 
     echo "  Done."
@@ -645,10 +706,9 @@ step_verify() {
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
 
+        # Health check via SSH (port 3001 is not open from local machine)
         local resp
-        resp=$(curl -sk --connect-timeout 5 \
-            --cacert "$certs_dir/ca/ca.pem" \
-            "https://${ip}:3001/health" 2>&1) || true
+        resp=$(ssh_node "$i" "curl -sk --connect-timeout 5 https://localhost:3001/health 2>&1" < /dev/null) || true
 
         if echo "$resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
             echo "    PASS: ready"
@@ -668,6 +728,100 @@ step_verify() {
         echo "    ssh → sudo docker logs toprf-node"
         echo "    ssh → sudo docker ps -a"
         return 1
+    fi
+}
+
+# ─── 10b. End-to-end verify ──────────────────────────────────────────────────
+
+step_e2e() {
+    echo ""
+    info "End-to-end verification"
+
+    local domain="${DOMAIN:?DOMAIN not set in config.env}"
+    local pass=0 fail=0 total=0
+
+    # 1. Node health (via SSH)
+    echo ""
+    echo "  [1/3] Node health (via SSH)"
+    for i in $(active_nodes); do
+        local ip
+        ip=$(node_ip "$i")
+        total=$((total + 1))
+
+        local resp
+        resp=$(ssh_node "$i" "curl -sk --connect-timeout 5 https://localhost:3001/health 2>&1" < /dev/null) || true
+
+        if echo "$resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
+            echo "    Node $i ($ip): PASS"
+            pass=$((pass + 1))
+        else
+            echo "    Node $i ($ip): FAIL — $resp"
+            fail=$((fail + 1))
+        fi
+    done
+
+    # 2. Proxy health (via ALB / domain)
+    echo ""
+    echo "  [2/3] Proxy health (https://${domain})"
+    total=$((total + 1))
+
+    local proxy_resp
+    proxy_resp=$(curl -s --connect-timeout 10 "https://${domain}/health" 2>&1) || true
+
+    if echo "$proxy_resp" | jq -e '.status' > /dev/null 2>&1; then
+        local proxy_status node_count
+        proxy_status=$(echo "$proxy_resp" | jq -r '.status')
+        node_count=$(echo "$proxy_resp" | jq -r '.nodes_reachable // empty')
+        echo "    Proxy: PASS (status=$proxy_status, nodes_reachable=${node_count:-?})"
+        pass=$((pass + 1))
+    else
+        echo "    Proxy: FAIL — $proxy_resp"
+        fail=$((fail + 1))
+    fi
+
+    # 3. OPRF evaluate (test round-trip through proxy → nodes)
+    echo ""
+    echo "  [3/3] OPRF evaluate (test request)"
+    total=$((total + 1))
+
+    # Generate a random 32-byte blinded element (hex-encoded)
+    local test_input
+    test_input=$(openssl rand -hex 32)
+
+    local eval_resp
+    eval_resp=$(curl -s --connect-timeout 10 \
+        -X POST "https://${domain}/oprf/evaluate" \
+        -H "Content-Type: application/json" \
+        -d "{\"blinded_element\":\"${test_input}\"}" 2>&1) || true
+
+    if echo "$eval_resp" | jq -e '.evaluated_element' > /dev/null 2>&1; then
+        echo "    Evaluate: PASS"
+        pass=$((pass + 1))
+    elif echo "$eval_resp" | jq -e '.error' > /dev/null 2>&1; then
+        local err
+        err=$(echo "$eval_resp" | jq -r '.error')
+        echo "    Evaluate: FAIL — $err"
+        echo "    (This is expected if the input isn't a valid curve point)"
+        fail=$((fail + 1))
+    else
+        echo "    Evaluate: FAIL — $eval_resp"
+        fail=$((fail + 1))
+    fi
+
+    # Summary
+    echo ""
+    echo "  ────────────────────────────────"
+    echo "  Results: $pass/$total passed, $fail failed"
+
+    if [[ $fail -gt 0 ]]; then
+        echo ""
+        echo "  Troubleshooting:"
+        echo "    Nodes:  ssh → sudo docker logs toprf-node"
+        echo "    Proxy:  ./setup-ecs.sh status"
+        echo "    Logs:   aws logs tail /ecs/ruonid --region eu-west-2 --since 10m"
+        return 1
+    else
+        echo "  All checks passed."
     fi
 }
 
@@ -848,7 +1002,8 @@ Steps (run in order for fresh deployment):
   firewall      Allow port 3001 from proxy VPC CIDR to each node
   peering       Set up VPC peering between proxy and node VPCs
   proxy-config  Generate docker/proxy-config.production.json
-  verify        Health check all nodes
+  verify        Health check all nodes (via SSH)
+  e2e           End-to-end verify: nodes + proxy + OPRF evaluate
 
 Utilities:
   auto-config   Auto-populate config.env from AWS
@@ -905,6 +1060,7 @@ for step in "${steps[@]}"; do
         start)        step_start ;;
         proxy-config) step_proxy_config ;;
         verify)       step_verify ;;
+        e2e)          step_e2e ;;
         auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
         redeploy)     step_redeploy ;;

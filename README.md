@@ -126,7 +126,8 @@ Provisions Amazon Linux 2023 instances with AMD SEV-SNP across 3 AWS regions. No
 ```bash
 cd deploy
 cp config.env.example config.env
-# Fill in KEY_NAMEs, SSH_KEYs, S3_BUCKETs, IAM_INSTANCE_PROFILE
+# Fill in KEY_NAMEs, SSH_KEYs, S3_BUCKETs
+# IAM_INSTANCE_PROFILE is auto-created by provision.sh
 
 ./provision.sh 1          # Provision node 1 (ap-southeast-1)
 ./provision.sh 2          # Provision node 2 (us-east-1)
@@ -154,7 +155,8 @@ Pulls the node image from ghcr.io (built by CI), creates S3 buckets, generates T
 ./deploy.sh firewall       # Allow port 3001 from proxy VPC CIDR
 ./deploy.sh peering        # Set up VPC peering (proxy ↔ node VPCs)
 ./deploy.sh proxy-config   # Generate proxy-config.production.json
-./deploy.sh verify         # Health check all nodes
+./deploy.sh verify         # Health check all nodes (via SSH)
+./deploy.sh e2e            # End-to-end: nodes + proxy + OPRF evaluate
 
 # Utilities
 ./deploy.sh show-ips       # Fetch VM IPs from all regions
