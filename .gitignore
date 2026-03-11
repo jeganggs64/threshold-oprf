@@ -17,6 +17,11 @@ node-shares/
 .env.*
 deploy/config.env
 deploy/ecs-state.env
+deploy/privatelink-state.env
+
+# Generated configs
+deploy/coordinator-configs/
+docker/coordinator-node-*.json
 
 # Private keys
 *.key

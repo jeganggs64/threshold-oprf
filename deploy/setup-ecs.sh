@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-# setup-ecs.sh — Provision ECS Fargate + ALB for the API + TOPRF proxy.
+# setup-ecs.sh — Provision ECS Fargate + ALB for the API server.
 #
 # Creates:
 #   - VPC with public/private subnets + NAT Gateway (stable outbound IP)
 #   - ALB with HTTP listener (HTTPS added after ACM cert validation)
 #   - ECS Fargate cluster, task definition, service
-#   - S3 bucket for proxy config + certs (pulled by init container at startup)
 #   - IAM roles for task execution and runtime
 #   - ACM certificate request for ${DOMAIN}
 #
 # Architecture:
 #   Internet → ALB (port 443) → ECS Task:
-#     - api-server (Express, port 3002) → TOPRF proxy (Rust, port 3000)
-#     - config-init container pulls proxy-config.json + certs from S3
-#   ECS Task → NAT Gateway (stable EIP) → TEE nodes on port 3001
+#     - api-server (Express, port 3002)
+#
+# OPRF evaluation is handled directly by the TEE nodes (node-as-coordinator).
+# Clients reach nodes via API Gateway → NLB → Node.
 #
 # Usage:
 #   ./setup-ecs.sh              # Run all steps
 #   ./setup-ecs.sh vpc          # Run specific step
-#   ./setup-ecs.sh upload-config # Upload proxy config + certs to S3
 #
 # Prerequisites:
 #   - AWS CLI authenticated with admin-level access
@@ -55,8 +54,6 @@ AZ_2="${REGION}b"
 
 ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 API_IMAGE="${ECR_URI}/${API_ECR_REPO:-ruonid/frontend}:latest"
-PROXY_IMAGE="${ECR_URI}/${PROXY_ECR_REPO:-ruonid/proxy}:latest"
-CONFIG_BUCKET="${ECS_CONFIG_BUCKET:-${CLUSTER_NAME}-ecs-config}"
 
 # State file — tracks created resource IDs for idempotency
 STATE_FILE="${SCRIPT_DIR}/ecs-state.env"
@@ -429,7 +426,7 @@ step_roles() {
     info "Creating IAM roles"
     load_state
 
-    # Task execution role (ECR pull, CloudWatch logs, S3 config)
+    # Task execution role (ECR pull, CloudWatch logs)
     if [[ -z "${EXEC_ROLE_ARN:-}" ]]; then
         EXEC_ROLE_ARN=$(aws iam create-role --role-name ${PROJECT}-ecs-exec \
             --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}' \
@@ -440,11 +437,6 @@ step_roles() {
 
         aws iam attach-role-policy --role-name ${PROJECT}-ecs-exec \
             --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy 2>/dev/null || true
-
-        # S3 access for init container to pull config
-        aws iam put-role-policy --role-name ${PROJECT}-ecs-exec \
-            --policy-name s3-config-access \
-            --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":\"arn:aws:s3:::${CONFIG_BUCKET}/*\"}]}"
 
         echo "  Execution role: $EXEC_ROLE_ARN"
     else
@@ -462,7 +454,7 @@ step_roles() {
 
         aws iam put-role-policy --role-name ${PROJECT}-ecs-task \
             --policy-name ${PROJECT}-runtime \
-            --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\",\"dynamodb:Query\",\"dynamodb:DeleteItem\"],\"Resource\":\"arn:aws:dynamodb:${REGION}:${AWS_ACCOUNT_ID}:table/${PROJECT}-*\"},{\"Effect\":\"Allow\",\"Action\":[\"kms:Sign\",\"kms:Verify\",\"kms:GetPublicKey\"],\"Resource\":\"arn:aws:kms:${REGION}:${AWS_ACCOUNT_ID}:key/*\"},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":\"arn:aws:s3:::${CONFIG_BUCKET}/*\"}]}"
+            --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"dynamodb:GetItem\",\"dynamodb:PutItem\",\"dynamodb:UpdateItem\",\"dynamodb:Query\",\"dynamodb:DeleteItem\"],\"Resource\":\"arn:aws:dynamodb:${REGION}:${AWS_ACCOUNT_ID}:table/${PROJECT}-*\"},{\"Effect\":\"Allow\",\"Action\":[\"kms:Sign\",\"kms:Verify\",\"kms:GetPublicKey\"],\"Resource\":\"arn:aws:kms:${REGION}:${AWS_ACCOUNT_ID}:key/*\"}]}"
 
         echo "  Task role: $TASK_ROLE_ARN"
     else
@@ -472,51 +464,7 @@ step_roles() {
     echo "  Done."
 }
 
-# ─── 7. S3 Config Bucket ────────────────────────────────────────────────────
-
-step_config_bucket() {
-    echo ""
-    info "Creating S3 config bucket"
-    load_state
-
-    aws s3 mb "s3://${CONFIG_BUCKET}" --region "$REGION" 2>/dev/null \
-        || warn "bucket may already exist"
-    aws s3api put-public-access-block --region "$REGION" \
-        --bucket "$CONFIG_BUCKET" \
-        --public-access-block-configuration \
-        'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
-
-    echo "  Bucket: s3://${CONFIG_BUCKET}"
-    echo "  Run './setup-ecs.sh upload-config' to upload proxy config + certs."
-    echo "  Done."
-}
-
-# ─── 8. Upload proxy config + certs to S3 ───────────────────────────────────
-
-step_upload_config() {
-    echo ""
-    info "Uploading proxy config + certs to S3"
-
-    local proxy_config="$REPO_ROOT/docker/proxy-config.production.json"
-    local certs_dir="$REPO_ROOT/certs"
-
-    if [[ ! -f "$proxy_config" ]]; then
-        die "proxy-config.production.json not found. Run './deploy.sh proxy-config' first."
-    fi
-    if [[ ! -f "$certs_dir/ca/ca.pem" ]]; then
-        die "certs/ca/ca.pem not found. Run './deploy.sh certs' first."
-    fi
-
-    aws s3 cp "$proxy_config" "s3://${CONFIG_BUCKET}/proxy-config.json" --region "$REGION"
-    aws s3 cp "$certs_dir/ca/ca.pem" "s3://${CONFIG_BUCKET}/certs/ca/ca.pem" --region "$REGION"
-
-    echo "  Uploaded:"
-    echo "    s3://${CONFIG_BUCKET}/proxy-config.json"
-    echo "    s3://${CONFIG_BUCKET}/certs/ca/ca.pem"
-    echo "  Done."
-}
-
-# ─── 9. ECR Repo for API Server ─────────────────────────────────────────────
+# ─── 7. ECR Repo for API Server ──────────────────────────────────────────────
 
 step_ecr() {
     echo ""
@@ -585,56 +533,15 @@ step_task() {
   "family": "${SERVICE_NAME}",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "512",
-  "memory": "1024",
+  "cpu": "256",
+  "memory": "512",
   "executionRoleArn": "${EXEC_ROLE_ARN}",
   "taskRoleArn": "${TASK_ROLE_ARN}",
   "containerDefinitions": [
     {
-      "name": "config-init",
-      "image": "amazon/aws-cli:latest",
-      "essential": false,
-      "entryPoint": ["sh", "-c"],
-      "command": ["mkdir -p /config/certs/ca && aws s3 cp s3://${CONFIG_BUCKET}/proxy-config.json /config/proxy-config.json && aws s3 cp s3://${CONFIG_BUCKET}/certs/ca/ca.pem /config/certs/ca/ca.pem"],
-      "mountPoints": [{"sourceVolume": "config", "containerPath": "/config"}],
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/${CLUSTER_NAME}",
-          "awslogs-region": "${REGION}",
-          "awslogs-stream-prefix": "config-init"
-        }
-      }
-    },
-    {
-      "name": "toprf-proxy",
-      "image": "${PROXY_IMAGE}",
-      "essential": true,
-      "dependsOn": [{"containerName": "config-init", "condition": "SUCCESS"}],
-      "command": ["--config", "/etc/toprf/proxy-config.json", "--port", "3000"],
-      "mountPoints": [{"sourceVolume": "config", "containerPath": "/etc/toprf"}],
-      "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
-      "healthCheck": {
-        "command": ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"],
-        "interval": 10,
-        "timeout": 5,
-        "startPeriod": 10,
-        "retries": 3
-      },
-      "logConfiguration": {
-        "logDriver": "awslogs",
-        "options": {
-          "awslogs-group": "/ecs/${CLUSTER_NAME}",
-          "awslogs-region": "${REGION}",
-          "awslogs-stream-prefix": "toprf-proxy"
-        }
-      }
-    },
-    {
       "name": "api-server",
       "image": "${API_IMAGE}",
       "essential": true,
-      "dependsOn": [{"containerName": "toprf-proxy", "condition": "HEALTHY"}],
       "portMappings": [{"containerPort": 3002, "protocol": "tcp"}],
       "environment": [
         {"name": "PORT", "value": "3002"},
@@ -646,7 +553,6 @@ step_task() {
         {"name": "APPLE_TEAM_ID", "value": "${APPLE_TEAM_ID:-}"},
         {"name": "APPLE_APP_ATTEST_ENV", "value": "${APPLE_APP_ATTEST_ENV:-production}"},
         {"name": "REDIS_URL", "value": "${REDIS_URL:-}"},
-        {"name": "TOPRF_PROXY_URL", "value": "http://localhost:3000"},
         {"name": "DEVELOPERS_TABLE", "value": "${DEVELOPERS_TABLE:-developers}"},
         {"name": "BILLING_TABLE", "value": "${BILLING_TABLE:-billing-events}"},
         {"name": "PRODUCTION_REQUESTS_TABLE", "value": "${PRODUCTION_REQUESTS_TABLE:-production-requests}"},
@@ -670,11 +576,6 @@ step_task() {
           "awslogs-stream-prefix": "api-server"
         }
       }
-    }
-  ],
-  "volumes": [
-    {
-      "name": "config"
     }
   ]
 }
@@ -817,10 +718,7 @@ step_status() {
     echo ""
 
     if [[ -n "${NAT_EIP:-}" ]]; then
-        echo "  ┌──────────────────────────────────────────────┐"
-        echo "  │  PROXY_IP=${NAT_EIP}  │"
-        echo "  │  Add this to deploy/config.env                │"
-        echo "  └──────────────────────────────────────────────┘"
+        echo "  NAT EIP: $NAT_EIP"
         echo ""
     fi
 
@@ -850,9 +748,8 @@ Infrastructure (run once, in order):
   vpc             VPC, subnets, IGW, NAT Gateway, route tables
   security        Security groups (ALB + ECS)
   alb             Application Load Balancer + target group
-  cert            Request ACM certificate for \${DOMAIN}
+  cert            Request ACM certificate for ${DOMAIN}
   roles           IAM roles (task execution + task runtime)
-  config-bucket   S3 bucket for proxy config + certs
   ecr             ECR repo for api-server image
   cluster         ECS Fargate cluster
   task            Register task definition
@@ -863,7 +760,6 @@ After cert validation:
   add-https       Add HTTPS listener + HTTP→HTTPS redirect
 
 Operations:
-  upload-config   Upload proxy-config.json + certs to S3
   status          Show resource IDs, NAT EIP, service health
 
 Shortcuts:
@@ -889,8 +785,6 @@ for step in "$@"; do
         cert)           step_cert ;;
         add-https)      step_add_https ;;
         roles)          step_roles ;;
-        config-bucket)  step_config_bucket ;;
-        upload-config)  step_upload_config ;;
         ecr)            step_ecr ;;
         cluster)        step_cluster ;;
         task)           step_task ;;
@@ -914,7 +808,6 @@ for step in "$@"; do
             step_alb
             step_cert
             step_roles
-            step_config_bucket
             step_ecr
             step_cluster
             step_task
