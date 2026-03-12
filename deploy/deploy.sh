@@ -31,9 +31,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Show help without requiring config
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
     cat <<'EOF'
-Usage: deploy.sh [--nodes 1,2,3] <step> [step...]
+Usage: deploy.sh [--slot NAME] [--nodes 1,2,3] <step> [step...]
 
 Options:
+  --slot NAME   Blue-green slot name (e.g., blue, green). Resources are
+                named and tagged with this slot for zero-downtime rotation.
   --nodes N     Operate on specific node(s) only (comma-separated)
 
 Steps (run in order for fresh deployment):
@@ -47,6 +49,10 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
 
+Blue-green:
+  cutover       Update Lambda NLB_URL to this slot's coordinator NLB
+  teardown      Delete all AWS resources tagged with this slot
+
 Utilities:
   auto-config   Auto-populate config.env from AWS
   show-ips      Fetch public/private IPs for all nodes
@@ -57,6 +63,12 @@ Shortcuts:
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
+
+Blue-green example:
+  SLOT=green ./provision.sh all           # Provision new VMs
+  ./deploy.sh --slot green all            # Deploy new set
+  ./deploy.sh --slot green cutover        # Switch traffic
+  ./deploy.sh --slot blue teardown        # Tear down old set
 EOF
     exit 0
 fi
@@ -75,6 +87,29 @@ source "$CONFIG_FILE"
 # ─── Derived values ──────────────────────────────────────────────────────────
 
 NODE_IMAGE="${NODE_IMAGE:-ghcr.io/${GHCR_OWNER:-jeganggs64}/toprf-node:latest}"
+
+# ─── Slot system (blue-green deployments) ─────────────────────────────────────
+# Set via --slot flag. When set, resource names and state files are slot-scoped.
+# Resources are tagged with Slot=<slot> for discovery during teardown.
+
+SLOT="${SLOT:-}"
+
+slot_suffix()    { [[ -n "$SLOT" ]] && echo "-${SLOT}" || echo ""; }
+vm_tag()         { echo "toprf-node-${1}$(slot_suffix)"; }
+nlb_name()       { echo "toprf-node-${1}$(slot_suffix)-nlb"; }
+tg_name()        { echo "toprf-node-${1}$(slot_suffix)-tg"; }
+vpce_sg_name()   { echo "toprf-privatelink-vpce-${1}$(slot_suffix)"; }
+pl_state_file()  { [[ -n "$SLOT" ]] && echo "${SCRIPT_DIR}/privatelink-state-${SLOT}.env" || echo "${SCRIPT_DIR}/privatelink-state.env"; }
+coord_config_dir() { [[ -n "$SLOT" ]] && echo "${SCRIPT_DIR}/coordinator-configs-${SLOT}" || echo "${SCRIPT_DIR}/coordinator-configs"; }
+
+slot_tags() {
+    # Returns AWS tag args for tagging resources with slot + project
+    if [[ -n "$SLOT" ]]; then
+        echo "Key=Slot,Value=${SLOT} Key=Project,Value=toprf"
+    else
+        echo "Key=Project,Value=toprf"
+    fi
+}
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -293,9 +328,10 @@ SETUP
 
 step_privatelink() {
     echo ""
-    info "Setting up AWS PrivateLink (node-to-node)"
+    info "Setting up AWS PrivateLink (node-to-node)${SLOT:+ [slot: $SLOT]}"
 
-    local pl_state="${SCRIPT_DIR}/privatelink-state.env"
+    local pl_state
+    pl_state=$(pl_state_file)
 
     # Load existing state for idempotency
     [[ -f "$pl_state" ]] && source "$pl_state"
@@ -324,15 +360,19 @@ step_privatelink() {
                 --filters "Name=vpc-id,Values=$vpc_id" \
                 --query "Subnets[?SubnetId!='${subnet_id}'] | [0].SubnetId" --output text)
 
-            echo "  Creating NLB (2 AZs: $subnet_id, $second_subnet)..."
+            local _nlb_name
+            _nlb_name=$(nlb_name "$i")
+            echo "  Creating NLB $_nlb_name (2 AZs: $subnet_id, $second_subnet)..."
             nlb_arn=$(aws elbv2 create-load-balancer \
                 --region "$region" \
-                --name "toprf-node-${i}-nlb" \
+                --name "$_nlb_name" \
                 --type network \
                 --scheme internal \
                 --subnets "$subnet_id" "$second_subnet" \
                 --query 'LoadBalancers[0].LoadBalancerArn' --output text)
             echo "${nlb_var}=${nlb_arn}" >> "$pl_state"
+            aws elbv2 add-tags --region "$region" --resource-arns "$nlb_arn" \
+                --tags $(slot_tags) 2>/dev/null || true
             echo "    NLB: $nlb_arn"
         else
             echo "    NLB: $nlb_arn (exists)"
@@ -372,10 +412,12 @@ step_privatelink() {
         local tg_var="PL_TG_ARN_NODE${i}"
         local tg_arn="${!tg_var:-}"
         if [[ -z "$tg_arn" ]]; then
-            echo "  Creating Target Group..."
+            local _tg_name
+            _tg_name=$(tg_name "$i")
+            echo "  Creating Target Group $_tg_name..."
             tg_arn=$(aws elbv2 create-target-group \
                 --region "$region" \
-                --name "toprf-node-${i}-tg" \
+                --name "$_tg_name" \
                 --protocol TCP --port 3001 \
                 --vpc-id "$vpc_id" \
                 --target-type ip \
@@ -386,6 +428,8 @@ step_privatelink() {
                 --unhealthy-threshold-count 2 \
                 --query 'TargetGroups[0].TargetGroupArn' --output text)
             echo "${tg_var}=${tg_arn}" >> "$pl_state"
+            aws elbv2 add-tags --region "$region" --resource-arns "$tg_arn" \
+                --tags $(slot_tags) 2>/dev/null || true
             echo "    TG: $tg_arn"
 
             aws elbv2 register-targets --region "$region" \
@@ -431,6 +475,8 @@ step_privatelink() {
                 --no-acceptance-required \
                 --query 'ServiceConfiguration.ServiceId' --output text)
             echo "${svc_var}=${svc_id}" >> "$pl_state"
+            aws ec2 create-tags --region "$region" --resources "$svc_id" \
+                --tags $(slot_tags) 2>/dev/null || true
             echo "    Endpoint Service: $svc_id"
 
             # Allow our AWS account to connect
@@ -511,12 +557,14 @@ step_privatelink() {
                 --vpc-ids "$my_vpc" \
                 --query 'Vpcs[0].CidrBlock' --output text)
 
+            local _vpce_sg_name
+            _vpce_sg_name=$(vpce_sg_name "$my_vi")
             echo "  Creating VPCE security group in $my_vpc ($my_region)..."
             local sg_id
             sg_id=$(aws ec2 create-security-group \
                 --region "$my_region" \
                 --vpc-id "$my_vpc" \
-                --group-name "toprf-privatelink-vpce-${my_vi}" \
+                --group-name "$_vpce_sg_name" \
                 --description "Allow nodes to reach peers via PrivateLink" \
                 --query 'GroupId' --output text)
             aws ec2 authorize-security-group-ingress \
@@ -526,6 +574,8 @@ step_privatelink() {
                 --cidr "$vpc_cidr"
             echo "${sg_var}=${sg_id}" >> "$pl_state"
             eval "${sg_var}=${sg_id}"
+            aws ec2 create-tags --region "$my_region" --resources "$sg_id" \
+                --tags $(slot_tags) 2>/dev/null || true
             echo "    SG: $sg_id (allows TCP 3001 from $vpc_cidr)"
         else
             echo "    SG in $my_vpc: ${!sg_var} (exists)"
@@ -595,6 +645,8 @@ step_privatelink() {
                     --query 'VpcEndpoint.VpcEndpointId' --output text)
                 echo "${vpce_id_var}=${vpce_id}" >> "$pl_state"
                 eval "${vpce_id_var}=${vpce_id}"
+                aws ec2 create-tags --region "$my_region" --resources "$vpce_id" \
+                    --tags $(slot_tags) 2>/dev/null || true
                 echo "    VPCE: $vpce_id"
             else
                 echo "    VPCE for node $j in $my_vpc: $vpce_id (exists)"
@@ -801,7 +853,8 @@ step_start() {
 
     load_ceremony
 
-    local config_dir="$SCRIPT_DIR/coordinator-configs"
+    local config_dir
+    config_dir=$(coord_config_dir)
 
     for i in $(active_nodes); do
         local ip vs url
@@ -844,15 +897,17 @@ step_start() {
 
 step_coordinator_config() {
     echo ""
-    info "Generating coordinator configs (per-node peer endpoints)"
+    info "Generating coordinator configs (per-node peer endpoints)${SLOT:+ [slot: $SLOT]}"
 
     load_ceremony
 
-    local pl_state="${SCRIPT_DIR}/privatelink-state.env"
-    [[ -f "$pl_state" ]] || die "privatelink-state.env not found. Run './deploy.sh privatelink' first."
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Run './deploy.sh privatelink' first."
     source "$pl_state"
 
-    local config_dir="$SCRIPT_DIR/coordinator-configs"
+    local config_dir
+    config_dir=$(coord_config_dir)
     mkdir -p "$config_dir"
 
     for i in $(active_nodes); do
@@ -1048,8 +1103,10 @@ step_show_ips() {
         echo "  Node $i ($region):"
 
         local result
+        local _vm_tag
+        _vm_tag=$(vm_tag "$i")
         result=$(aws ec2 describe-instances --region "$region" \
-            --filters "Name=tag:Name,Values=toprf-node-${i}" "Name=instance-state-name,Values=running" \
+            --filters "Name=tag:Name,Values=${_vm_tag}" "Name=instance-state-name,Values=running" \
             --query 'Reservations[0].Instances[0].[PublicIpAddress,PrivateIpAddress]' \
             --output text 2>/dev/null) || true
 
@@ -1101,8 +1158,10 @@ step_auto_config() {
         echo "  Fetching Node $i info ($region)..."
 
         local instance_data
+        local _vm_tag
+        _vm_tag=$(vm_tag "$i")
         instance_data=$(aws ec2 describe-instances --region "$region" \
-            --filters "Name=tag:Name,Values=toprf-node-${i}" "Name=instance-state-name,Values=running" \
+            --filters "Name=tag:Name,Values=${_vm_tag}" "Name=instance-state-name,Values=running" \
             --query 'Reservations[0].Instances[0]' --output json 2>/dev/null) || true
 
         if [[ -n "$instance_data" && "$instance_data" != "null" ]]; then
@@ -1122,17 +1181,6 @@ step_auto_config() {
             warn "Could not find Node $i in $region"
         fi
     done
-
-    # Proxy IP from ecs-state.env
-    local ecs_state="${SCRIPT_DIR}/ecs-state.env"
-    if [[ -f "$ecs_state" ]]; then
-        echo "  Reading PROXY_IP from ecs-state.env..."
-        local nat_eip
-        nat_eip=$(grep '^NAT_EIP=' "$ecs_state" | cut -d= -f2) || true
-        if [[ -n "$nat_eip" ]]; then
-            _set_config "PROXY_IP" "$nat_eip"
-        fi
-    fi
 
     echo ""
     echo "  Done. Review config.env and fill in any remaining empty fields."
@@ -1194,15 +1242,242 @@ step_redeploy() {
     step_start
 }
 
+# ─── 15. Cutover (update Lambda to new slot's NLB) ────────────────────────────
+
+step_cutover() {
+    echo ""
+    [[ -n "$SLOT" ]] || die "cutover requires --slot (e.g., --slot green)"
+    info "Cutting over to slot: $SLOT"
+
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Deploy the slot first."
+    source "$pl_state"
+
+    # Use node 1's NLB as the coordinator endpoint
+    local nlb_dns="${NLB_DNS_NODE1:-}"
+    [[ -n "$nlb_dns" ]] || die "NLB_DNS_NODE1 not found in $(basename "$pl_state")"
+
+    local new_url="http://${nlb_dns}:3001"
+    echo "  New coordinator URL: $new_url"
+
+    # Update Lambda environment variable
+    local lambda_name="ruonid-evaluate"
+    local lambda_region="eu-west-1"
+
+    echo "  Updating Lambda $lambda_name NLB_URL..."
+    local current_env
+    current_env=$(aws lambda get-function-configuration \
+        --region "$lambda_region" \
+        --function-name "$lambda_name" \
+        --query 'Environment.Variables' --output json 2>/dev/null) || die "Could not read Lambda config"
+
+    # Merge NLB_URL into existing env vars
+    local new_env
+    new_env=$(echo "$current_env" | jq --arg url "$new_url" '. + {"NLB_URL": $url}')
+
+    aws lambda update-function-configuration \
+        --region "$lambda_region" \
+        --function-name "$lambda_name" \
+        --environment "{\"Variables\": $new_env}" > /dev/null
+
+    echo "  Lambda updated. Verifying..."
+
+    # Quick health check through the new NLB (via Lambda)
+    sleep 2
+    local verify_url="https://${DOMAIN:-api.ruonlabs.com}/evaluate"
+    local test_point="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    local resp
+    resp=$(curl -s --connect-timeout 10 -X POST "$verify_url" \
+        -H "Content-Type: application/json" \
+        -d "{\"blinded_point\":\"${test_point}\"}" 2>&1) || true
+
+    if echo "$resp" | jq -e '.evaluation' > /dev/null 2>&1; then
+        echo "  Cutover verified — OPRF evaluation working through new slot."
+    else
+        warn "Could not verify via domain (may need attestation token). Check manually."
+        echo "  Response: $resp"
+    fi
+
+    echo ""
+    echo "  Cutover complete. Traffic now routes to slot: $SLOT"
+    echo "  To tear down the old slot: ./deploy.sh teardown --slot <old-slot>"
+}
+
+# ─── 16. Teardown (discover by tag, delete everything) ────────────────────────
+
+step_teardown() {
+    echo ""
+    [[ -n "$SLOT" ]] || die "teardown requires --slot (e.g., --slot blue)"
+    info "Tearing down slot: $SLOT"
+    echo ""
+    echo "  WARNING: This will permanently delete all resources tagged Slot=$SLOT."
+    echo "  Press Enter to confirm, or Ctrl-C to abort:"
+    read -r _ < /dev/tty
+
+    local regions=("eu-west-1" "us-east-2")
+
+    # ── 1. Terminate EC2 instances ──
+    echo ""
+    echo "  ━━━ Terminating EC2 instances ━━━"
+    for region in "${regions[@]}"; do
+        local instance_ids
+        instance_ids=$(aws ec2 describe-instances --region "$region" \
+            --filters "Name=tag:Slot,Values=$SLOT" "Name=tag:Project,Values=toprf" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null) || true
+
+        for iid in $instance_ids; do
+            [[ -n "$iid" && "$iid" != "None" ]] || continue
+            echo "    Terminating $iid ($region)..."
+            aws ec2 terminate-instances --region "$region" --instance-ids "$iid" > /dev/null
+        done
+    done
+
+    # ── 2. Delete VPC Endpoints ──
+    echo ""
+    echo "  ━━━ Deleting VPC Endpoints ━━━"
+    for region in "${regions[@]}"; do
+        local vpce_ids
+        vpce_ids=$(aws ec2 describe-vpc-endpoints --region "$region" \
+            --filters "Name=tag:Slot,Values=$SLOT" "Name=tag:Project,Values=toprf" \
+            --query 'VpcEndpoints[].VpcEndpointId' --output text 2>/dev/null) || true
+
+        for vpce in $vpce_ids; do
+            [[ -n "$vpce" && "$vpce" != "None" ]] || continue
+            echo "    Deleting $vpce ($region)..."
+            aws ec2 delete-vpc-endpoints --region "$region" --vpc-endpoint-ids "$vpce" > /dev/null 2>/dev/null || true
+        done
+    done
+
+    # ── 3. Delete VPC Endpoint Services ──
+    echo ""
+    echo "  ━━━ Deleting VPC Endpoint Services ━━━"
+    for region in "${regions[@]}"; do
+        local svc_ids
+        svc_ids=$(aws ec2 describe-vpc-endpoint-service-configurations --region "$region" \
+            --filters "Name=tag:Slot,Values=$SLOT" \
+            --query 'ServiceConfigurations[].ServiceId' --output text 2>/dev/null) || true
+
+        for svc in $svc_ids; do
+            [[ -n "$svc" && "$svc" != "None" ]] || continue
+            echo "    Deleting $svc ($region)..."
+            aws ec2 delete-vpc-endpoint-service-configurations --region "$region" \
+                --service-ids "$svc" > /dev/null 2>/dev/null || true
+        done
+    done
+
+    # ── 4. Delete NLB listeners, target groups, and NLBs ──
+    echo ""
+    echo "  ━━━ Deleting NLBs and Target Groups ━━━"
+    for region in "${regions[@]}"; do
+        # Find NLBs by tag
+        local nlb_arns
+        nlb_arns=$(aws elbv2 describe-load-balancers --region "$region" \
+            --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null) || true
+
+        for nlb_arn in $nlb_arns; do
+            [[ -n "$nlb_arn" && "$nlb_arn" != "None" ]] || continue
+            # Check if this NLB has our slot tag
+            local tags
+            tags=$(aws elbv2 describe-tags --region "$region" --resource-arns "$nlb_arn" \
+                --query "TagDescriptions[0].Tags[?Key=='Slot'&&Value=='$SLOT'].Value" \
+                --output text 2>/dev/null) || true
+            [[ "$tags" == "$SLOT" ]] || continue
+
+            echo "    Deleting NLB $nlb_arn ($region)..."
+
+            # Delete listeners first
+            local listeners
+            listeners=$(aws elbv2 describe-listeners --region "$region" \
+                --load-balancer-arn "$nlb_arn" \
+                --query 'Listeners[].ListenerArn' --output text 2>/dev/null) || true
+            for lis in $listeners; do
+                [[ -n "$lis" && "$lis" != "None" ]] || continue
+                aws elbv2 delete-listener --region "$region" --listener-arn "$lis" 2>/dev/null || true
+            done
+
+            # Delete NLB
+            aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$nlb_arn" 2>/dev/null || true
+        done
+
+        # Find and delete target groups by tag
+        local tg_arns
+        tg_arns=$(aws elbv2 describe-target-groups --region "$region" \
+            --query 'TargetGroups[].TargetGroupArn' --output text 2>/dev/null) || true
+
+        for tg_arn in $tg_arns; do
+            [[ -n "$tg_arn" && "$tg_arn" != "None" ]] || continue
+            local tags
+            tags=$(aws elbv2 describe-tags --region "$region" --resource-arns "$tg_arn" \
+                --query "TagDescriptions[0].Tags[?Key=='Slot'&&Value=='$SLOT'].Value" \
+                --output text 2>/dev/null) || true
+            [[ "$tags" == "$SLOT" ]] || continue
+
+            echo "    Deleting TG $tg_arn ($region)..."
+            aws elbv2 delete-target-group --region "$region" --target-group-arn "$tg_arn" 2>/dev/null || true
+        done
+    done
+
+    # ── 5. Delete VPCE Security Groups ──
+    echo ""
+    echo "  ━━━ Deleting VPCE Security Groups ━━━"
+    for region in "${regions[@]}"; do
+        local sg_ids
+        sg_ids=$(aws ec2 describe-security-groups --region "$region" \
+            --filters "Name=tag:Slot,Values=$SLOT" "Name=tag:Project,Values=toprf" \
+            --query 'SecurityGroups[].GroupId' --output text 2>/dev/null) || true
+
+        for sg in $sg_ids; do
+            [[ -n "$sg" && "$sg" != "None" ]] || continue
+            echo "    Deleting SG $sg ($region)..."
+            aws ec2 delete-security-group --region "$region" --group-id "$sg" 2>/dev/null || true
+        done
+    done
+
+    # ── 6. Delete EC2 key pairs ──
+    echo ""
+    echo "  ━━━ Deleting EC2 key pairs ━━━"
+    for region in "${regions[@]}"; do
+        local key_names
+        key_names=$(aws ec2 describe-key-pairs --region "$region" \
+            --filters "Name=tag:Slot,Values=$SLOT" "Name=tag:Project,Values=toprf" \
+            --query 'KeyPairs[].KeyName' --output text 2>/dev/null) || true
+
+        for kn in $key_names; do
+            [[ -n "$kn" && "$kn" != "None" ]] || continue
+            echo "    Deleting key pair $kn ($region)..."
+            aws ec2 delete-key-pair --region "$region" --key-name "$kn" 2>/dev/null || true
+            rm -f "${SCRIPT_DIR}/${kn}.pem"
+        done
+    done
+
+    # ── 7. Clean up local state files ──
+    echo ""
+    echo "  ━━━ Cleaning up local files ━━━"
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] && rm -f "$pl_state" && echo "    Deleted $(basename "$pl_state")"
+
+    local config_dir
+    config_dir=$(coord_config_dir)
+    [[ -d "$config_dir" ]] && rm -rf "$config_dir" && echo "    Deleted $(basename "$config_dir")/"
+
+    echo ""
+    echo "  Teardown of slot '$SLOT' complete."
+}
+
 # =============================================================================
 # CLI
 # =============================================================================
 
 usage() {
     cat <<'EOF'
-Usage: deploy.sh [--nodes 1,2,3] <step> [step...]
+Usage: deploy.sh [--slot NAME] [--nodes 1,2,3] <step> [step...]
 
 Options:
+  --slot NAME   Blue-green slot name (e.g., blue, green). Resources are
+                named and tagged with this slot for zero-downtime rotation.
   --nodes N     Operate on specific node(s) only (comma-separated)
 
 Steps (run in order for fresh deployment):
@@ -1216,6 +1491,10 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
 
+Blue-green:
+  cutover       Update Lambda NLB_URL to this slot's coordinator NLB
+  teardown      Delete all AWS resources tagged with this slot
+
 Utilities:
   auto-config   Auto-populate config.env from AWS
   show-ips      Fetch public/private IPs for all nodes
@@ -1226,6 +1505,11 @@ Shortcuts:
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
+
+Blue-green example:
+  ./deploy.sh --slot green all          # Deploy new set
+  ./deploy.sh --slot green cutover      # Switch traffic
+  ./deploy.sh --slot blue teardown      # Tear down old set
 EOF
 }
 
@@ -1238,6 +1522,11 @@ fi
 steps=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --slot|-s)
+            shift
+            SLOT="$1"
+            shift
+            ;;
         --nodes|-n)
             shift
             _NODE_FILTER=$(echo "$1" | tr ',' ' ')
@@ -1255,6 +1544,9 @@ if [[ ${#steps[@]} -eq 0 ]]; then
     exit 0
 fi
 
+if [[ -n "$SLOT" ]]; then
+    info "Slot: $SLOT"
+fi
 if [[ -n "$_NODE_FILTER" ]]; then
     info "Operating on node(s): $_NODE_FILTER"
 fi
@@ -1274,6 +1566,8 @@ for step in "${steps[@]}"; do
         show-ips)     step_show_ips ;;
         redeploy)     step_redeploy ;;
         lock)         step_lock ;;
+        cutover)      step_cutover ;;
+        teardown)     step_teardown ;;
         pre-seal)
             step_setup_vms
             step_pull
