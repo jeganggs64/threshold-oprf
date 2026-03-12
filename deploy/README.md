@@ -228,6 +228,19 @@ rm -rf node-shares coordinator-configs-green
 
 After teardown, `green` is the active slot. Next rotation deploys to `blue`, cuts over, tears down `green`.
 
+### What you can delete and when
+
+After `deploy.sh lock`, nodes are running and SSH is gone. You can delete all local files and start fresh for the next rotation:
+
+```bash
+rm -f config.env nodes.json privatelink-state.env *.pem
+rm -rf coordinator-configs node-shares
+```
+
+For the next rotation, create new `config.env` + `nodes.json` from the examples, run the admin ceremony to generate fresh node shares, and deploy a new slot. Teardown discovers old resources **by AWS tags** (`Slot=<name>`, `Project=toprf`), not from local files — no previous state needed.
+
+**Caveat:** `teardown` searches only the regions listed in your current `nodes.json`. If the old slot used regions not in the new `nodes.json`, add them temporarily so teardown can find those resources.
+
 **Nothing persisted locally between rotations.** Admin shares are distributed across 5 admins. All infrastructure state lives in AWS resource tags.
 
 ---
