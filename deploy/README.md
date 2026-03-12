@@ -1,15 +1,15 @@
 # Deployment Guide
 
-Deploy 3 threshold OPRF nodes across AWS regions.
+Deploy threshold OPRF nodes across AWS regions. Node count and threshold (T-of-N) are configurable via `nodes.json`.
 
 ## Architecture
 
 ```
-Mobile App → API Gateway (TLS) → Lambda (VPC) → NLB (eu-west-1)
-                                                    ↓
-                                         Node 1 or Node 2 (coordinator)
-                                                    ↓ AWS PrivateLink
-                                                 Peer Node
+Mobile App → API Gateway (TLS) → Lambda (VPC) → NLB
+                                                  ↓
+                                          Coordinator Node
+                                                  ↓ AWS PrivateLink
+                                          (threshold-1) Peer Nodes
 ```
 
 Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
@@ -18,13 +18,35 @@ The API server (developer registration, billing, admin, webhooks) runs as Lambda
 
 ---
 
+## Configuration
+
+Two config files:
+
+- **`config.env`** — Global settings (AWS account, instance type, IAM profile, domain, ceremony path)
+- **`nodes.json`** — Per-node config (regions, IPs, keys, S3 buckets, threshold)
+
+Copy the examples and fill in your values:
+```bash
+cp config.env.example config.env
+cp nodes.json.example nodes.json
+# Edit both files, then:
+./deploy.sh auto-config    # Populates IPs, SGs, VPCs from AWS
+```
+
+To change the threshold or node count, edit `nodes.json`: set `threshold` and add/remove entries in the `nodes` array. The keygen ceremony must match:
+```bash
+toprf-keygen node-shares --node-threshold 3 --node-shares 5  # 3-of-5
+```
+
+---
+
 ## Step 1: Provision TEE Nodes (`provision.sh`)
 
-Launches AMD SEV-SNP virtual machines in 3 regions.
+Launches AMD SEV-SNP virtual machines across AWS regions.
 
 ### Prerequisites
 
-- `config.env` with node regions filled in and `NODE*_S3_BUCKET` names chosen (buckets don't need to exist yet — `deploy.sh storage` creates them)
+- `nodes.json` with node regions and S3 bucket names filled in (buckets don't need to exist yet — `deploy.sh storage` creates them)
 - An IAM instance profile for the nodes, with `IAM_INSTANCE_PROFILE` set in `config.env`. The role needs `s3:PutObject` and `s3:GetObject` on the sealed-key buckets so nodes can upload/download sealed key blobs
 
 ### What it does
@@ -39,15 +61,15 @@ For each node:
 ### Run
 
 ```bash
-./provision.sh all        # All 3 nodes
+./provision.sh all        # All nodes
 ./provision.sh 1          # Just node 1
 ```
 
 ### After it runs
 
-- 3 VMs running, one per region
-- SSH keys saved to `deploy/ruonid-node<N>.pem`
-- Run `./deploy.sh auto-config` to populate IPs, SGs, and VPC IDs in `config.env`
+- VMs running, one per node in `nodes.json`
+- SSH keys saved to `deploy/<key_name>.pem`
+- Run `./deploy.sh auto-config` to populate IPs, SGs, and VPC IDs in `nodes.json`
 
 ### Management
 
@@ -65,10 +87,10 @@ Installs Docker, injects key shares, and starts the OPRF service on each node.
 ### Prerequisites
 
 - Nodes provisioned and running (step 1)
-- `config.env` populated (run `./deploy.sh auto-config` after provisioning)
+- `nodes.json` populated (run `./deploy.sh auto-config` after provisioning)
 - Key ceremony completed — key shares at `../ceremony/node-shares/`
   - `public-config.json` (group public key, threshold, verification shares)
-  - `node-1-share.json`, `node-2-share.json`, `node-3-share.json`
+  - `node-<id>-share.json` for each node in `nodes.json`
 - Node image available at `ghcr.io/<owner>/toprf-node:latest` (built by CI)
 
 ### What it does
@@ -114,7 +136,7 @@ For each node:
 ### After it runs
 
 - All nodes are sealed, running, and reachable via PrivateLink
-- Each node can act as coordinator (receives client requests, calls a peer, returns combined evaluation)
+- Each node can act as coordinator (receives client requests, calls threshold-1 peers, returns combined evaluation)
 
 ---
 
@@ -181,7 +203,7 @@ toprf-keygen node-shares \
   -a admin-1.json -a admin-3.json -a admin-5.json \
   -o ./node-shares
 
-# 2. Create config.env from example, fill in regions + S3 buckets
+# 2. Create config.env + nodes.json from examples, fill in values
 
 # 3. Provision new VMs alongside old ones
 SLOT=green ./provision.sh all
@@ -200,7 +222,7 @@ SLOT=green ./provision.sh all
 ./deploy.sh --slot blue teardown
 
 # 8. Clean up local files — nothing to keep
-rm -f config.env *.pem
+rm -f config.env nodes.json *.pem
 rm -rf node-shares coordinator-configs-green
 ```
 

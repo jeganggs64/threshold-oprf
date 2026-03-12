@@ -9,7 +9,7 @@
 #   ./provision.sh <node>             Launch a new node VM
 #   ./provision.sh <node> --status    Show node instance status
 #   ./provision.sh <node> --terminate Terminate node instance
-#   ./provision.sh all                Launch all 3 nodes
+#   ./provision.sh all                Launch all nodes
 #
 # Examples:
 #   ./provision.sh 1                  Provision node 1 in ap-southeast-1
@@ -30,6 +30,16 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 source "$CONFIG_FILE"
 
+# ─── Load nodes.json ────────────────────────────────────────────────────────
+
+NODES_JSON="${NODES_JSON:-${SCRIPT_DIR}/nodes.json}"
+if [[ ! -f "$NODES_JSON" ]]; then
+    echo "ERROR: nodes.json not found at $NODES_JSON"
+    echo "  cp deploy/nodes.json.example deploy/nodes.json"
+    exit 1
+fi
+command -v jq >/dev/null || { echo "ERROR: jq is required but not installed" >&2; exit 1; }
+
 # Slot support: SLOT env var controls VM tag names for blue-green deployments
 SLOT="${SLOT:-}"
 _slot_suffix() { [[ -n "$SLOT" ]] && echo "-${SLOT}" || echo ""; }
@@ -41,32 +51,19 @@ info()  { echo "==> $*"; }
 warn()  { echo "  WARN: $*"; }
 die()   { echo "  ERROR: $*" >&2; exit 1; }
 
-node_region() {
-    case "$1" in
-        1) echo "$NODE1_REGION" ;;
-        2) echo "$NODE2_REGION" ;;
-        3) echo "$NODE3_REGION" ;;
-        *) die "Invalid node: $1" ;;
-    esac
+# Node lookup helpers (read from nodes.json)
+_node_field() {
+    local id="$1" field="$2"
+    jq -r --argjson id "$id" ".nodes[] | select(.id == \$id) | .$field" "$NODES_JSON"
 }
 
-node_key_name() {
-    case "$1" in
-        1) echo "$NODE1_KEY_NAME" ;;
-        2) echo "$NODE2_KEY_NAME" ;;
-        3) echo "$NODE3_KEY_NAME" ;;
-        *) die "Invalid node: $1" ;;
-    esac
-}
+node_region()    { _node_field "$1" region; }
+node_key_name()  { _node_field "$1" key_name; }
+node_s3_bucket() { _node_field "$1" s3_bucket; }
+node_ssh_key()   { _node_field "$1" ssh_key; }
 
-node_s3_bucket() {
-    case "$1" in
-        1) echo "$NODE1_S3_BUCKET" ;;
-        2) echo "$NODE2_S3_BUCKET" ;;
-        3) echo "$NODE3_S3_BUCKET" ;;
-        *) die "Invalid node: $1" ;;
-    esac
-}
+# All node IDs from nodes.json
+all_node_ids() { jq -r '.nodes[].id' "$NODES_JSON" | tr '\n' ' '; }
 
 # ─── Ensure IAM instance profile exists ─────────────────────────────────────
 
@@ -92,7 +89,7 @@ ensure_iam_profile() {
         # Grant S3 access to all sealed-key buckets
         local resources=""
         local first=true
-        for n in 1 2 3; do
+        for n in $(all_node_ids); do
             local bucket
             bucket=$(node_s3_bucket "$n" 2>/dev/null) || continue
             [[ -n "$bucket" ]] || continue
@@ -266,7 +263,7 @@ provision_node() {
     echo "    VPC:        $vpc_id"
     echo ""
     echo "  Next steps:"
-    echo "    1. Update config.env (or run ./deploy.sh auto-config)"
+    echo "    1. Run ./deploy.sh auto-config (or update nodes.json manually)"
     echo "    2. Run ./deploy.sh --nodes $n pre-seal"
     echo "    3. Run ./deploy.sh --nodes $n init-seal"
     echo "    4. Run ./deploy.sh --nodes $n post-seal"
@@ -332,11 +329,13 @@ terminate_node() {
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 usage() {
-    cat <<'EOF'
+    local valid_ids
+    valid_ids=$(jq -r '[.nodes[].id] | join(", ")' "$NODES_JSON" 2>/dev/null || echo "?")
+    cat <<EOF
 Usage: provision.sh <node> [action]
 
 Arguments:
-  node              Node number (1, 2, 3) or "all"
+  node              Node ID (${valid_ids}) or "all"
 
 Actions:
   (default)         Launch a new VM
@@ -345,10 +344,15 @@ Actions:
 
 Examples:
   ./provision.sh 1                  Launch node 1
-  ./provision.sh all                Launch all 3 nodes
+  ./provision.sh all                Launch all nodes
   ./provision.sh 2 --status         Check node 2
   ./provision.sh 3 --terminate      Tear down node 3
 EOF
+}
+
+# Check if a node ID exists in nodes.json
+_valid_node_id() {
+    jq -e --argjson id "$1" '.nodes[] | select(.id == $id)' "$NODES_JSON" > /dev/null 2>&1
 }
 
 if [[ $# -eq 0 || "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
@@ -359,39 +363,35 @@ fi
 NODE="$1"
 ACTION="${2:---provision}"
 
-case "$NODE" in
-    1|2|3)
-        case "$ACTION" in
-            --provision) provision_node "$NODE" ;;
-            --status)    show_status "$NODE" ;;
-            --terminate) terminate_node "$NODE" ;;
-            *) die "Unknown action: $ACTION" ;;
-        esac
-        ;;
-    all)
-        case "$ACTION" in
-            --provision)
-                for n in 1 2 3; do
-                    provision_node "$n"
-                    echo ""
-                done
-                ;;
-            --status)
-                for n in 1 2 3; do
-                    show_status "$n"
-                    echo ""
-                done
-                ;;
-            --terminate)
-                for n in 1 2 3; do
-                    terminate_node "$n"
-                    echo ""
-                done
-                ;;
-            *) die "Unknown action: $ACTION" ;;
-        esac
-        ;;
-    *)
-        die "Invalid node: $NODE (expected 1, 2, 3, or all)"
-        ;;
-esac
+if [[ "$NODE" == "all" ]]; then
+    case "$ACTION" in
+        --provision)
+            for n in $(all_node_ids); do
+                provision_node "$n"
+                echo ""
+            done
+            ;;
+        --status)
+            for n in $(all_node_ids); do
+                show_status "$n"
+                echo ""
+            done
+            ;;
+        --terminate)
+            for n in $(all_node_ids); do
+                terminate_node "$n"
+                echo ""
+            done
+            ;;
+        *) die "Unknown action: $ACTION" ;;
+    esac
+elif _valid_node_id "$NODE"; then
+    case "$ACTION" in
+        --provision) provision_node "$NODE" ;;
+        --status)    show_status "$NODE" ;;
+        --terminate) terminate_node "$NODE" ;;
+        *) die "Unknown action: $ACTION" ;;
+    esac
+else
+    die "Invalid node: $NODE (valid IDs: $(jq -r '[.nodes[].id] | join(", ")' "$NODES_JSON"))"
+fi

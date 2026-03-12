@@ -2,10 +2,11 @@
 # =============================================================================
 # deploy.sh — Automated deployment for threshold OPRF nodes on AWS.
 #
-# Deploys 3 TEE nodes (Amazon Linux 2023) across AWS regions. Each node can
-# act as coordinator: receiving a client request, computing its own partial
-# evaluation, calling a peer node via PrivateLink, verifying the peer's DLEQ
-# proof, and returning the combined OPRF evaluation.
+# Deploys TEE nodes (Amazon Linux 2023) across AWS regions. Node count and
+# threshold are defined in nodes.json. Each node can act as coordinator:
+# receiving a client request, computing its own partial evaluation, calling
+# (threshold-1) peer nodes via PrivateLink, verifying DLEQ proofs, and
+# returning the combined OPRF evaluation.
 #
 # Architecture:
 #   Client → API Gateway → NLB → Coordinator Node → PrivateLink → Peer Node
@@ -54,7 +55,7 @@ Blue-green:
   teardown      Delete all AWS resources tagged with this slot
 
 Utilities:
-  auto-config   Auto-populate config.env from AWS
+  auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
   lock          Remove SSH access + delete keys (irreversible)
 
@@ -83,6 +84,14 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     exit 1
 fi
 source "$CONFIG_FILE"
+
+# ─── Load nodes.json ────────────────────────────────────────────────────────
+
+NODES_JSON="${NODES_JSON:-${SCRIPT_DIR}/nodes.json}"
+if [[ ! -f "$NODES_JSON" ]]; then
+    die "nodes.json not found at $NODES_JSON. Copy nodes.json.example and fill in values."
+fi
+command -v jq >/dev/null || die "jq is required but not installed"
 
 # ─── Derived values ──────────────────────────────────────────────────────────
 
@@ -117,69 +126,22 @@ info()  { echo "==> $*"; }
 warn()  { echo "  WARN: $*"; }
 die()   { echo "  ERROR: $*" >&2; exit 1; }
 
-node_region() {
-    case "$1" in
-        1) echo "$NODE1_REGION" ;;
-        2) echo "$NODE2_REGION" ;;
-        3) echo "$NODE3_REGION" ;;
-    esac
+# ─── Node lookup helpers (read from nodes.json) ─────────────────────────────
+
+_node_field() {
+    local id="$1" field="$2"
+    jq -r --argjson id "$id" ".nodes[] | select(.id == \$id) | .$field" "$NODES_JSON"
 }
 
-node_ip() {
-    case "$1" in
-        1) echo "$NODE1_IP" ;;
-        2) echo "$NODE2_IP" ;;
-        3) echo "$NODE3_IP" ;;
-    esac
-}
-
-node_private_ip() {
-    case "$1" in
-        1) echo "$NODE1_PRIVATE_IP" ;;
-        2) echo "$NODE2_PRIVATE_IP" ;;
-        3) echo "$NODE3_PRIVATE_IP" ;;
-    esac
-}
-
-node_ssh_key() {
-    case "$1" in
-        1) echo "$NODE1_SSH_KEY" ;;
-        2) echo "$NODE2_SSH_KEY" ;;
-        3) echo "$NODE3_SSH_KEY" ;;
-    esac
-}
-
-node_sg_id() {
-    case "$1" in
-        1) echo "$NODE1_SG_ID" ;;
-        2) echo "$NODE2_SG_ID" ;;
-        3) echo "$NODE3_SG_ID" ;;
-    esac
-}
-
-node_vpc_id() {
-    case "$1" in
-        1) echo "$NODE1_VPC_ID" ;;
-        2) echo "$NODE2_VPC_ID" ;;
-        3) echo "$NODE3_VPC_ID" ;;
-    esac
-}
-
-node_subnet_id() {
-    case "$1" in
-        1) echo "$NODE1_SUBNET_ID" ;;
-        2) echo "$NODE2_SUBNET_ID" ;;
-        3) echo "$NODE3_SUBNET_ID" ;;
-    esac
-}
-
-node_s3_bucket() {
-    case "$1" in
-        1) echo "$NODE1_S3_BUCKET" ;;
-        2) echo "$NODE2_S3_BUCKET" ;;
-        3) echo "$NODE3_S3_BUCKET" ;;
-    esac
-}
+node_region()     { _node_field "$1" region; }
+node_ip()         { _node_field "$1" ip; }
+node_private_ip() { _node_field "$1" private_ip; }
+node_ssh_key()    { _node_field "$1" ssh_key; }
+node_sg_id()      { _node_field "$1" sg_id; }
+node_vpc_id()     { _node_field "$1" vpc_id; }
+node_subnet_id()  { _node_field "$1" subnet_id; }
+node_s3_bucket()  { _node_field "$1" s3_bucket; }
+node_key_name()   { _node_field "$1" key_name; }
 
 # Convert VPC ID to variable-safe identifier: vpc-0abc → vpc_0abc
 vpc_ident() { echo "${1//-/_}"; }
@@ -190,6 +152,9 @@ sealed_url() {
     echo "s3://${bucket}/node-${1}-sealed.bin"
 }
 
+# All node IDs from nodes.json
+all_node_ids() { jq -r '.nodes[].id' "$NODES_JSON" | tr '\n' ' '; }
+
 # Node filter: set via --nodes flag (e.g. --nodes 1,3)
 _NODE_FILTER=""
 
@@ -198,11 +163,12 @@ active_nodes() {
         echo "$_NODE_FILTER"
         return
     fi
-    local nodes=""
-    [[ -n "${NODE1_IP:-}" ]] && nodes="$nodes 1"
-    [[ -n "${NODE2_IP:-}" ]] && nodes="$nodes 2"
-    [[ -n "${NODE3_IP:-}" ]] && nodes="$nodes 3"
-    echo $nodes
+    all_node_ids
+}
+
+# Unique regions across all nodes
+all_regions() {
+    jq -r '[.nodes[].region] | unique | .[]' "$NODES_JSON"
 }
 
 ssh_node() {
@@ -228,20 +194,14 @@ load_ceremony() {
     local config="${NODE_SHARES_DIR}/public-config.json"
     [[ -f "$config" ]] || die "$config not found. Run toprf-keygen node-shares first."
     GROUP_PUBLIC_KEY=$(jq -r '.group_public_key' "$config")
-    THRESHOLD=$(jq -r '.threshold' "$config")
-    VS_1=$(jq -r '.verification_shares[] | select(.node_id == 1) | .verification_share' "$config")
-    VS_2=$(jq -r '.verification_shares[] | select(.node_id == 2) | .verification_share' "$config")
-    VS_3=$(jq -r '.verification_shares[] | select(.node_id == 3) | .verification_share' "$config")
+    CEREMONY_THRESHOLD=$(jq -r '.threshold' "$config")
     _ceremony_loaded=true
 }
 
 node_vs() {
     load_ceremony
-    case "$1" in
-        1) echo "$VS_1" ;;
-        2) echo "$VS_2" ;;
-        3) echo "$VS_3" ;;
-    esac
+    local config="${NODE_SHARES_DIR}/public-config.json"
+    jq -r --argjson id "$1" '.verification_shares[] | select(.node_id == $id) | .verification_share' "$config"
 }
 
 # =============================================================================
@@ -345,7 +305,7 @@ step_privatelink() {
         subnet_id=$(node_subnet_id "$i")
         private_ip=$(node_private_ip "$i")
 
-        [[ -n "$subnet_id" ]] || die "NODE${i}_SUBNET_ID not set in config.env. Run auto-config or set manually."
+        [[ -n "$subnet_id" ]] || die "subnet_id not set for node $i in nodes.json. Run auto-config or set manually."
 
         echo ""
         echo "  ━━━ Node $i ($region, $private_ip) ━━━"
@@ -1030,16 +990,18 @@ step_e2e() {
         fi
     done
 
-    # 2. Coordinator test (via SSH to node 1, calls /evaluate which coordinates with a peer)
+    # 2. Coordinator test (via SSH, calls /evaluate which coordinates with peers)
+    local coord_node
+    coord_node=$(active_nodes | awk '{print $1}')
     echo ""
-    echo "  [2/3] Coordinator evaluate (node 1 → peer via PrivateLink)"
+    echo "  [2/3] Coordinator evaluate (node $coord_node → peers via PrivateLink)"
     total=$((total + 1))
 
     # Use a known test blinded point (valid secp256k1 point)
     local test_point="0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 
     local eval_resp
-    eval_resp=$(ssh_node "1" "curl -s --connect-timeout 10 \
+    eval_resp=$(ssh_node "$coord_node" "curl -s --connect-timeout 10 \
         -X POST http://localhost:3001/evaluate \
         -H 'Content-Type: application/json' \
         -d '{\"blinded_point\":\"${test_point}\"}'" < /dev/null 2>&1) || true
@@ -1124,35 +1086,26 @@ step_show_ips() {
 
 # ─── 12. Auto-config ─────────────────────────────────────────────────────────
 
-_set_config() {
-    local key="$1" value="$2"
-    if grep -q "^${key}=" "$CONFIG_FILE"; then
-        if grep -q "^${key}=$" "$CONFIG_FILE" || grep -q "^${key}=\s*$" "$CONFIG_FILE"; then
-            sed -i.bak "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
-            echo "  ${key}=${value}"
-        else
-            echo "  ${key} already set, skipping"
-        fi
-    fi
-}
-
 step_auto_config() {
     echo ""
-    info "Auto-populating config.env from AWS"
+    info "Auto-populating nodes.json from AWS"
     echo ""
 
-    # AWS Account ID
+    # AWS Account ID (still in config.env)
     echo "  Fetching AWS account ID..."
     local aws_id
     aws_id=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) || true
     if [[ -n "$aws_id" ]]; then
-        _set_config "AWS_ACCOUNT_ID" "$aws_id"
+        if grep -q "^AWS_ACCOUNT_ID=" "$CONFIG_FILE"; then
+            sed -i.bak "s|^AWS_ACCOUNT_ID=.*|AWS_ACCOUNT_ID=${aws_id}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+            echo "  AWS_ACCOUNT_ID=${aws_id}"
+        fi
     else
         warn "Could not fetch AWS account ID"
     fi
 
-    # Per-node IPs, SGs, VPCs
-    for i in 1 2 3; do
+    # Per-node IPs, SGs, VPCs → update nodes.json
+    for i in $(all_node_ids); do
         local region
         region=$(node_region "$i")
         echo "  Fetching Node $i info ($region)..."
@@ -1172,18 +1125,23 @@ step_auto_config() {
             vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
             subnet_id=$(echo "$instance_data" | jq -r '.SubnetId // empty')
 
-            [[ -n "$pub_ip" ]] && _set_config "NODE${i}_IP" "$pub_ip"
-            [[ -n "$priv_ip" ]] && _set_config "NODE${i}_PRIVATE_IP" "$priv_ip"
-            [[ -n "$sg_id" ]] && _set_config "NODE${i}_SG_ID" "$sg_id"
-            [[ -n "$vpc_id" ]] && _set_config "NODE${i}_VPC_ID" "$vpc_id"
-            [[ -n "$subnet_id" ]] && _set_config "NODE${i}_SUBNET_ID" "$subnet_id"
+            # Update nodes.json in place
+            local tmp
+            tmp=$(mktemp)
+            jq --argjson id "$i" \
+               --arg ip "$pub_ip" --arg pip "$priv_ip" \
+               --arg sg "$sg_id" --arg vpc "$vpc_id" --arg sub "$subnet_id" \
+               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub}' \
+               "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
+
+            echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id"
         else
             warn "Could not find Node $i in $region"
         fi
     done
 
     echo ""
-    echo "  Done. Review config.env and fill in any remaining empty fields."
+    echo "  Done. Review nodes.json and fill in any remaining empty fields."
 }
 
 # ─── 13. Lock nodes (remove SSH access) ──────────────────────────────────────
@@ -1254,9 +1212,12 @@ step_cutover() {
     [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Deploy the slot first."
     source "$pl_state"
 
-    # Use node 1's NLB as the coordinator endpoint
-    local nlb_dns="${NLB_DNS_NODE1:-}"
-    [[ -n "$nlb_dns" ]] || die "NLB_DNS_NODE1 not found in $(basename "$pl_state")"
+    # Use the first node's NLB as the coordinator endpoint
+    local first_node
+    first_node=$(all_node_ids | awk '{print $1}')
+    local nlb_dns_var="NLB_DNS_NODE${first_node}"
+    local nlb_dns="${!nlb_dns_var:-}"
+    [[ -n "$nlb_dns" ]] || die "${nlb_dns_var} not found in $(basename "$pl_state")"
 
     local new_url="http://${nlb_dns}:3001"
     echo "  New coordinator URL: $new_url"
@@ -1315,7 +1276,11 @@ step_teardown() {
     echo "  Press Enter to confirm, or Ctrl-C to abort:"
     read -r _ < /dev/tty
 
-    local regions=("eu-west-1" "us-east-2")
+    # Derive unique regions from nodes.json
+    local regions=()
+    while IFS= read -r r; do
+        regions+=("$r")
+    done < <(all_regions)
 
     # ── 1. Terminate EC2 instances ──
     echo ""
@@ -1496,7 +1461,7 @@ Blue-green:
   teardown      Delete all AWS resources tagged with this slot
 
 Utilities:
-  auto-config   Auto-populate config.env from AWS
+  auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
   lock          Remove SSH access + delete keys (irreversible)
 

@@ -1,0 +1,41 @@
+{
+  "threshold": 2,
+  "nodes": [
+    {
+      "id": 1,
+      "region": "eu-west-1",
+      "key_name": "ruonid-node1",
+      "ssh_key": "ruonid-node1.pem",
+      "ip": "34.240.237.50",
+      "private_ip": "172.31.11.199",
+      "sg_id": "sg-068635a59093711a5",
+      "vpc_id": "vpc-0a41ba5e17b28f53e",
+      "subnet_id": "subnet-021a5de1280a879d8",
+      "s3_bucket": "ruonid-sealed-node1"
+    },
+    {
+      "id": 2,
+      "region": "eu-west-1",
+      "key_name": "ruonid-node2",
+      "ssh_key": "ruonid-node2.pem",
+      "ip": "34.244.137.171",
+      "private_ip": "172.31.3.215",
+      "sg_id": "sg-068635a59093711a5",
+      "vpc_id": "vpc-0a41ba5e17b28f53e",
+      "subnet_id": "subnet-021a5de1280a879d8",
+      "s3_bucket": "ruonid-sealed-node2"
+    },
+    {
+      "id": 3,
+      "region": "us-east-2",
+      "key_name": "ruonid-node3",
+      "ssh_key": "ruonid-node3.pem",
+      "ip": "18.188.14.237",
+      "private_ip": "172.31.41.196",
+      "sg_id": "sg-0d7fecb78376a53d9",
+      "vpc_id": "vpc-080eaf83bf5120561",
+      "subnet_id": "subnet-0090cd90ff880eb8f",
+      "s3_bucket": "ruonid-sealed-node3"
+    }
+  ]
+}
