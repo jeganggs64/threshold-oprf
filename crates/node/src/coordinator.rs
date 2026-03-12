@@ -2,13 +2,13 @@
 //!
 //! When a node receives a request on `POST /evaluate`, it acts as coordinator:
 //! 1. Computes its own partial evaluation (E_self = k_i * B)
-//! 2. Forwards the blinded point to a peer node via PrivateLink
-//! 3. Verifies the peer's DLEQ proof
-//! 4. Combines both partials via Lagrange interpolation
+//! 2. Forwards the blinded point to (threshold - 1) peer nodes via PrivateLink
+//! 3. Verifies each peer's DLEQ proof
+//! 4. Combines all partials via Lagrange interpolation
 //! 5. Returns the final evaluation E = k * B
 //!
-//! Peers are tried in order; if the first peer fails, the next is attempted.
-//! Only one peer is needed (threshold=2 means self + 1 peer).
+//! Peers are tried in order until enough successful responses are collected.
+//! For threshold T, the coordinator needs T-1 peer responses (self counts as one).
 
 use std::sync::Arc;
 
@@ -85,17 +85,20 @@ pub async fn evaluate_handler(
 
     info!(node_id = key.node_id, "computed own partial");
 
-    // 3. Call peers — try each in order until one succeeds
-    let mut peer_partial: Option<PartialEvaluation> = None;
-    let mut peer_vs: Option<String> = None;
+    // 3. Call peers — collect (threshold - 1) successful responses
+    let needed_peers = (key.threshold as usize) - 1; // self counts as one
+    let mut peer_partials: Vec<PartialEvaluation> = Vec::with_capacity(needed_peers);
+    let mut peer_vs: Vec<(u16, String)> = Vec::with_capacity(needed_peers);
 
     for peer in &coordinator.peers {
+        if peer_partials.len() >= needed_peers {
+            break;
+        }
         match call_peer(&state.http_client, peer, &req.blinded_point).await {
             Ok(partial) => {
                 info!(peer_node_id = peer.node_id, "received peer partial");
-                peer_vs = Some(peer.verification_share.clone());
-                peer_partial = Some(partial);
-                break;
+                peer_vs.push((peer.node_id, peer.verification_share.clone()));
+                peer_partials.push(partial);
             }
             Err(e) => {
                 warn!(peer_node_id = peer.node_id, error = %e, "peer call failed, trying next");
@@ -103,21 +106,29 @@ pub async fn evaluate_handler(
         }
     }
 
-    let peer_partial = peer_partial.ok_or_else(|| {
-        error!("all peers unreachable");
-        (
+    if peer_partials.len() < needed_peers {
+        error!(
+            needed = needed_peers,
+            got = peer_partials.len(),
+            "insufficient peers responded"
+        );
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "no peer available".to_string(),
+            format!(
+                "need {} peer(s) but only {} responded",
+                needed_peers,
+                peer_partials.len()
+            ),
         )
-            .into_response()
-    })?;
+            .into_response());
+    }
 
-    // 4. Combine partials via Lagrange interpolation (verifies DLEQ proofs internally)
-    let partials = vec![own_partial, peer_partial];
-    let verification_shares = vec![
-        (key.node_id, key.verification_share.clone()),
-        (partials[1].node_id, peer_vs.unwrap()),
-    ];
+    // 4. Combine all partials via Lagrange interpolation (verifies DLEQ proofs internally)
+    let mut partials = vec![own_partial];
+    partials.extend(peer_partials);
+
+    let mut verification_shares = vec![(key.node_id, key.verification_share.clone())];
+    verification_shares.extend(peer_vs);
 
     let combined = combine_partials(
         &partials,
@@ -134,9 +145,11 @@ pub async fn evaluate_handler(
             .into_response()
     })?;
 
+    let peer_ids: Vec<u16> = partials[1..].iter().map(|p| p.node_id).collect();
     info!(
         coordinator = key.node_id,
-        peer = partials[1].node_id,
+        peers = ?peer_ids,
+        threshold = key.threshold,
         "evaluation complete"
     );
 
