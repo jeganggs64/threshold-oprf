@@ -1,26 +1,26 @@
 # Threshold OPRF
 
-A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF key is split into 3 shares using 2-of-3 Shamir secret sharing, with each share running inside an AMD SEV-SNP Trusted Execution Environment on a separate AWS region. No single region holds enough shares to evaluate the function.
+A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF key is split into shares using T-of-N Shamir secret sharing, with each share running inside an AMD SEV-SNP Trusted Execution Environment on a separate AWS instance. No single node holds enough shares to evaluate the function.
+
+Node count and threshold are configurable — deploy 2-of-3, 3-of-5, 4-of-7, or any T-of-N split.
 
 ## Architecture
 
 ```
-Mobile App
-    |  HTTPS
-    v
-API Gateway (TLS, rate limiting)
-    |  VPC Link
-    v
-NLB (eu-west-1) → Node 1 or Node 2 (coordinator)
-                      |  AWS PrivateLink (private)
-                      +── Peer Node (same or cross-region)
+Mobile App → API Gateway (TLS) → Lambda (VPC) → NLB
+                                                  ↓
+                                          Coordinator Node
+                                                  ↓ AWS PrivateLink
+                                          (threshold-1) Peer Nodes
 ```
 
-Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to a peer node via PrivateLink, verifies the peer's DLEQ proof, combines both partials via Lagrange interpolation, and returns the final OPRF evaluation. No separate proxy service needed.
+Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to threshold-1 peer nodes via PrivateLink, verifies each peer's DLEQ proof, combines all partials via Lagrange interpolation, and returns the final OPRF evaluation.
 
-Node-to-node communication uses AWS PrivateLink — each node sits behind a Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
+Node-to-node communication uses **AWS PrivateLink** — each node sits behind a Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
 
-Each node's sealed key blob is stored in S3, encrypted with a hardware-derived key via `MSG_KEY_REQ` — even AWS cannot decrypt it.
+Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
+
+The API server (developer registration, billing, admin, webhooks) runs as Lambda functions behind API Gateway — see `ruonid-frontend/` for that infrastructure.
 
 ## Repository Structure
 
@@ -32,7 +32,7 @@ crates/
   seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
   monitor/    Maintenance event monitor with webhook alerts
 docker/       Dockerfiles, docker-compose, SEV-SNP config
-deploy/       Deployment automation (provision.sh, deploy.sh, setup-ecs.sh)
+deploy/       Deployment automation (provision.sh, deploy.sh)
 scripts/      Dev utilities (integration-test.sh)
 ```
 
@@ -41,8 +41,8 @@ scripts/      Dev utilities (integration-test.sh)
 | Crate | Description |
 |-------|-------------|
 | **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination. Built on FROST secp256k1 and k256. |
-| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Acts as both coordinator (receives client request, calls a peer, combines partials) and peer (computes partial evaluation). Supports three key loading modes: init-seal (S3-mediated ECIES key injection with attestation), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
-| **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (2-of-3 for TEE deployment). Also supports re-deriving node shares from admin shares. |
+| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Acts as both coordinator (receives client request, calls threshold-1 peers, combines partials) and peer (computes partial evaluation). Supports three key loading modes: init-seal (S3-mediated ECIES key injection with attestation), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
+| **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (T-of-N for TEE deployment). Also supports re-deriving node shares from admin shares. |
 | **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes attestation report fetching and verification. |
 | **toprf-monitor** | Daemon that polls for scheduled host maintenance events and sends webhook alerts. |
 
@@ -67,11 +67,13 @@ bash scripts/integration-test.sh
 ### Local Development
 
 ```bash
-# Start 3 nodes with Docker Compose
+# Start nodes with Docker Compose
 docker compose -f docker/docker-compose.yml up --build
 ```
 
 Any node can act as coordinator. Node 1 is exposed at `http://localhost:3001/evaluate`.
+
+---
 
 ## Key Management
 
@@ -89,148 +91,229 @@ cargo run --release -p toprf-keygen -- init \
 
 ### 2. Derive node shares (per deployment)
 
-Bring 3 of the 5 admin shares together to produce 2-of-3 node shares for TEE deployment. Run this for every fresh deployment or key rotation.
+Bring 3 of the 5 admin shares together to produce T-of-N node shares for TEE deployment. The threshold and node count are configurable — set them to match your deployment:
 
 ```bash
+# 2-of-3 (default)
 cargo run --release -p toprf-keygen -- node-shares \
     --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
     --node-threshold 2 --node-shares 3 \
     --output-dir ./node-shares
+
+# 3-of-5
+cargo run --release -p toprf-keygen -- node-shares \
+    --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
+    --node-threshold 3 --node-shares 5 \
+    --output-dir ./node-shares
 ```
 
-Output: `node-shares/node-{1,2,3}-share.json` + `node-shares/public-config.json`. Point `NODE_SHARES_DIR` in `deploy/config.env` to this directory.
+Output: `node-shares/node-{1..N}-share.json` + `node-shares/public-config.json`. Point `NODE_SHARES_DIR` in `deploy/config.env` to this directory.
+
+The threshold and node count in `nodes.json` must match the keygen ceremony.
+
+---
 
 ## Deployment
 
-Three TEE VMs (one per AWS region) run the node binary. Each node can act as coordinator — receiving client requests, calling a peer via PrivateLink, and returning the combined OPRF evaluation. Clients reach nodes via API Gateway → NLB.
+### Configuration
+
+Two config files in `deploy/`:
+
+- **`config.env`** — Global settings (AWS account, instance type, IAM profile, domain, ceremony path)
+- **`nodes.json`** — Per-node config (regions, IPs, keys, S3 buckets, threshold)
+
+```bash
+cd deploy
+cp config.env.example config.env
+cp nodes.json.example nodes.json
+# Edit both files, then:
+./deploy.sh auto-config    # Populates IPs, SGs, VPCs from AWS
+```
+
+To change the threshold or node count, edit `nodes.json`: set `threshold` and add/remove entries in the `nodes` array. The keygen ceremony must match.
 
 ### Prerequisites
 
 - `aws` CLI authenticated locally
 - `jq`, `openssl`, `curl` installed locally
-- SSH key pairs created in each AWS region
-- Key ceremony completed
+- Key ceremony completed (node shares + public config)
+- Node image available at `ghcr.io/<owner>/toprf-node:latest` (built by CI)
 
-### VM Provisioning (`deploy/provision.sh`)
+### Step 1: Provision TEE Nodes (`provision.sh`)
 
-Provisions Amazon Linux 2023 instances with AMD SEV-SNP across AWS regions. Nodes can be provisioned individually.
+Launches AMD SEV-SNP virtual machines across AWS regions.
+
+Requires `nodes.json` with node regions and S3 bucket names filled in (buckets don't need to exist yet — `deploy.sh storage` creates them), and an IAM instance profile set in `config.env` with `s3:PutObject`/`s3:GetObject` on the sealed-key buckets.
+
+For each node:
+1. Creates an EC2 key pair in the node's region (saves `.pem` locally)
+2. Finds the latest Amazon Linux 2023 AMI
+3. Launches a `c6a.large` instance with SEV-SNP enabled
+4. Sets IMDS hop limit to 2 (for Docker)
+5. Attaches the IAM instance profile
 
 ```bash
-cd deploy
-cp config.env.example config.env
-# Fill in KEY_NAMEs, SSH_KEYs, S3_BUCKETs
-# IAM_INSTANCE_PROFILE is auto-created by provision.sh
+./provision.sh all        # All nodes
+./provision.sh 1          # Just node 1
 
-./provision.sh 1          # Provision node 1 (eu-west-1)
-./provision.sh 2          # Provision node 2 (eu-west-1)
-./provision.sh 3          # Provision node 3 (us-east-2)
-./provision.sh all        # Or all at once
+./provision.sh 2 --status      # Check node 2
+./provision.sh 3 --terminate   # Terminate node 3 + clear sealed blob
 ```
 
-### TEE Node Deployment (`deploy/deploy.sh`)
+After provisioning, run `./deploy.sh auto-config` to populate IPs, SGs, and VPC IDs in `nodes.json`.
 
-Pulls the node image from ghcr.io (built by CI), creates S3 buckets, handles init-seal key injection, starts nodes, and sets up AWS PrivateLink.
+### Step 2: Deploy OPRF Nodes (`deploy.sh`)
+
+Installs Docker, injects key shares, and starts the OPRF service on each node.
+
+**Phase 1: `pre-seal`** (automated)
+
+| Step | What it does |
+|------|-------------|
+| `setup-vms` | Installs Docker on each VM |
+| `pull` | Pulls the node image from ghcr.io |
+| `storage` | Creates S3 buckets for sealed key blobs |
+
+**Phase 2: `init-seal`** (interactive, S3-mediated ECIES)
+
+For each node:
+1. Starts a temporary container in init-seal mode — node generates an X25519 keypair, gets an attestation report binding the public key, and uploads both to S3
+2. Downloads the attestation report and public key from S3
+3. Verifies the SEV-SNP attestation (measurement + AMD certificate chain) and confirms the public key is bound to the report via REPORT_DATA
+4. Encrypts the key share using ECIES (X25519 ECDH + HKDF-SHA256 + AES-256-GCM) to the attested public key
+5. Uploads the encrypted share to S3 — node picks it up, decrypts with its private key, seals to hardware, verifies the seal round-trips, and uploads the sealed blob
+
+**Phase 3: `post-seal`** (automated)
+
+| Step | What it does |
+|------|-------------|
+| `privatelink` | Creates NLBs, Endpoint Services, and VPC Endpoints |
+| `coordinator-config` | Generates per-node coordinator configs with peer PrivateLink endpoints |
+| `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
+| `verify` | Health-checks all nodes via SSH |
 
 ```bash
-# Auto-populate IPs, SGs, VPC IDs, Subnet IDs from provisioned VMs:
-./deploy.sh auto-config
-
-./deploy.sh all           # Full deployment
+# Full deployment
+./deploy.sh all
 
 # Or step by step
-./deploy.sh setup-vms     # Install Docker on VMs
-./deploy.sh pull           # Pull node image from ghcr.io
-./deploy.sh storage        # Create S3 buckets for sealed blobs
-./deploy.sh init-seal      # Interactive: S3-mediated ECIES key injection (attested)
-./deploy.sh start          # Start nodes in normal mode
-./deploy.sh privatelink    # Create NLBs, Endpoint Services, VPC Endpoints
-./deploy.sh coordinator-config  # Generate per-node coordinator configs
-./deploy.sh verify         # Health check all nodes (via SSH)
-./deploy.sh e2e            # End-to-end: OPRF evaluate via coordinator
+./deploy.sh pre-seal
+./deploy.sh init-seal        # Interactive — one node at a time recommended
+./deploy.sh post-seal
 
-# Utilities
-./deploy.sh show-ips       # Fetch VM IPs from all regions
-./deploy.sh redeploy       # Pull latest image + restart nodes
+# Or individual steps
+./deploy.sh setup-vms
+./deploy.sh pull
+./deploy.sh storage
+./deploy.sh init-seal
+./deploy.sh privatelink
+./deploy.sh coordinator-config
+./deploy.sh start
+./deploy.sh verify
+./deploy.sh e2e              # End-to-end OPRF evaluation via coordinator
 ```
 
-### ECS Fargate + ALB (`deploy/setup-ecs.sh`)
+### Step 3: Lock Nodes (`deploy.sh lock`)
 
-Provisions the API server infrastructure: VPC with NAT Gateway, ALB, ECS Fargate cluster.
+Removes SSH access permanently. Nodes become stateless black boxes — only reachable on port 3001 through PrivateLink.
+
+For each node:
+1. Removes `authorized_keys` from the VM
+2. Stops and disables `sshd`
+3. Deletes the EC2 key pair from AWS
+4. Deletes the local `.pem` file
 
 ```bash
-./setup-ecs.sh all          # Full infrastructure setup
-
-# Or step by step
-./setup-ecs.sh vpc          # VPC, subnets, IGW, NAT Gateway
-./setup-ecs.sh security     # Security groups
-./setup-ecs.sh alb          # Application Load Balancer
-./setup-ecs.sh cert         # ACM certificate request
-./setup-ecs.sh roles        # IAM roles
-./setup-ecs.sh ecr          # ECR repo for API server
-./setup-ecs.sh cluster      # ECS Fargate cluster
-./setup-ecs.sh task         # Task definition
-./setup-ecs.sh service      # ECS service
-
-# Operations
-./setup-ecs.sh status        # Show NAT EIP, ALB DNS, service health
-./setup-ecs.sh redeploy      # Force new deployment
+./deploy.sh lock
 ```
 
-### Node Replacement (`deploy/replace-node.sh`)
+This is irreversible. If a node fails after locking, terminate it (`./provision.sh <N> --terminate`) and reprovision from scratch.
 
-Replaces a single failed node without touching the other nodes. The replacement reuses the same key share and the same PrivateLink endpoint — peers don't need any config changes.
+### Common Operations
 
 ```bash
-./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json
+./deploy.sh redeploy                # All nodes (requires SSH — before lock)
+./deploy.sh --nodes 2 redeploy     # Single node
+./deploy.sh verify                  # Health-check nodes
+./deploy.sh show-ips                # Fetch node IPs from AWS
 ```
 
-See `deploy/README.md` for full options (`--skip-provision`, `--skip-init-seal`).
+---
 
-### Zero-Downtime Key Rotation
+## Blue-Green Rotation
 
-Key rotation deploys to fresh nodes rather than resealing existing ones. The old nodes keep serving traffic until the new ones are verified, so there is no downtime.
+Zero-downtime node rotation using slots. Each slot is a fully independent set of nodes + NLBs + PrivateLink. Traffic switches by updating the Lambda's NLB_URL env var.
 
-1. **Derive new node shares** (air-gapped machine):
-   ```bash
-   toprf-keygen node-shares \
-       --admin-share admin-1.json --admin-share admin-3.json --admin-share admin-5.json \
-       --node-threshold 2 --node-shares 3 \
-       --output-dir ./node-shares-v2
-   ```
+### Prerequisites
 
-2. **Provision 3 new VMs**:
-   ```bash
-   ./provision.sh all
-   ```
+- 3-of-5 admin shares (from `toprf-keygen init`)
+- Current nodes tagged with a slot (e.g., `blue`)
 
-3. **Update `deploy/config.env`** with the new VM IPs and `NODE_SHARES_DIR=./node-shares-v2`. Run `./deploy.sh auto-config` to fill in IPs automatically.
+### Flow
 
-4. **Deploy to new nodes**:
-   ```bash
-   ./deploy.sh all
-   ```
+```bash
+# 1. Admin ceremony: reconstruct secret, generate fresh node shares
+toprf-keygen node-shares \
+  -a admin-1.json -a admin-3.json -a admin-5.json \
+  --node-threshold 2 --node-shares 3 \
+  -o ./node-shares
 
-5. **Verify new nodes** are healthy:
-   ```bash
-   ./deploy.sh verify
-   ```
+# 2. Create config.env + nodes.json from examples, fill in values
 
-6. **Set up PrivateLink for new nodes** and update coordinator configs:
-   ```bash
-   ./deploy.sh privatelink
-   ./deploy.sh coordinator-config
-   ./deploy.sh start
-   ```
-   Restart nodes to pick up the new coordinator configs.
+# 3. Provision new VMs alongside old ones
+SLOT=green ./provision.sh all
 
-7. **Decommission old VMs**:
-   ```bash
-   ./provision.sh all --terminate
-   ```
+# 4. Deploy everything (sealed nodes + PrivateLink + start)
+./deploy.sh --slot green auto-config
+./deploy.sh --slot green all
+
+# 5. Verify new set is healthy
+./deploy.sh --slot green e2e
+
+# 6. Switch traffic (updates Lambda NLB_URL)
+./deploy.sh --slot green cutover
+
+# 7. Tear down old set (discovers resources by Slot=blue tag, deletes all)
+./deploy.sh --slot blue teardown
+
+# 8. Clean up local files
+rm -f config.env nodes.json *.pem
+rm -rf node-shares coordinator-configs-green
+```
+
+After teardown, `green` is the active slot. Next rotation deploys to `blue`, cuts over, tears down `green`.
+
+---
+
+## Local File Cleanup
+
+After `deploy.sh lock`, nodes are running and SSH is gone. You can delete all local deploy files and start fresh for the next rotation:
+
+```bash
+rm -f config.env nodes.json privatelink-state.env *.pem
+rm -rf coordinator-configs node-shares
+```
+
+All of these are regenerated during deployment:
+
+| File | Created by |
+|------|------------|
+| `config.env` / `nodes.json` | Copied from `.example` templates |
+| `*.pem` | `provision.sh` |
+| `privatelink-state.env` | `deploy.sh privatelink` |
+| `coordinator-configs/` | `deploy.sh coordinator-config` |
+| `node-shares/` | `toprf-keygen node-shares` (admin ceremony) |
+| `docker/coordinator-node-*.json` | `docker compose` (local test artifacts) |
+
+Teardown discovers old resources **by AWS tags** (`Slot=<name>`, `Project=toprf`), not from local files — no previous state needed.
+
+**Caveat:** `teardown` searches only the regions listed in your current `nodes.json`. If the old slot used regions not in the new config, add them temporarily so teardown can find those resources.
+
+---
 
 ## Security Properties
 
-- **No single point of compromise** — key shares split across 3 AWS regions, each below the 2-of-3 threshold
+- **No single point of compromise** — key shares split across N nodes, each below the T-of-N threshold
 - **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP measurement-derived keys; AWS cannot decrypt
 - **TEE attestation** — key injection verified against hardware attestation reports
 - **Network isolation** — nodes only reachable via AWS PrivateLink; traffic never crosses the public internet
@@ -244,6 +327,15 @@ GitHub Actions runs on push/PR to `main`:
 2. **Unit Tests** — `cargo test --release`
 3. **Build** — `cargo build --release`
 4. **Integration Tests** — Full E2E with 3 nodes
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| S3 upload denied during seal | Missing IAM permissions | Add `s3:PutObject` to the instance profile role |
+| Container exits on init-seal | Crash during attestation | `ssh <node> "sudo docker logs toprf-init-seal"` |
+| Coordinator can't reach peer | PrivateLink endpoint not available | Check `privatelink-state.env` for endpoint IDs; verify endpoint is in `available` state |
+| NLB targets unhealthy | Node not running or wrong port | SSH to node, check `docker ps` and `docker logs toprf-node` |
 
 ## License
 
