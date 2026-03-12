@@ -1,65 +1,24 @@
 # Deployment Guide
 
-Deploy the RuonID API server and 3 threshold OPRF nodes across AWS.
+Deploy 3 threshold OPRF nodes across AWS regions.
 
 ## Architecture
 
 ```
-Mobile App → API Gateway (TLS) → VPC Link → NLB (eu-west-1)
-                                               ↓
-                                    Node 1 or Node 2 (coordinator)
-                                               ↓ AWS PrivateLink
-                                            Peer Node
+Mobile App → API Gateway (TLS) → Lambda (VPC) → NLB (eu-west-1)
+                                                    ↓
+                                         Node 1 or Node 2 (coordinator)
+                                                    ↓ AWS PrivateLink
+                                                 Peer Node
 ```
 
 Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
 
----
-
-## Step 1: ECS Infrastructure (`setup-ecs.sh`)
-
-Sets up the cloud infrastructure for the API server.
-
-### Prerequisites
-
-- AWS CLI authenticated with admin-level access
-- `jq` installed
-- A domain name (e.g. `api.ruonlabs.com`)
-- `config.env` created from `config.env.example` with `AWS_ACCOUNT_ID` and `DOMAIN` set
-
-### What it does
-
-| Step | Creates |
-|------|---------|
-| `vpc` | VPC, public/private subnets, IGW, NAT Gateway, route tables |
-| `security` | Security groups for ALB and ECS tasks |
-| `alb` | Application Load Balancer + target group |
-| `cert` | ACM certificate request (needs DNS validation after) |
-| `roles` | IAM roles for ECS task execution and runtime (DynamoDB, KMS) |
-| `ecr` | ECR repository for the API server image |
-| `cluster` | ECS Fargate cluster + CloudWatch log group |
-| `task` | ECS task definition (api-server) |
-| `service` | ECS service wired to the ALB |
-
-### Run
-
-```bash
-cd deploy
-cp config.env.example config.env   # Fill in AWS_ACCOUNT_ID, DOMAIN
-./setup-ecs.sh all
-```
-
-### After it runs
-
-- ALB is live (HTTP only initially)
-- Add the DNS CNAME record shown in the output
-- Validate the ACM certificate, then run `./setup-ecs.sh add-https`
-- Note the NAT Gateway EIP
-- Resource IDs are saved to `ecs-state.env` (don't delete this file)
+The API server (developer registration, billing, admin, webhooks) runs as Lambda functions behind API Gateway — see `ruonid-frontend/` for that infrastructure.
 
 ---
 
-## Step 2: Provision TEE Nodes (`provision.sh`)
+## Step 1: Provision TEE Nodes (`provision.sh`)
 
 Launches AMD SEV-SNP virtual machines in 3 regions.
 
@@ -99,13 +58,13 @@ For each node:
 
 ---
 
-## Step 3: Deploy OPRF Nodes (`deploy.sh`)
+## Step 2: Deploy OPRF Nodes (`deploy.sh`)
 
 Installs Docker, injects key shares, and starts the OPRF service on each node.
 
 ### Prerequisites
 
-- Nodes provisioned and running (step 2)
+- Nodes provisioned and running (step 1)
 - `config.env` populated (run `./deploy.sh auto-config` after provisioning)
 - Key ceremony completed — key shares at `../ceremony/node-shares/`
   - `public-config.json` (group public key, threshold, verification shares)
@@ -156,17 +115,16 @@ For each node:
 
 - All nodes are sealed, running, and reachable via PrivateLink
 - Each node can act as coordinator (receives client requests, calls a peer, returns combined evaluation)
-- Set up API Gateway to expose nodes to clients
 
 ---
 
-## Step 4: Lock Nodes (`deploy.sh lock`)
+## Step 3: Lock Nodes (`deploy.sh lock`)
 
 Removes SSH access permanently. Nodes become stateless black boxes — only reachable on port 3001 through PrivateLink.
 
 ### Prerequisites
 
-- Nodes deployed and verified (step 3)
+- Nodes deployed and verified (step 2)
 - You're sure everything is working — this is irreversible
 
 ### What it does
@@ -198,36 +156,57 @@ For each node:
 ./deploy.sh --nodes 2 redeploy     # Single node
 ```
 
-### Redeploy ECS (API server update)
-```bash
-./setup-ecs.sh redeploy            # Force new ECS deployment
-```
-
 ### Check status
 ```bash
 ./deploy.sh verify                 # Health-check nodes
 ./deploy.sh show-ips               # Fetch node IPs from AWS
-./setup-ecs.sh status              # ECS service status
 ```
 
 ---
 
-## Node Replacement
+## Blue-Green Rotation (recommended)
 
-If a node fails, replace it with `replace-node.sh`. This provisions a new VM, seals the key share, swaps the NLB target, and starts the node — without touching the other nodes or their PrivateLink endpoints.
+Zero-downtime node rotation using slots. Each slot is a fully independent set of nodes + NLBs + PrivateLink. Traffic switches by updating the Lambda's NLB_URL env var.
+
+### Prerequisites
+
+- 3-of-5 admin shares (from `toprf-keygen init`)
+- Current nodes tagged with a slot (e.g., `blue`)
+
+### Flow
 
 ```bash
-# Full replacement (provision new VM + seal + start)
-./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json
+# 1. Admin ceremony: reconstruct secret, generate fresh node shares
+toprf-keygen node-shares \
+  -a admin-1.json -a admin-3.json -a admin-5.json \
+  -o ./node-shares
 
-# Skip provisioning (VM already exists, just re-seal and start)
-./replace-node.sh 3 --share-file ../ceremony/node-shares/node-3-share.json --skip-provision
+# 2. Create config.env from example, fill in regions + S3 buckets
 
-# Skip init-seal too (node already sealed, just update NLB and start)
-./replace-node.sh 3 --skip-provision --skip-init-seal
+# 3. Provision new VMs alongside old ones
+SLOT=green ./provision.sh all
+
+# 4. Deploy everything (sealed nodes + PrivateLink + start)
+./deploy.sh --slot green auto-config
+./deploy.sh --slot green all
+
+# 5. Verify new set is healthy
+./deploy.sh --slot green e2e
+
+# 6. Switch traffic (updates Lambda NLB_URL)
+./deploy.sh --slot green cutover
+
+# 7. Tear down old set (discovers resources by Slot=blue tag, deletes all)
+./deploy.sh --slot blue teardown
+
+# 8. Clean up local files — nothing to keep
+rm -f config.env *.pem
+rm -rf node-shares coordinator-configs-green
 ```
 
-The NLB target group swap is transparent to peers — the PrivateLink endpoint DNS stays the same, so other nodes' coordinator configs don't need updating.
+After teardown, `green` is the active slot. Next rotation deploys to `blue`, cuts over, tears down `green`.
+
+**Nothing persisted locally between rotations.** Admin shares are distributed across 5 admins. All infrastructure state lives in AWS resource tags.
 
 ---
 

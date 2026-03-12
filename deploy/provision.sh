@@ -30,6 +30,11 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 source "$CONFIG_FILE"
 
+# Slot support: SLOT env var controls VM tag names for blue-green deployments
+SLOT="${SLOT:-}"
+_slot_suffix() { [[ -n "$SLOT" ]] && echo "-${SLOT}" || echo ""; }
+_vm_tag() { echo "toprf-node-${1}$(_slot_suffix)"; }
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 info()  { echo "==> $*"; }
@@ -131,10 +136,11 @@ ensure_iam_profile() {
 
 find_instance() {
     local n="$1"
-    local region
+    local region tag
     region=$(node_region "$n")
+    tag=$(_vm_tag "$n")
     aws ec2 describe-instances --region "$region" \
-        --filters "Name=tag:Name,Values=toprf-node-${n}" \
+        --filters "Name=tag:Name,Values=${tag}" \
                   "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null
 }
@@ -169,6 +175,7 @@ provision_node() {
         aws ec2 create-key-pair --region "$region" \
             --key-name "$key_name" \
             --key-type ed25519 \
+            --tag-specifications "ResourceType=key-pair,Tags=[{Key=Project,Value=toprf}${SLOT:+,{Key=Slot,Value=$SLOT}}]" \
             --query 'KeyMaterial' --output text > "$key_file"
         chmod 600 "$key_file"
         echo "  Key saved to: $key_file"
@@ -200,7 +207,7 @@ provision_node() {
         --key-name "$key_name" \
         --cpu-options AmdSevSnp=enabled \
         --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=50,VolumeType=gp3}' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=toprf-node-${n}}]" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$(_vm_tag "$n")},{Key=Project,Value=toprf}${SLOT:+,{Key=Slot,Value=$SLOT}}]" \
         --query 'Instances[0].InstanceId' --output text)
 
     echo "  Instance: $instance_id"
@@ -275,15 +282,17 @@ show_status() {
     info "Node $n status ($region)"
 
     local result
+    local tag
+    tag=$(_vm_tag "$n")
     result=$(aws ec2 describe-instances --region "$region" \
-        --filters "Name=tag:Name,Values=toprf-node-${n}" \
+        --filters "Name=tag:Name,Values=${tag}" \
         --query 'Reservations[].Instances[].{Id:InstanceId,State:State.Name,Type:InstanceType,PublicIp:PublicIpAddress,PrivateIp:PrivateIpAddress,LaunchTime:LaunchTime}' \
         --output table 2>/dev/null) || true
 
     if [[ -n "$result" ]]; then
         echo "$result"
     else
-        echo "  No instances found with tag toprf-node-${n}"
+        echo "  No instances found with tag ${tag}"
     fi
 }
 
