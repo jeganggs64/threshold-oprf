@@ -174,16 +174,16 @@ def launch_instance(config, node):
     iam_profile = config.get("iam_instance_profile", "ruonid-node-profile")
     image = config.get("node_image", "ghcr.io/jeganggs64/toprf-node:latest")
 
-    # Find latest Amazon Linux 2023 AMI
-    amis = ec2.describe_images(
-        Owners=["amazon"],
-        Filters=[
-            {"Name": "name", "Values": ["al2023-ami-*-x86_64"]},
-            {"Name": "state", "Values": ["available"]},
-            {"Name": "architecture", "Values": ["x86_64"]},
-        ],
-    )
-    ami_id = sorted(amis["Images"], key=lambda x: x["CreationDate"], reverse=True)[0]["ImageId"]
+    # Use pinned AMI from node config (set at provision time).
+    # This ensures rotated nodes use the same AMI as the original deployment,
+    # keeping the SEV-SNP measurement stable. To update the AMI, redeploy
+    # all nodes from scratch.
+    ami_id = node.get("ami_id")
+    if not ami_id:
+        raise ValueError(
+            f"ami_id not set for node {node['id']}. "
+            "Reprovision nodes or set ami_id in SSM config."
+        )
 
     # Find a subnet in the target VPC
     subnet_id = node.get("subnet_id")

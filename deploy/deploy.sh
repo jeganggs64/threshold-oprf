@@ -1215,12 +1215,13 @@ step_auto_config() {
             --query 'Reservations[0].Instances[0]' --output json 2>/dev/null) || true
 
         if [[ -n "$instance_data" && "$instance_data" != "null" ]]; then
-            local pub_ip priv_ip sg_id vpc_id subnet_id
+            local pub_ip priv_ip sg_id vpc_id subnet_id ami_id
             pub_ip=$(echo "$instance_data" | jq -r '.PublicIpAddress // empty')
             priv_ip=$(echo "$instance_data" | jq -r '.PrivateIpAddress // empty')
             sg_id=$(echo "$instance_data" | jq -r '.SecurityGroups[0].GroupId // empty')
             vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
             subnet_id=$(echo "$instance_data" | jq -r '.SubnetId // empty')
+            ami_id=$(echo "$instance_data" | jq -r '.ImageId // empty')
 
             # Set ssh_key if still empty (derive from key_name)
             local key_name ssh_key_val
@@ -1236,11 +1237,11 @@ step_auto_config() {
             jq --argjson id "$i" \
                --arg ip "$pub_ip" --arg pip "$priv_ip" \
                --arg sg "$sg_id" --arg vpc "$vpc_id" --arg sub "$subnet_id" \
-               --arg ssh "$ssh_key_val" \
-               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub, ssh_key: $ssh}' \
+               --arg ssh "$ssh_key_val" --arg ami "$ami_id" \
+               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub, ssh_key: $ssh, ami_id: $ami}' \
                "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
 
-            echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id"
+            echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id ami=$ami_id"
         else
             warn "Could not find Node $i in $region"
         fi
