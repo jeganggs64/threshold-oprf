@@ -189,6 +189,7 @@ For each node:
 | `coordinator-config` | Generates per-node coordinator configs with peer PrivateLink endpoints |
 | `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
 | `verify` | Health-checks all nodes via SSH |
+| `cloudwatch` | Creates CloudWatch alarms for unhealthy node detection |
 
 ```bash
 # Full deployment
@@ -265,6 +266,23 @@ For each node to rotate (1..N):
 ```
 
 After all nodes are rotated, each node has a fresh VM and a new share on the **same polynomial** — the group public key and OPRF function are unchanged.
+
+### Unhealthy node detection
+
+CloudWatch alarms monitor each node's NLB target health. If a target is unhealthy for 3 consecutive minutes, the alarm fires to an SNS topic. The rotation Lambda is subscribed to this topic and automatically triggers single-node recovery for the failed node.
+
+```bash
+# Set up alarms after deployment
+./deploy.sh cloudwatch
+
+# Subscribe rotation Lambda to the SNS topic
+aws sns subscribe \
+  --topic-arn arn:aws:sns:<region>:<account>:toprf-node-alerts \
+  --protocol lambda \
+  --notification-endpoint arn:aws:lambda:<region>:<account>:function:toprf-rotation
+```
+
+The NLB health check polls `GET /health` every 30 seconds. A node is marked unhealthy after 2 consecutive failures (60s). The CloudWatch alarm requires 3 consecutive unhealthy data points at 1-minute resolution (3 minutes total) before alerting — this avoids false alarms from transient issues.
 
 ### Why no admin ceremony?
 
