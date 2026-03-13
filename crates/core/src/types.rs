@@ -23,9 +23,6 @@ pub enum TOPRFError {
     #[error("not enough partial evaluations: need {need}, got {got}")]
     InsufficientPartials { need: usize, got: usize },
 
-    #[error("insufficient admin signatures: need {need}, got {got}")]
-    InsufficientAdminSigs { need: usize, got: usize },
-
     #[error("DLEQ proof verification failed for node {0}")]
     DLEQVerificationFailed(u16),
 
@@ -106,22 +103,6 @@ pub struct KeyGenResult {
     pub threshold: u16,
     /// Total shares.
     pub total_shares: u16,
-}
-
-/// Migration request signed by admin quorum.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigrationRequest {
-    pub request_id: String,
-    pub timestamp: u64,
-    pub target_endpoints: Vec<String>,
-    pub new_threshold: u16,
-    pub admin_signatures: Vec<AdminSignature>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminSignature {
-    pub admin_public_key: String,
-    pub signature: String,
 }
 
 // -- Point encoding helpers --
