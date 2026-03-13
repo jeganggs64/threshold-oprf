@@ -37,7 +37,6 @@ fn print_help() {
     eprintln!("  --output <PATH>            Path to write the ECIES-encrypted share");
     eprintln!("  --share-file <PATH>        Path to the node's key share JSON file");
     eprintln!("  --expected-measurement <HEX>  Expected measurement (96 hex chars)");
-    eprintln!("  --skip-attestation-verify  Skip AMD certificate chain verification (dev only)");
     eprintln!("  -h, --help                 Show this help");
     eprintln!();
     eprintln!("The operator downloads attestation.bin, pubkey.bin, and certs.bin from S3,");
@@ -69,7 +68,6 @@ async fn main() {
     let mut output_path: Option<String> = None;
     let mut share_file: Option<String> = None;
     let mut expected_measurement: Option<String> = None;
-    let mut skip_verify = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -121,9 +119,6 @@ async fn main() {
                     process::exit(1);
                 }
                 expected_measurement = Some(args[i].clone());
-            }
-            "--skip-attestation-verify" => {
-                skip_verify = true;
             }
             "--help" | "-h" => {
                 print_help();
@@ -190,12 +185,23 @@ async fn main() {
     }
     eprintln!("  Measurement matches expected value.");
 
+    // 2b. Verify VMPL == 0 (most privileged guest level)
+    if report.vmpl != 0 {
+        eprintln!("Error: VMPL is {} — must be 0 for production nodes", report.vmpl);
+        process::exit(1);
+    }
+    eprintln!("  VMPL: 0 (OK)");
+
+    // 2c. Verify guest policy debug bit is NOT set (bit 19)
+    if (report.policy >> 19) & 1 != 0 {
+        eprintln!("Error: guest policy has debug bit set (policy=0x{:x})", report.policy);
+        eprintln!("  Debug-enabled VMs allow the hypervisor to read guest memory.");
+        process::exit(1);
+    }
+    eprintln!("  Policy: 0x{:x} (debug disabled, OK)", report.policy);
+
     // 3. Verify attestation report signature (AMD certificate chain)
-    if skip_verify {
-        eprintln!(
-            "  WARNING: skipping AMD certificate chain verification (--skip-attestation-verify)"
-        );
-    } else if let Some(ref certs_file) = certs_path {
+    if let Some(ref certs_file) = certs_path {
         // Use certificate chain from extended report (required for AWS EC2
         // where the chip ID is masked and AMD KDS is unavailable)
         eprintln!("  Reading certificate chain from {certs_file}");
@@ -204,40 +210,23 @@ async fn main() {
             process::exit(1);
         });
 
-        match parse_cert_table(&cert_table_bytes) {
-            Ok(certs) => {
-                eprintln!(
-                    "  Certificates: VCEK={} bytes, ASK={} bytes, ARK={} bytes",
-                    certs.vcek.len(),
-                    certs.ask.len(),
-                    certs.ark.len()
-                );
-                eprintln!("  Verifying AMD certificate chain (VCEK -> ASK -> ARK)...");
-                AttestationVerifier::verify_report_with_certs(&report, &certs).unwrap_or_else(
-                    |e| {
-                        eprintln!("Error: attestation verification failed: {e}");
-                        process::exit(1);
-                    },
-                );
-                eprintln!("  Attestation report signature verified (using provided certs).");
-            }
-            Err(_) => {
-                if skip_verify {
-                    eprintln!(
-                        "  WARNING: certificate table empty and --skip-attestation-verify set."
-                    );
-                    eprintln!("  Skipping AMD signature verification.");
-                    eprintln!("  Measurement and REPORT_DATA binding are still verified.");
-                } else {
-                    eprintln!("  Error: certificate table empty (AWS EC2 does not provide certs).");
-                    eprintln!("  Cannot verify AMD signature chain without certificates.");
-                    eprintln!(
-                        "  Use --skip-attestation-verify to proceed without cert verification."
-                    );
-                    process::exit(1);
-                }
-            }
-        }
+        let certs = parse_cert_table(&cert_table_bytes).unwrap_or_else(|e| {
+            eprintln!("Error: failed to parse certificate table: {e}");
+            process::exit(1);
+        });
+
+        eprintln!(
+            "  Certificates: VCEK={} bytes, ASK={} bytes, ARK={} bytes",
+            certs.vcek.len(),
+            certs.ask.len(),
+            certs.ark.len()
+        );
+        eprintln!("  Verifying AMD certificate chain (VCEK -> ASK -> ARK)...");
+        AttestationVerifier::verify_report_with_certs(&report, &certs).unwrap_or_else(|e| {
+            eprintln!("Error: attestation verification failed: {e}");
+            process::exit(1);
+        });
+        eprintln!("  Attestation report signature verified (using provided certs).");
     } else {
         // Fall back to fetching from AMD KDS (requires non-zero chip ID)
         eprintln!("  Verifying AMD certificate chain (fetching from AMD KDS)...");

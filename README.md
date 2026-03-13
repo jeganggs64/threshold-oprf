@@ -117,7 +117,7 @@ The threshold and node count in `nodes.json` must match the keygen ceremony.
 
 Two config files in `deploy/`:
 
-- **`config.env`** — Global settings (instance type, ceremony path). IAM roles/profiles are auto-created.
+- **`config.env`** — Global settings (instance type, ceremony path).
 - **`nodes.json`** — Per-node config (regions, threshold). IPs, keys, S3 buckets, SGs are auto-populated.
 
 ```bash
@@ -141,7 +141,7 @@ To change the threshold or node count, edit `nodes.json`: set `threshold` and ad
 Launches AMD SEV-SNP virtual machines across AWS regions.
 
 Requires `nodes.json` with node regions filled in. Everything else is auto-created:
-- **IAM role + instance profile** — created automatically with per-node S3 policies
+- **Per-node IAM roles** — each node gets its own IAM role (`toprf-node-<id>-role`) scoped to only that node's S3 bucket
 - **EC2 key pairs** — created per node, `.pem` files saved locally
 - **S3 bucket names** — auto-generated as `toprf-sealed-<account>-node-<id>` if empty
 - **Security groups, VPCs, subnets** — populated by `auto-config` after provisioning
@@ -342,10 +342,14 @@ Third-party auditors can verify:
 
 - **No single point of compromise** — key shares split across N nodes, each below the T-of-N threshold
 - **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP `MSG_KEY_REQ`-derived keys; AWS cannot decrypt
-- **TEE attestation** — key injection and share recovery verified against hardware attestation reports with AMD certificate chain validation
-- **DLEQ proofs** — every partial evaluation includes a DLEQ proof proving the node used its correct key share; coordinator verifies before combining
+- **TEE attestation** — key injection and share recovery verified against hardware attestation reports with AMD certificate chain validation, VMPL == 0 enforcement, and guest policy debug-bit rejection
+- **ARK fingerprint pinning** — AMD root certificate fingerprint is mandatory, preventing MITM on the KDS connection
+- **DLEQ proofs** — every partial evaluation includes a DLEQ proof (SHA-512 wide reduction) proving the node used its correct key share; coordinator verifies before combining
 - **Attestation-bound recovery** — donor nodes independently verify the target's attestation before releasing sub-shares; compromised orchestrator cannot extract shares
+- **Reshare replay protection** — donor nodes track processed attestation reports to prevent duplicate sub-share extraction
+- **Per-node IAM isolation** — each node's IAM role is scoped to only its own S3 bucket
 - **Network isolation** — nodes only reachable via AWS PrivateLink; traffic never crosses the public internet
+- **ECIES key binding** — HKDF derivation binds both public keys and uses a fixed protocol salt for domain separation
 - **Device attestation** — Apple App Attest and Google Play Integrity validation (via API Gateway)
 
 ## CI

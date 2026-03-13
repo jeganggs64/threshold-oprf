@@ -105,6 +105,10 @@ pub fn parse_cert_table(raw: &[u8]) -> Result<CertChain, SealError> {
 pub struct AttestationVerifier;
 
 impl AttestationVerifier {
+    // TODO(L-5): Add CRL/OCSP revocation checking for VCEK certificates.
+    // AMD publishes CRLs at https://kdsintf.amd.com/vcek/v1/{product}/crl
+    // Check certs against the CRL to detect revoked VCEK keys.
+
     /// Verify the SNP report using a pre-provided certificate chain.
     ///
     /// Use this when the cert chain comes from `SNP_GET_EXT_REPORT` (e.g., on
@@ -349,12 +353,12 @@ impl AttestationVerifier {
                 Ok(())
             }
             Err(_) => {
-                tracing::warn!(
-                    "AMD_ARK_FINGERPRINT not set — ARK certificate is NOT pinned. \
-                     Set this env var to the SHA-256 hex digest of the ARK DER certificate \
-                     for your AMD product family to defend against MITM on the KDS connection."
-                );
-                Ok(())
+                Err(SealError::AttestationFailed(
+                    "AMD_ARK_FINGERPRINT env var is not set — ARK certificate pinning is \
+                     mandatory. Set this to the SHA-256 hex digest of the DER-encoded ARK \
+                     certificate for your AMD product family."
+                        .into(),
+                ))
             }
         }
     }

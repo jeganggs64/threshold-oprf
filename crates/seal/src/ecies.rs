@@ -21,6 +21,11 @@ use crate::SealError;
 /// HKDF info string for key derivation.
 const HKDF_INFO: &[u8] = b"toprf-ecies-aes256gcm";
 
+/// Fixed protocol salt for HKDF domain separation.
+/// Using a non-empty salt strengthens the extract step and provides
+/// domain separation from other protocols that may use the same shared secret.
+const HKDF_SALT: &[u8] = b"toprf-ecies-v1-salt";
+
 /// Size of an X25519 public key.
 const PUBKEY_LEN: usize = 32;
 
@@ -149,7 +154,7 @@ fn derive_aes_key(
     ephemeral_pubkey: &[u8; 32],
     recipient_pubkey: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>, SealError> {
-    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_secret);
     let mut info = Vec::with_capacity(HKDF_INFO.len() + 64);
     info.extend_from_slice(HKDF_INFO);
     info.extend_from_slice(ephemeral_pubkey);

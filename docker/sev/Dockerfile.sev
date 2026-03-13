@@ -38,6 +38,8 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build
 # ---------------------------------------------------------------------------
+# Pin base images to specific tags for reproducibility.
+# Update these when upgrading toolchains.
 FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build

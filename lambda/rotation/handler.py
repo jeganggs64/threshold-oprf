@@ -22,6 +22,8 @@ Environment variables:
 import json
 import logging
 import os
+import re
+import shlex
 import time
 import base64
 
@@ -98,19 +100,27 @@ def update_node_config(config, node_id, updates):
 # EC2 Operations
 # ---------------------------------------------------------------------------
 
+def _validate_shell_safe(value, name):
+    """Validate that a value is safe for shell interpolation (alphanumeric, hyphens, dots, colons, slashes)."""
+    if not re.match(r'^[a-zA-Z0-9._:/@\-]+$', str(value)):
+        raise ValueError(f"Unsafe characters in {name}: {value!r}")
+    return str(value)
+
+
 def build_user_data(config, node, image):
     """Build EC2 user data script that bootstraps init-reshare."""
-    node_id = node["id"]
-    bucket = node["s3_bucket"]
-    threshold = config["threshold"]
+    node_id = int(node["id"])
+    bucket = _validate_shell_safe(node["s3_bucket"], "s3_bucket")
+    threshold = int(config["threshold"])
     total = len(config["nodes"])
-    group_public_key = config["group_public_key"]
+    group_public_key = _validate_shell_safe(config["group_public_key"], "group_public_key")
+    image = _validate_shell_safe(image, "image")
 
     # Donor IDs = all nodes except the one being replaced
     donor_ids = [n["id"] for n in config["nodes"] if n["id"] != node_id]
     min_contributions = threshold
 
-    measurement = get_measurement()
+    measurement = _validate_shell_safe(get_measurement(), "measurement")
 
     script = f"""#!/bin/bash
 set -euo pipefail
@@ -126,37 +136,37 @@ systemctl start docker
 systemctl enable docker
 
 # Pull node image
-docker pull {image}
+docker pull {shlex.quote(image)}
 
 # Run init-reshare mode
 echo "Starting init-reshare..."
 docker run --rm --name toprf-init-reshare \\
     --device /dev/sev-guest:/dev/sev-guest \\
     --cap-drop ALL --security-opt no-new-privileges:true \\
-    {image} \\
+    {shlex.quote(image)} \\
     --init-reshare \\
-    --s3-bucket '{bucket}' \\
-    --upload-url 's3://{bucket}/sealed.bin' \\
+    --s3-bucket {shlex.quote(bucket)} \\
+    --upload-url {shlex.quote('s3://' + bucket + '/sealed.bin')} \\
     --new-node-id {node_id} \\
     --new-threshold {threshold} \\
     --new-total-shares {total} \\
-    --group-public-key '{group_public_key}' \\
+    --group-public-key {shlex.quote(group_public_key)} \\
     --min-contributions {min_contributions}
 
 echo "Init-reshare complete. Starting normal mode..."
 
 # Write coordinator config (uploaded by Lambda via S3)
 mkdir -p /etc/toprf
-aws s3 cp s3://{bucket}/coordinator.json /etc/toprf/coordinator.json
+aws s3 cp {shlex.quote('s3://' + bucket + '/coordinator.json')} /etc/toprf/coordinator.json
 
 # Start in normal mode
 docker run -d --name toprf-node --restart=unless-stopped \\
-    -e SEALED_KEY_URL='s3://{bucket}/sealed.bin' \\
-    -e EXPECTED_PEER_MEASUREMENT='{measurement}' \\
+    -e SEALED_KEY_URL={shlex.quote('s3://' + bucket + '/sealed.bin')} \\
+    -e EXPECTED_PEER_MEASUREMENT={shlex.quote(measurement)} \\
     --device /dev/sev-guest:/dev/sev-guest \\
     --cap-drop ALL --security-opt no-new-privileges:true \\
     -p 3001:3001 \\
-    {image} \\
+    {shlex.quote(image)} \\
     --port 3001 \\
     --coordinator-config /etc/toprf/coordinator.json
 
@@ -171,7 +181,7 @@ def launch_instance(config, node):
     ec2 = boto3.client("ec2", region_name=region)
 
     instance_type = config.get("instance_type", "c6a.large")
-    iam_profile = config.get("iam_instance_profile", "ruonid-node-profile")
+    iam_profile = f"toprf-node-{node['id']}-profile"
     image = config.get("node_image", "ghcr.io/jeganggs64/toprf-node:latest")
 
     # Use pinned AMI from node config (set at provision time).
