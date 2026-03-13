@@ -1,0 +1,20 @@
+{
+  "name": "@toprf/lambda",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OPRF Lambda functions (challenge, attest, evaluate)",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "deploy": "./deploy.sh"
+  },
+  "dependencies": {
+    "@peculiar/x509": "^1.14.3",
+    "cbor": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}

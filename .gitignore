@@ -19,6 +19,11 @@ deploy/config.env
 deploy/nodes.json
 deploy/ecs-state.env
 deploy/privatelink-state.env
+lambda/config.env
+
+# Lambda build output
+lambda/dist/
+lambda/node_modules/
 
 # Generated configs
 deploy/coordinator-configs/
