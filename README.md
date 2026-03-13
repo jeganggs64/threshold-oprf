@@ -20,8 +20,6 @@ Node-to-node communication uses **AWS PrivateLink** — each node sits behind a 
 
 Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
 
-The API server (developer registration, billing, admin, webhooks) runs as Lambda functions behind API Gateway — see `ruonid-frontend/` for that infrastructure.
-
 ## Repository Structure
 
 ```
@@ -30,10 +28,23 @@ crates/
   node/       TEE node server — coordinator + peer mode, serves /evaluate, /partial-evaluate, /reshare
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing, ECIES encryption, attestation
+lambda/       OPRF Lambda functions (challenge, attest, evaluate)
 docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation (provision.sh, deploy.sh)
 scripts/      Dev utilities (integration-test.sh)
 ```
+
+### Lambda Functions
+
+Three Lambda functions handle the API Gateway layer in front of the OPRF nodes:
+
+| Function | Route | Description |
+|----------|-------|-------------|
+| **challenge** | `GET /challenge` | Issues single-use nonces (DynamoDB-backed) for device attestation |
+| **attest** | `POST /attest` | One-time Apple App Attest device key registration — validates CBOR attestation object, stores public key |
+| **evaluate** | `POST /evaluate` | Attestation-gated OPRF evaluation — verifies device assertion, proxies blinded input to coordinator node via NLB |
+
+Deployed via `lambda/deploy.sh` (sources secrets from gitignored `lambda/config.env`). Uses the `toprf-lambda-exec` IAM role. The evaluate Lambda is VPC-attached to reach the coordinator node's internal NLB.
 
 ### Crates
 

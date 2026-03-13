@@ -299,6 +299,7 @@ step_privatelink() {
             second_subnet=$(aws ec2 describe-subnets --region "$region" \
                 --filters "Name=vpc-id,Values=$vpc_id" \
                 --query "Subnets[?SubnetId!='${subnet_id}'] | [0].SubnetId" --output text)
+            [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet found in VPC $vpc_id ($region). NLB requires ≥2 AZs."
 
             local _nlb_name
             _nlb_name=$(nlb_name "$i")
@@ -552,9 +553,11 @@ step_privatelink() {
                 local peer_region svc_name_var svc_name sg_var sg_id
                 peer_region=$(node_region "$j")
                 svc_name_var="ENDPOINT_SVC_NAME_NODE${j}"
-                svc_name="${!svc_name_var}"
+                svc_name="${!svc_name_var:-}"
+                [[ -n "$svc_name" ]] || die "No endpoint service name for node $j. Run privatelink for node $j first."
                 sg_var="VPCE_SG_${my_vi}"
-                sg_id="${!sg_var}"
+                sg_id="${!sg_var:-}"
+                [[ -n "$sg_id" ]] || die "No VPCE security group for VPC $my_vi."
 
                 echo "  Creating VPCE for node $j in $my_vpc ($my_region)..."
 
@@ -563,6 +566,7 @@ step_privatelink() {
                 second_subnet=$(aws ec2 describe-subnets --region "$my_region" \
                     --filters "Name=vpc-id,Values=$my_vpc" \
                     --query "Subnets[?SubnetId!='${my_subnet}'] | [0].SubnetId" --output text)
+                [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet found in VPC $my_vpc ($my_region). VPCE requires ≥2 AZs."
 
                 local vpce_args=(
                     --region "$my_region"
@@ -610,9 +614,7 @@ step_privatelink() {
                     fi
                     attempts=$((attempts + 1))
                     if [[ $attempts -ge 60 ]]; then
-                        warn "Could not get DNS for $vpce_id after 5 minutes"
-                        vpce_dns=""
-                        break
+                        die "Could not get DNS for $vpce_id after 5 minutes"
                     fi
                     sleep 5
                 done
@@ -855,7 +857,7 @@ step_start() {
         local coord_config="${config_dir}/coordinator-node-${i}.json"
         local coord_args=""
         if [[ -f "$coord_config" ]]; then
-            scp_to_node "$i" "$coord_config"
+            scp_to_node "$i" "$coord_config" || die "Failed to upload coordinator config to node $i"
             ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json"
             coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
             echo "    Coordinator config uploaded"
@@ -1097,7 +1099,7 @@ step_cloudwatch() {
     for i in $(active_nodes); do
         local region tg_arn
         region=$(node_region "$i")
-        local tg_var="TG_ARN_NODE${i}"
+        local tg_var="PL_TG_ARN_NODE${i}"
         tg_arn="${!tg_var:-}"
         [[ -n "$tg_arn" ]] || { warn "No target group ARN for node $i — skipping"; continue; }
 
