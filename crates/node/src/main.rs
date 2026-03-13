@@ -438,8 +438,7 @@ async fn run_init_reshare(
                 .expect("init-reshare: failed to get extended attestation report");
 
         // Serialize attestation report
-        let mut attestation_bytes =
-            Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
+        let mut attestation_bytes = Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
         attestation_bytes.extend_from_slice(&report.body_bytes);
         while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
             attestation_bytes.push(0);
@@ -485,14 +484,11 @@ async fn run_init_reshare(
 
     for attempt in 1..=max_attempts {
         for donor_id in 1..=max_donor_id {
-            let contrib_url =
-                format!("s3://{s3_bucket}/reshare/contribution-from-{donor_id}.json");
+            let contrib_url = format!("s3://{s3_bucket}/reshare/contribution-from-{donor_id}.json");
             if let Ok(data) = cloud_storage::download_blob(&contrib_url).await {
                 if !data.is_empty() {
                     // Check if we already have this donor's contribution
-                    let already_have = contributions
-                        .iter()
-                        .any(|c| c.from_node_id == donor_id);
+                    let already_have = contributions.iter().any(|c| c.from_node_id == donor_id);
                     if !already_have {
                         match serde_json::from_slice::<SerializableReshareContribution>(&data) {
                             Ok(c) => {
@@ -503,10 +499,7 @@ async fn run_init_reshare(
                                 contributions.push(c);
                             }
                             Err(e) => {
-                                warn!(
-                                    donor_id,
-                                    "init-reshare: invalid contribution JSON: {e}"
-                                );
+                                warn!(donor_id, "init-reshare: invalid contribution JSON: {e}");
                             }
                         }
                     }
@@ -556,7 +549,11 @@ async fn run_init_reshare(
                 .expect("init-reshare: invalid base64 in encrypted contribution");
             let plaintext = toprf_seal::ecies::decrypt(&ephemeral_secret, &ciphertext)
                 .expect("init-reshare: ECIES decryption failed");
-            assert_eq!(plaintext.len(), 32, "init-reshare: decrypted sub-share is not 32 bytes");
+            assert_eq!(
+                plaintext.len(),
+                32,
+                "init-reshare: decrypted sub-share is not 32 bytes"
+            );
             let hex_str = hex::encode(&*plaintext);
             toprf_core::hex_to_scalar(&hex_str)
                 .expect("init-reshare: decrypted sub-share is not a valid scalar")
@@ -614,8 +611,10 @@ async fn run_init_reshare(
     let _ = cloud_storage::delete_blob(&s3_pubkey_url).await;
     let _ = cloud_storage::delete_blob(&s3_certs_url).await;
     for c in &contributions {
-        let contrib_url =
-            format!("s3://{s3_bucket}/reshare/contribution-from-{}.json", c.from_node_id);
+        let contrib_url = format!(
+            "s3://{s3_bucket}/reshare/contribution-from-{}.json",
+            c.from_node_id
+        );
         let _ = cloud_storage::delete_blob(&contrib_url).await;
     }
 
@@ -720,8 +719,7 @@ async fn upload_attestation_for_website(sealed_key_url: &str, key: &LoadedKey) {
 
     info!(
         node_id = key.node_id,
-        "attestation: report uploaded to s3://{}/attestation/",
-        bucket,
+        "attestation: report uploaded to s3://{}/attestation/", bucket,
     );
 }
 
@@ -964,9 +962,7 @@ async fn main() {
             eprintln!("Error: --init-reshare requires --s3-bucket <BUCKET>");
             std::process::exit(1);
         });
-        let seal_url = upload_url.unwrap_or_else(|| {
-            format!("s3://{bucket}/sealed.bin")
-        });
+        let seal_url = upload_url.unwrap_or_else(|| format!("s3://{bucket}/sealed.bin"));
         let new_node_id = reshare_new_node_id.unwrap_or_else(|| {
             eprintln!("Error: --init-reshare requires --new-node-id");
             std::process::exit(1);
@@ -1125,9 +1121,8 @@ async fn main() {
         }
 
         let share_json = Zeroizing::new(
-            toprf_seal::unseal_derived(&sealed_blob, &derived_key).expect(
-                "auto-unseal: decryption failed — derived key mismatch or corrupt blob",
-            ),
+            toprf_seal::unseal_derived(&sealed_blob, &derived_key)
+                .expect("auto-unseal: decryption failed — derived key mismatch or corrupt blob"),
         );
 
         // Parse the unsealed key share

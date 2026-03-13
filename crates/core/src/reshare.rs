@@ -164,9 +164,7 @@ pub fn combine_recovery_contributions(
         ));
     }
     if decoded_contributions.is_empty() {
-        return Err(TOPRFError::ReshareError(
-            "no contributions provided".into(),
-        ));
+        return Err(TOPRFError::ReshareError("no contributions provided".into()));
     }
 
     // Check for duplicate donors
@@ -214,7 +212,7 @@ pub fn combine_recovery_contributions(
 
     // Sum sub-shares to get the new key share
     let mut new_share = Scalar::ZERO;
-    for &(_, ref sub_share, _) in decoded_contributions {
+    for (_, sub_share, _) in decoded_contributions {
         new_share += sub_share;
     }
 
@@ -272,9 +270,13 @@ mod tests {
                 .find(|s| s.node_id == donor_id)
                 .unwrap();
             let scalar = crate::hex_to_scalar(&share.secret_share).unwrap();
-            let sub_share =
-                generate_recovery_contribution(donor_id, &scalar, &participant_ids, replaced_node_id)
-                    .unwrap();
+            let sub_share = generate_recovery_contribution(
+                donor_id,
+                &scalar,
+                &participant_ids,
+                replaced_node_id,
+            )
+            .unwrap();
             decoded.push((donor_id, sub_share, share.verification_share.clone()));
         }
 
@@ -298,7 +300,10 @@ mod tests {
 
         // Verify OPRF still works: use the recovered share + another original share
         let vs: Vec<(NodeId, String)> = vec![
-            (keygen.shares[0].node_id, keygen.shares[0].verification_share.clone()),
+            (
+                keygen.shares[0].node_id,
+                keygen.shares[0].verification_share.clone(),
+            ),
             (new_share.node_id, new_share.verification_share.clone()),
         ];
 
@@ -360,7 +365,10 @@ mod tests {
 
         // Verify OPRF works with new share + one donor
         let vs: Vec<(NodeId, String)> = vec![
-            (keygen.shares[0].node_id, keygen.shares[0].verification_share.clone()),
+            (
+                keygen.shares[0].node_id,
+                keygen.shares[0].verification_share.clone(),
+            ),
             (new_share.node_id, new_share.verification_share.clone()),
         ];
 
@@ -485,8 +493,14 @@ mod tests {
 
         // Verify OPRF with recovered share + two original shares
         let vs: Vec<(NodeId, String)> = vec![
-            (keygen.shares[0].node_id, keygen.shares[0].verification_share.clone()),
-            (keygen.shares[1].node_id, keygen.shares[1].verification_share.clone()),
+            (
+                keygen.shares[0].node_id,
+                keygen.shares[0].verification_share.clone(),
+            ),
+            (
+                keygen.shares[1].node_id,
+                keygen.shares[1].verification_share.clone(),
+            ),
             (new_share.node_id, new_share.verification_share.clone()),
         ];
 

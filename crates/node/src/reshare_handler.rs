@@ -29,9 +29,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use x25519_dalek::PublicKey;
 
-use toprf_core::reshare::{
-    generate_recovery_contribution, SerializableReshareContribution,
-};
+use toprf_core::reshare::{generate_recovery_contribution, SerializableReshareContribution};
 use toprf_core::scalar_to_hex;
 
 use crate::NodeState;
@@ -92,10 +90,7 @@ pub async fn reshare_handler(
     if !req.participant_ids.contains(&key.node_id) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "this node ({}) is not in participant_ids",
-                key.node_id
-            ),
+            format!("this node ({}) is not in participant_ids", key.node_id),
         )
             .into_response());
     }
@@ -120,10 +115,7 @@ pub async fn reshare_handler(
     if pubkey_bytes.len() != 32 {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!(
-                "target_pubkey must be 32 bytes, got {}",
-                pubkey_bytes.len()
-            ),
+            format!("target_pubkey must be 32 bytes, got {}", pubkey_bytes.len()),
         )
             .into_response());
     }
@@ -161,24 +153,18 @@ pub async fn reshare_handler(
             })?;
 
         // Parse the SNP report
-        let report =
-            toprf_seal::snp_report::SnpReport::from_bytes(&report_bytes).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid attestation report: {e}"),
-                )
-                    .into_response()
-            })?;
+        let report = toprf_seal::snp_report::SnpReport::from_bytes(&report_bytes).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid attestation report: {e}"),
+            )
+                .into_response()
+        })?;
 
         // Parse the certificate chain
-        let certs =
-            toprf_seal::attestation::parse_cert_table(&cert_bytes).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid cert chain: {e}"),
-                )
-                    .into_response()
-            })?;
+        let certs = toprf_seal::attestation::parse_cert_table(&cert_bytes).map_err(|e| {
+            (StatusCode::BAD_REQUEST, format!("invalid cert chain: {e}")).into_response()
+        })?;
 
         // Verify AMD signature chain
         toprf_seal::attestation::AttestationVerifier::verify_report_with_certs(&report, &certs)
@@ -251,14 +237,13 @@ pub async fn reshare_handler(
         // Production: ECIES-encrypt to the verified target pubkey
         let recipient = PublicKey::from(pubkey_arr);
         let sub_share_bytes = sub_scalar.to_bytes();
-        let ciphertext =
-            toprf_seal::ecies::encrypt(&recipient, &sub_share_bytes).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("ECIES encryption failed: {e}"),
-                )
-                    .into_response()
-            })?;
+        let ciphertext = toprf_seal::ecies::encrypt(&recipient, &sub_share_bytes).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("ECIES encryption failed: {e}"),
+            )
+                .into_response()
+        })?;
         use base64::Engine;
         (
             base64::engine::general_purpose::STANDARD.encode(&ciphertext),
