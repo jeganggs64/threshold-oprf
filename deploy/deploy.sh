@@ -49,15 +49,21 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
   cloudwatch    Create CloudWatch alarms for unhealthy node detection
+  frontend-nlb  Create frontend NLB targeting same-region nodes (Lambda failover)
+
+Rotation:
+  rotate <N>    Zero-downtime node replacement (staging-based reshare)
+                Requires: ./provision.sh <N> --staging first
 
 Utilities:
   auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
+  lambda-config Auto-generate lambda/config.env from deployment state
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → measure
-  post-seal     privatelink → coordinator-config → start → verify
+  post-seal     privatelink → coordinator-config → start → verify → frontend-nlb
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
@@ -110,7 +116,9 @@ die()   { echo "  ERROR: $*" >&2; exit 1; }
 
 _node_field() {
     local id="$1" field="$2"
-    jq -r --argjson id "$id" ".nodes[] | select(.id == \$id) | .$field" "$NODES_JSON"
+    local val
+    val=$(jq -r --argjson id "$id" ".nodes[] | select(.id == \$id) | .$field // empty" "$NODES_JSON")
+    echo "$val"
 }
 
 node_region()     { _node_field "$1" region; }
@@ -198,7 +206,7 @@ step_pull() {
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
-        ssh_node "$i" "sudo docker pull ${NODE_IMAGE}"
+        ssh_node "$i" "sudo docker pull ${NODE_IMAGE}" < /dev/null
     done
 
     echo "  Done."
@@ -246,7 +254,7 @@ else
 fi
 echo "    Done."
 SETUP
-)"
+)" < /dev/null
     done
 
     echo "  Done."
@@ -321,6 +329,12 @@ step_privatelink() {
             aws elbv2 wait load-balancer-available \
                 --region "$region" \
                 --load-balancer-arns "$nlb_arn" 2>/dev/null || true
+            # Verify NLB is actually active (wait can exit early or silently fail)
+            local _nlb_state
+            _nlb_state=$(aws elbv2 describe-load-balancers --region "$region" \
+                --load-balancer-arns "$nlb_arn" \
+                --query 'LoadBalancers[0].State.Code' --output text 2>/dev/null)
+            [[ "$_nlb_state" == "active" ]] || die "NLB $nlb_arn is not active (state: $_nlb_state)"
             echo "    NLB active."
         else
             echo "    NLB: $nlb_arn (exists)"
@@ -386,6 +400,27 @@ step_privatelink() {
             echo "    Registered target: ${private_ip}:3001"
         else
             echo "    TG: $tg_arn (exists)"
+        fi
+
+        # ── Reconcile TG targets (handles IP changes after reprovisioning) ──
+        local current_targets
+        current_targets=$(aws elbv2 describe-target-health --region "$region" \
+            --target-group-arn "$tg_arn" \
+            --query 'TargetHealthDescriptions[*].Target.Id' --output text 2>/dev/null) || true
+        # Deregister stale IPs, register current IP
+        for old_ip in $current_targets; do
+            if [[ "$old_ip" != "$private_ip" ]]; then
+                aws elbv2 deregister-targets --region "$region" \
+                    --target-group-arn "$tg_arn" \
+                    --targets "Id=${old_ip},Port=3001" 2>/dev/null || true
+                echo "    Deregistered stale target: ${old_ip}"
+            fi
+        done
+        if [[ ! " $current_targets " =~ " $private_ip " ]]; then
+            aws elbv2 register-targets --region "$region" \
+                --target-group-arn "$tg_arn" \
+                --targets "Id=${private_ip},Port=3001"
+            echo "    Registered target: ${private_ip}:3001"
         fi
 
         # ── 3. NLB Listener ──
@@ -596,6 +631,21 @@ step_privatelink() {
                 if [[ "$peer_region" != "$my_region" ]]; then
                     vpce_args+=(--service-region "$peer_region")
                     echo "    Cross-region: $peer_region → $my_region"
+
+                    # Wait for endpoint service to accept connections from this region
+                    local _svc_wait=0
+                    while true; do
+                        if aws ec2 describe-vpc-endpoint-services --region "$my_region" \
+                            --service-names "$svc_name" > /dev/null 2>&1; then
+                            break
+                        fi
+                        _svc_wait=$((_svc_wait + 1))
+                        if [[ $_svc_wait -ge 30 ]]; then
+                            warn "Endpoint service $svc_name not yet visible in $my_region after 60s — attempting VPCE creation anyway"
+                            break
+                        fi
+                        sleep 2
+                    done
                 fi
 
                 vpce_id=$(aws ec2 create-vpc-endpoint \
@@ -865,14 +915,14 @@ step_start() {
 
         echo "  Node $i ($ip)..."
 
-        ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
+        ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true" < /dev/null
 
         # Upload coordinator config if it exists
         local coord_config="${config_dir}/coordinator-node-${i}.json"
         local coord_args=""
         if [[ -f "$coord_config" ]]; then
-            scp_to_node "$i" "$coord_config" || die "Failed to upload coordinator config to node $i"
-            ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json"
+            scp_to_node "$i" "$coord_config" < /dev/null || die "Failed to upload coordinator config to node $i"
+            ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json" < /dev/null
             coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
             echo "    Coordinator config uploaded"
         fi
@@ -890,7 +940,7 @@ step_start() {
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --port 3001 \
-            --coordinator-config /etc/toprf/coordinator.json"
+            --coordinator-config /etc/toprf/coordinator.json" < /dev/null
     done
 
     echo "  Waiting for nodes to boot..."
@@ -900,7 +950,7 @@ step_start() {
         ip=$(node_ip "$i")
         echo -n "    Node $i ($ip): "
         while true; do
-            if ssh_node "$i" "curl -sf http://localhost:3001/health" > /dev/null 2>&1; then
+            if ssh_node "$i" "curl -sf http://localhost:3001/health" < /dev/null > /dev/null 2>&1; then
                 echo "healthy"
                 break
             fi
@@ -1267,13 +1317,15 @@ step_auto_config() {
 
             # Update nodes.json in place
             local tmp
-            tmp=$(mktemp)
+            tmp=$(mktemp) || die "mktemp failed"
             jq --argjson id "$i" \
                --arg ip "$pub_ip" --arg pip "$priv_ip" \
                --arg sg "$sg_id" --arg vpc "$vpc_id" --arg sub "$subnet_id" \
                --arg ssh "$ssh_key_val" --arg ami "$ami_id" \
                '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub, ssh_key: $ssh, ami_id: $ami}' \
-               "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
+               "$NODES_JSON" > "$tmp" || { rm -f "$tmp"; die "jq failed updating nodes.json"; }
+            jq . "$tmp" > /dev/null 2>&1 || { rm -f "$tmp"; die "jq produced invalid JSON"; }
+            mv "$tmp" "$NODES_JSON" || { rm -f "$tmp"; die "mv failed updating nodes.json"; }
 
             echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id ami=$ami_id"
         else
@@ -1336,9 +1388,728 @@ step_redeploy() {
     step_pull
     for i in $(active_nodes); do
         echo "  Restarting node $i..."
-        ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true"
+        ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true" < /dev/null
     done
     step_start
+}
+
+# ─── 17. Rotate node (staging-based zero-downtime replacement) ────────────────
+#
+# Replaces a single node via staging: provision staging instance alongside the
+# existing node, reshare from donors, verify, swap NLB targets, clean up.
+# Requires: ./provision.sh <N> --staging already run.
+
+step_rotate() {
+    local target_node="${ROTATE_NODE:?rotate requires a node ID}"
+    echo ""
+    info "Rotating node $target_node (staging-based)"
+
+    local region bucket
+    region=$(node_region "$target_node")
+    bucket=$(node_s3_bucket "$target_node")
+
+    local staging_tag="toprf-node-${target_node}-staging"
+    local staging_key="toprf-node-${target_node}-staging-key"
+    local staging_sealed_path="node-${target_node}-staging-sealed.bin"
+    local staging_sealed_url="s3://${bucket}/${staging_sealed_path}"
+
+    # ── Verify staging instance exists ──
+    local staging_instance
+    staging_instance=$(aws ec2 describe-instances --region "$region" \
+        --filters "Name=tag:Name,Values=${staging_tag}" \
+                  "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)
+    [[ -n "$staging_instance" && "$staging_instance" != "None" && "$staging_instance" != "null" ]] \
+        || die "No running staging instance found (${staging_tag}). Run './provision.sh ${target_node} --staging' first."
+
+    local staging_ip staging_priv_ip staging_sg
+    staging_ip=$(aws ec2 describe-instances --region "$region" \
+        --instance-ids "$staging_instance" \
+        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    staging_priv_ip=$(aws ec2 describe-instances --region "$region" \
+        --instance-ids "$staging_instance" \
+        --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
+    staging_sg=$(aws ec2 describe-instances --region "$region" \
+        --instance-ids "$staging_instance" \
+        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' --output text 2>/dev/null)
+
+    local staging_key_file="${SCRIPT_DIR}/${staging_key}.pem"
+    [[ -f "$staging_key_file" ]] || die "Staging key file not found: $staging_key_file"
+
+    echo "  Staging instance: $staging_instance ($staging_ip / $staging_priv_ip)"
+
+    # SSH helper for staging node
+    _ssh_staging() {
+        ssh -o StrictHostKeyChecking=accept-new -i "$staging_key_file" "ec2-user@${staging_ip}" "$@"
+    }
+    _scp_staging() {
+        scp -o StrictHostKeyChecking=accept-new -i "$staging_key_file" "$@" "ec2-user@${staging_ip}:/tmp/"
+    }
+
+    # Cleanup trap: remove reshare artifacts on failure
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    _rotate_cleanup() {
+        rm -rf "$tmpdir"
+        aws s3 rm "s3://${bucket}/reshare/" --recursive --quiet 2>/dev/null || true
+    }
+    trap _rotate_cleanup EXIT
+
+    # ── Pre-flight: verify donor nodes are healthy ──
+    echo ""
+    echo "  ━━━ Pre-flight: donor health check ━━━"
+    local donor_ids=""
+    for i in $(active_nodes); do
+        [[ "$i" != "$target_node" ]] || continue
+        donor_ids="$donor_ids $i"
+        local donor_ip
+        donor_ip=$(node_ip "$i")
+        local health_resp
+        health_resp=$(ssh_node "$i" "curl -sf --connect-timeout 5 http://localhost:3001/health" < /dev/null 2>&1) || true
+        if echo "$health_resp" | jq -e '.status == "ready"' > /dev/null 2>&1; then
+            echo "    Node $i ($donor_ip): healthy"
+        else
+            die "Donor node $i ($donor_ip) is not healthy — cannot proceed with rotation"
+        fi
+    done
+
+    # ── Step 1: Setup staging VM ──
+    echo ""
+    echo "  ━━━ Step 1: Setup staging VM ━━━"
+    _ssh_staging "sudo yum install -y docker > /dev/null 2>&1 && sudo systemctl enable --now docker" < /dev/null
+    echo "    Docker installed"
+
+    _ssh_staging "sudo docker pull ${NODE_IMAGE}" < /dev/null
+    echo "    Image pulled: ${NODE_IMAGE}"
+
+    # ── Step 2: Init-reshare on staging node ──
+    echo ""
+    echo "  ━━━ Step 2: Init-reshare ━━━"
+
+    load_ceremony
+    local threshold total_shares
+    threshold=$(jq -r '.threshold // empty' "$NODES_JSON")
+    total_shares=$(jq -r '.nodes | length' "$NODES_JSON")
+    [[ -n "$threshold" && "$threshold" =~ ^[0-9]+$ ]] || die "Invalid threshold in nodes.json: '$threshold'"
+    [[ -n "$total_shares" && "$total_shares" =~ ^[0-9]+$ && "$total_shares" -ge "$threshold" ]] \
+        || die "Invalid total_shares in nodes.json: '$total_shares' (threshold=$threshold)"
+
+    echo "  Starting staging node in init-reshare mode..."
+    echo "    node_id=$target_node threshold=$threshold total=$total_shares"
+
+    _ssh_staging "sudo docker rm -f toprf-init-reshare 2>/dev/null || true" < /dev/null
+    _ssh_staging "sudo docker run -d --name toprf-init-reshare \
+        --device /dev/sev-guest:/dev/sev-guest \
+        --cap-drop ALL --security-opt no-new-privileges:true \
+        ${NODE_IMAGE} \
+        --init-reshare \
+        --s3-bucket '${bucket}' \
+        --upload-url '${staging_sealed_url}' \
+        --new-node-id ${target_node} \
+        --new-threshold ${threshold} \
+        --new-total-shares ${total_shares} \
+        --group-public-key '${GROUP_PUBLIC_KEY}' \
+        --min-contributions ${threshold}" < /dev/null
+
+    echo "  Waiting for attestation artifacts in S3..."
+    local s3_attestation="s3://${bucket}/reshare/attestation.bin"
+    local s3_pubkey="s3://${bucket}/reshare/pubkey.bin"
+    local s3_certs="s3://${bucket}/reshare/certs.bin"
+
+    local waited=0
+    while ! aws s3 ls "$s3_attestation" > /dev/null 2>&1; do
+        sleep 3
+        waited=$((waited + 1))
+        [[ $waited -lt 40 ]] || die "Timed out waiting for staging node attestation in S3"
+    done
+    echo "    Attestation uploaded to S3"
+
+    aws s3 cp "$s3_attestation" "$tmpdir/attestation.bin" --quiet
+    aws s3 cp "$s3_pubkey" "$tmpdir/pubkey.bin" --quiet
+    aws s3 cp "$s3_certs" "$tmpdir/certs.bin" --quiet
+
+    # ── Step 3: Trigger reshare on donor nodes ──
+    echo ""
+    echo "  ━━━ Step 3: Reshare from donors ━━━"
+
+    local participant_json="["
+    local first=true
+    for i in $donor_ids; do
+        $first || participant_json="${participant_json},"
+        participant_json="${participant_json}${i}"
+        first=false
+    done
+    participant_json="${participant_json}]"
+
+    local target_pubkey attestation_b64 certs_b64
+    target_pubkey=$(xxd -p -c 256 "$tmpdir/pubkey.bin")
+    attestation_b64=$(base64 < "$tmpdir/attestation.bin")
+    certs_b64=$(base64 < "$tmpdir/certs.bin")
+
+    for donor_id in $donor_ids; do
+        local donor_ip
+        donor_ip=$(node_ip "$donor_id")
+        echo "  Requesting reshare from node $donor_id ($donor_ip)..."
+
+        local reshare_resp
+        reshare_resp=$(ssh_node "$donor_id" "curl -sf --connect-timeout 10 \
+            -X POST http://localhost:3001/reshare \
+            -H 'Content-Type: application/json' \
+            -d '{
+                \"target_pubkey\": \"${target_pubkey}\",
+                \"attestation_report\": \"${attestation_b64}\",
+                \"cert_chain\": \"${certs_b64}\",
+                \"new_node_id\": ${target_node},
+                \"participant_ids\": ${participant_json},
+                \"group_public_key\": \"${GROUP_PUBLIC_KEY}\"
+            }'" < /dev/null 2>&1) || die "Reshare request to node $donor_id failed"
+
+        echo "$reshare_resp" | aws s3 cp - "s3://${bucket}/reshare/contribution-from-${donor_id}.json" --quiet
+        echo "    Contribution from node $donor_id uploaded"
+    done
+
+    # ── Step 4: Wait for staging node to combine and seal ──
+    echo ""
+    echo "  ━━━ Step 4: Waiting for seal ━━━"
+
+    local seal_waited=0
+    while true; do
+        local running
+        running=$(_ssh_staging "sudo docker inspect -f '{{.State.Running}}' toprf-init-reshare 2>/dev/null || echo false" < /dev/null)
+        if [[ "$running" != "true" ]]; then
+            break
+        fi
+        sleep 3
+        seal_waited=$((seal_waited + 1))
+        [[ $seal_waited -lt 120 ]] || die "Timed out waiting for staging node to seal"
+    done
+
+    local exit_code
+    exit_code=$(_ssh_staging "sudo docker inspect -f '{{.State.ExitCode}}' toprf-init-reshare 2>/dev/null || echo 1" < /dev/null)
+    [[ "$exit_code" == "0" ]] || {
+        echo "  Init-reshare failed (exit code $exit_code). Logs:"
+        _ssh_staging "sudo docker logs --tail 30 toprf-init-reshare 2>&1" < /dev/null | sed 's/^/    /' || true
+        die "Staging node init-reshare failed"
+    }
+    echo "  Sealed blob uploaded to $staging_sealed_url"
+    _ssh_staging "sudo docker rm -f toprf-init-reshare 2>/dev/null || true" < /dev/null
+
+    # ── Step 5: Update nodes.json, generate configs, start staging node ──
+    echo ""
+    echo "  ━━━ Step 5: Start staging node ━━━"
+
+    # Save old IP for NLB deregistration later
+    local old_priv_ip
+    old_priv_ip=$(node_private_ip "$target_node")
+
+    # Update nodes.json NOW so coordinator config generation uses correct IPs
+    echo "  Updating nodes.json with staging node IPs..."
+    local tmp
+    tmp=$(mktemp) || die "mktemp failed"
+    jq --argjson id "$target_node" \
+       --arg ip "$staging_ip" --arg pip "$staging_priv_ip" --arg sg "$staging_sg" \
+       '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg}' \
+       "$NODES_JSON" > "$tmp" || { rm -f "$tmp"; die "jq failed updating nodes.json"; }
+    jq . "$tmp" > /dev/null 2>&1 || { rm -f "$tmp"; die "jq produced invalid JSON"; }
+    mv "$tmp" "$NODES_JSON" || { rm -f "$tmp"; die "mv failed updating nodes.json"; }
+
+    # Load PrivateLink state
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] && source "$pl_state"
+
+    local vs
+    vs=$(node_vs "$target_node")
+    local peer_measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
+
+    # Regenerate coordinator configs for ALL nodes (uses updated nodes.json)
+    step_coordinator_config
+
+    local config_dir
+    config_dir=$(coord_config_dir)
+    local coord_config="${config_dir}/coordinator-node-${target_node}.json"
+
+    local coord_args=""
+    if [[ -f "$coord_config" ]]; then
+        _scp_staging "$coord_config" < /dev/null
+        _ssh_staging "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${target_node}.json /etc/toprf/coordinator.json" < /dev/null
+        coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
+        echo "    Coordinator config uploaded to staging node"
+    fi
+
+    _ssh_staging "sudo docker run -d --name toprf-node --restart=unless-stopped \
+        -e SEALED_KEY_URL='${staging_sealed_url}' \
+        -e EXPECTED_VERIFICATION_SHARE=${vs} \
+        -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+        ${coord_args} \
+        --device /dev/sev-guest:/dev/sev-guest \
+        --cap-drop ALL --security-opt no-new-privileges:true \
+        -p 3001:3001 \
+        ${NODE_IMAGE} \
+        --port 3001 \
+        --coordinator-config /etc/toprf/coordinator.json" < /dev/null
+
+    echo "  Waiting for staging node to become healthy..."
+    local attempts=0
+    while true; do
+        if _ssh_staging "curl -sf http://localhost:3001/health" < /dev/null > /dev/null 2>&1; then
+            echo "    Staging node healthy"
+            break
+        fi
+        attempts=$((attempts + 1))
+        [[ $attempts -lt 30 ]] || die "Staging node not healthy after 60s"
+        sleep 2
+    done
+
+    # ── Step 6: Swap NLB targets ──
+    echo ""
+    echo "  ━━━ Step 6: Swap NLB targets ━━━"
+
+    # Helper: wait for a target to become healthy in a target group
+    _wait_target_healthy() {
+        local _tg_arn="$1" _target_ip="$2" _tg_region="$3" _label="$4"
+        local _attempts=0
+        echo "    Waiting for $_target_ip to become healthy in ${_label}..."
+        while true; do
+            local _health
+            _health=$(aws elbv2 describe-target-health --region "$_tg_region" \
+                --target-group-arn "$_tg_arn" \
+                --targets "Id=${_target_ip},Port=3001" \
+                --query 'TargetHealthDescriptions[0].TargetHealth.State' --output text 2>/dev/null) || true
+            if [[ "$_health" == "healthy" ]]; then
+                echo "    $_target_ip: healthy in ${_label}"
+                return 0
+            fi
+            _attempts=$((_attempts + 1))
+            if [[ $_attempts -ge 30 ]]; then
+                warn "$_target_ip not healthy in ${_label} after 60s (state: $_health) — continuing"
+                return 0
+            fi
+            sleep 2
+        done
+    }
+
+    # Per-node NLB target group
+    local tg_var="PL_TG_ARN_NODE${target_node}"
+    local tg_arn="${!tg_var:-}"
+    if [[ -n "$tg_arn" ]]; then
+        echo "  Per-node NLB ($tg_arn):"
+        aws elbv2 deregister-targets --region "$region" \
+            --target-group-arn "$tg_arn" \
+            --targets "Id=${old_priv_ip},Port=3001" 2>/dev/null || true
+        echo "    Deregistered: $old_priv_ip"
+        aws elbv2 register-targets --region "$region" \
+            --target-group-arn "$tg_arn" \
+            --targets "Id=${staging_priv_ip},Port=3001"
+        echo "    Registered: $staging_priv_ip"
+        _wait_target_healthy "$tg_arn" "$staging_priv_ip" "$region" "per-node NLB"
+    fi
+
+    # Frontend NLB target group (only if node is in the coordinator VPC)
+    local frontend_tg="${FRONTEND_TG_ARN:-}"
+    local coord_vpc
+    coord_vpc=$(node_vpc_id 1)
+    local target_vpc
+    target_vpc=$(node_vpc_id "$target_node")
+    if [[ -n "$frontend_tg" && "$target_vpc" == "$coord_vpc" ]]; then
+        echo "  Frontend NLB ($frontend_tg):"
+        aws elbv2 deregister-targets --region "$region" \
+            --target-group-arn "$frontend_tg" \
+            --targets "Id=${old_priv_ip},Port=3001" 2>/dev/null || true
+        echo "    Deregistered: $old_priv_ip"
+        aws elbv2 register-targets --region "$region" \
+            --target-group-arn "$frontend_tg" \
+            --targets "Id=${staging_priv_ip},Port=3001"
+        echo "    Registered: $staging_priv_ip"
+        _wait_target_healthy "$frontend_tg" "$staging_priv_ip" "$region" "frontend NLB"
+    fi
+
+    # ── Step 7: Terminate old, finalize new, update other nodes ──
+    echo ""
+    echo "  ━━━ Step 7: Finalize ━━━"
+
+    # Terminate old instance
+    local old_instance
+    old_instance=$(aws ec2 describe-instances --region "$region" \
+        --filters "Name=tag:Name,Values=toprf-node-${target_node}" \
+                  "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null)
+    if [[ -n "$old_instance" && "$old_instance" != "None" && "$old_instance" != "null" ]]; then
+        echo "  Terminating old instance: $old_instance"
+        aws ec2 terminate-instances --region "$region" --instance-ids "$old_instance" > /dev/null
+    fi
+
+    # Retag staging instance
+    echo "  Retagging staging instance..."
+    aws ec2 create-tags --region "$region" --resources "$staging_instance" \
+        --tags "Key=Name,Value=toprf-node-${target_node}"
+
+    # Rename S3 blob: staging → permanent
+    echo "  Renaming sealed blob..."
+    local canonical_s3="s3://${bucket}/node-${target_node}-sealed.bin"
+    aws s3 cp "$staging_sealed_url" "$canonical_s3" --quiet
+    # Verify the copy landed before deleting the source
+    if aws s3 ls "$canonical_s3" > /dev/null 2>&1; then
+        aws s3 rm "$staging_sealed_url" --quiet 2>/dev/null || true
+    else
+        warn "Could not verify copied blob at $canonical_s3 — keeping staging blob as backup"
+    fi
+
+    # Restart container with canonical sealed URL (for future auto-unseal)
+    echo "  Restarting container with canonical sealed URL..."
+    _ssh_staging "sudo docker rm -f toprf-node 2>/dev/null || true" < /dev/null
+    _ssh_staging "sudo docker run -d --name toprf-node --restart=unless-stopped \
+        -e SEALED_KEY_URL='${canonical_s3}' \
+        -e EXPECTED_VERIFICATION_SHARE=${vs} \
+        -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+        ${coord_args} \
+        --device /dev/sev-guest:/dev/sev-guest \
+        --cap-drop ALL --security-opt no-new-privileges:true \
+        -p 3001:3001 \
+        ${NODE_IMAGE} \
+        --port 3001 \
+        --coordinator-config /etc/toprf/coordinator.json" < /dev/null
+
+    attempts=0
+    while true; do
+        if _ssh_staging "curl -sf http://localhost:3001/health" < /dev/null > /dev/null 2>&1; then
+            echo "    Node healthy after restart"
+            break
+        fi
+        attempts=$((attempts + 1))
+        [[ $attempts -lt 30 ]] || die "Node not healthy after restart"
+        sleep 2
+    done
+
+    # Update coordinator configs on OTHER running nodes (they need the new peer IP)
+    echo "  Updating coordinator configs on other nodes..."
+    for i in $donor_ids; do
+        local other_config="${config_dir}/coordinator-node-${i}.json"
+        if [[ -f "$other_config" ]]; then
+            scp_to_node "$i" "$other_config" < /dev/null || { warn "Failed to upload config to node $i"; continue; }
+            ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json" < /dev/null
+            # Restart node to pick up new config
+            ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true" < /dev/null
+
+            local other_vs other_url
+            other_vs=$(node_vs "$i")
+            other_url=$(sealed_url "$i")
+            local other_coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
+
+            ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
+                -e SEALED_KEY_URL='${other_url}' \
+                -e EXPECTED_VERIFICATION_SHARE=${other_vs} \
+                -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+                ${other_coord_args} \
+                --device /dev/sev-guest:/dev/sev-guest \
+                --cap-drop ALL --security-opt no-new-privileges:true \
+                -p 3001:3001 \
+                ${NODE_IMAGE} \
+                --port 3001 \
+                --coordinator-config /etc/toprf/coordinator.json" < /dev/null
+
+            # Wait for donor node to come back healthy
+            local _donor_attempts=0
+            while true; do
+                if ssh_node "$i" "curl -sf http://localhost:3001/health" < /dev/null > /dev/null 2>&1; then
+                    echo "    Node $i: healthy"
+                    break
+                fi
+                _donor_attempts=$((_donor_attempts + 1))
+                if [[ $_donor_attempts -ge 30 ]]; then
+                    warn "Node $i not healthy after 60s — continuing (may need manual check)"
+                    break
+                fi
+                sleep 2
+            done
+        fi
+    done
+
+    # Delete staging key pair
+    echo "  Cleaning up staging key..."
+    aws ec2 delete-key-pair --region "$region" --key-name "$staging_key" 2>/dev/null || true
+    rm -f "$staging_key_file"
+
+    # Clear cleanup trap (artifacts cleaned up below)
+    trap - EXIT
+    aws s3 rm "s3://${bucket}/reshare/" --recursive --quiet 2>/dev/null || true
+    rm -rf "$tmpdir"
+
+    echo ""
+    echo "  ━━━ Rotation complete ━━━"
+    echo "  Node $target_node replaced successfully."
+    echo "  Old instance terminated, staging instance is now the live node."
+    echo "  Other nodes' coordinator configs updated."
+    echo ""
+    echo "  To lock the node (remove SSH): ./deploy.sh --nodes $target_node lock"
+}
+
+# ─── 18. Frontend NLB (Lambda → nodes failover) ──────────────────────────────
+#
+# Creates a single NLB in eu-west-1 that targets all same-region nodes.
+# The evaluate Lambda hits this NLB — if one node dies, traffic routes to
+# the surviving node automatically via NLB health checks.
+# Per-node NLBs (used for PrivateLink) are untouched.
+
+step_frontend_nlb() {
+    echo ""
+    info "Setting up frontend NLB (Lambda → nodes failover)"
+
+    local pl_state
+    pl_state=$(pl_state_file)
+
+    # Load existing state
+    [[ -f "$pl_state" ]] && source "$pl_state"
+
+    # Determine the coordinator region (node 1's region)
+    local coord_region coord_vpc coord_subnet
+    coord_region=$(node_region 1)
+    coord_vpc=$(node_vpc_id 1)
+    coord_subnet=$(node_subnet_id 1)
+    [[ -n "$coord_vpc" ]] || die "Node 1 VPC not set. Run auto-config first."
+
+    # Find a second subnet in a different AZ
+    local second_subnet
+    second_subnet=$(aws ec2 describe-subnets --region "$coord_region" \
+        --filters "Name=vpc-id,Values=$coord_vpc" \
+        --query "Subnets[?SubnetId!='${coord_subnet}'] | [0].SubnetId" --output text)
+    [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet in VPC $coord_vpc"
+
+    # ── 1. Create frontend NLB ──
+    local nlb_arn="${FRONTEND_NLB_ARN:-}"
+    if [[ -z "$nlb_arn" ]]; then
+        echo "  Creating frontend NLB (2 AZs: $coord_subnet, $second_subnet)..."
+        nlb_arn=$(aws elbv2 create-load-balancer \
+            --region "$coord_region" \
+            --name "toprf-frontend-nlb" \
+            --type network \
+            --scheme internal \
+            --subnets "$coord_subnet" "$second_subnet" \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+        echo "FRONTEND_NLB_ARN=${nlb_arn}" >> "$pl_state"
+        aws elbv2 add-tags --region "$coord_region" --resource-arns "$nlb_arn" \
+            --tags $(project_tags) 2>/dev/null || true
+        echo "    NLB: $nlb_arn"
+
+        echo "  Waiting for NLB to become active..."
+        aws elbv2 wait load-balancer-available \
+            --region "$coord_region" \
+            --load-balancer-arns "$nlb_arn" 2>/dev/null || true
+        # Verify NLB is actually active (wait can exit early or silently fail)
+        local _nlb_state
+        _nlb_state=$(aws elbv2 describe-load-balancers --region "$coord_region" \
+            --load-balancer-arns "$nlb_arn" \
+            --query 'LoadBalancers[0].State.Code' --output text 2>/dev/null)
+        [[ "$_nlb_state" == "active" ]] || die "Frontend NLB $nlb_arn is not active (state: $_nlb_state)"
+        echo "    NLB active."
+    else
+        echo "    Frontend NLB: $nlb_arn (exists)"
+    fi
+
+    # Save DNS
+    local nlb_dns="${FRONTEND_NLB_DNS:-}"
+    if [[ -z "$nlb_dns" ]]; then
+        nlb_dns=$(aws elbv2 describe-load-balancers --region "$coord_region" \
+            --load-balancer-arns "$nlb_arn" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+        echo "FRONTEND_NLB_DNS=${nlb_dns}" >> "$pl_state"
+        echo "    DNS: $nlb_dns"
+    else
+        echo "    DNS: $nlb_dns (exists)"
+    fi
+
+    # ── 2. Create target group ──
+    local tg_arn="${FRONTEND_TG_ARN:-}"
+    if [[ -z "$tg_arn" ]]; then
+        echo "  Creating target group (health check: HTTP /health)..."
+        tg_arn=$(aws elbv2 create-target-group \
+            --region "$coord_region" \
+            --name "toprf-frontend-tg" \
+            --protocol TCP --port 3001 \
+            --vpc-id "$coord_vpc" \
+            --target-type ip \
+            --health-check-protocol HTTP \
+            --health-check-path /health \
+            --health-check-interval-seconds 10 \
+            --healthy-threshold-count 2 \
+            --unhealthy-threshold-count 2 \
+            --query 'TargetGroups[0].TargetGroupArn' --output text)
+        echo "FRONTEND_TG_ARN=${tg_arn}" >> "$pl_state"
+        aws elbv2 add-tags --region "$coord_region" --resource-arns "$tg_arn" \
+            --tags $(project_tags) 2>/dev/null || true
+        echo "    TG: $tg_arn"
+    else
+        echo "    TG: $tg_arn (exists)"
+    fi
+
+    # ── 3. Reconcile targets (register same-region nodes, deregister stale IPs) ──
+    echo "  Reconciling frontend NLB targets..."
+
+    # Build expected target set
+    local expected_ips=""
+    for i in $(active_nodes); do
+        local node_vpc_i
+        node_vpc_i=$(node_vpc_id "$i")
+        if [[ "$node_vpc_i" == "$coord_vpc" ]]; then
+            local pip
+            pip=$(node_private_ip "$i")
+            expected_ips="$expected_ips $pip"
+        fi
+    done
+
+    # Deregister stale targets
+    local current_targets
+    current_targets=$(aws elbv2 describe-target-health --region "$coord_region" \
+        --target-group-arn "$tg_arn" \
+        --query 'TargetHealthDescriptions[*].Target.Id' --output text 2>/dev/null) || true
+    for old_ip in $current_targets; do
+        if [[ ! " $expected_ips " =~ " $old_ip " ]]; then
+            aws elbv2 deregister-targets --region "$coord_region" \
+                --target-group-arn "$tg_arn" \
+                --targets "Id=${old_ip},Port=3001" 2>/dev/null || true
+            echo "    Deregistered stale target: ${old_ip}"
+        fi
+    done
+
+    # Register current targets
+    for i in $(active_nodes); do
+        local node_region_i node_vpc_i private_ip
+        node_region_i=$(node_region "$i")
+        node_vpc_i=$(node_vpc_id "$i")
+        if [[ "$node_vpc_i" == "$coord_vpc" ]]; then
+            private_ip=$(node_private_ip "$i")
+            if [[ ! " $current_targets " =~ " $private_ip " ]]; then
+                aws elbv2 register-targets --region "$coord_region" \
+                    --target-group-arn "$tg_arn" \
+                    --targets "Id=${private_ip},Port=3001"
+                echo "    Node $i ($private_ip): registered (new)"
+            else
+                echo "    Node $i ($private_ip): already registered"
+            fi
+        else
+            echo "    Node $i: skipped (different VPC — $node_region_i)"
+        fi
+    done
+
+    # ── 4. Create listener ──
+    local listener_arn="${FRONTEND_NLB_LISTENER:-}"
+    if [[ -z "$listener_arn" ]]; then
+        echo "  Creating listener (TCP :3001)..."
+        listener_arn=$(aws elbv2 create-listener \
+            --region "$coord_region" \
+            --load-balancer-arn "$nlb_arn" \
+            --protocol TCP --port 3001 \
+            --default-actions "Type=forward,TargetGroupArn=${tg_arn}" \
+            --query 'Listeners[0].ListenerArn' --output text)
+        echo "FRONTEND_NLB_LISTENER=${listener_arn}" >> "$pl_state"
+        echo "    Listener: $listener_arn"
+    else
+        echo "    Listener: exists"
+    fi
+
+    echo ""
+    echo "  Frontend NLB ready."
+    echo "    DNS: $nlb_dns"
+    echo "    URL: http://${nlb_dns}:3001"
+    echo "    Targets: all nodes in VPC $coord_vpc"
+    echo ""
+    echo "  The evaluate Lambda should use NLB_URL=http://${nlb_dns}:3001"
+    echo "  Run './deploy.sh lambda-config' to auto-update lambda/config.env."
+}
+
+# ─── 18. Lambda config auto-generation ────────────────────────────────────────
+
+step_lambda_config() {
+    echo ""
+    info "Generating lambda/config.env from deployment state"
+
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Run './deploy.sh privatelink' first."
+    source "$pl_state"
+
+    local lambda_config="${REPO_ROOT}/lambda/config.env"
+    local lambda_example="${REPO_ROOT}/lambda/config.env.example"
+    [[ -f "$lambda_example" ]] || die "lambda/config.env.example not found."
+
+    # ── Gather values ──
+
+    # Account ID
+    local account_id
+    account_id=$(aws sts get-caller-identity --query Account --output text 2>/dev/null) \
+        || die "Could not determine AWS account ID"
+
+    # Frontend NLB DNS (multi-node failover) — falls back to node 1 NLB if frontend not set up
+    local nlb_dns="${FRONTEND_NLB_DNS:-${NLB_DNS_NODE1:-}}"
+    [[ -n "$nlb_dns" ]] || die "No NLB DNS found. Run './deploy.sh frontend-nlb' (or at least 'privatelink')."
+    local nlb_url="http://${nlb_dns}:3001"
+    if [[ -n "${FRONTEND_NLB_DNS:-}" ]]; then
+        echo "  Using frontend NLB (multi-node failover)"
+    else
+        warn "Frontend NLB not set up — using node 1 NLB only. Run './deploy.sh frontend-nlb' for failover."
+    fi
+
+    # VPC subnets for the evaluate Lambda (node 1's VPC — where the NLB is)
+    local coord_region coord_vpc coord_subnet
+    coord_region=$(node_region 1)
+    coord_vpc=$(node_vpc_id 1)
+    coord_subnet=$(node_subnet_id 1)
+
+    local second_subnet
+    second_subnet=$(aws ec2 describe-subnets --region "$coord_region" \
+        --filters "Name=vpc-id,Values=$coord_vpc" \
+        --query "Subnets[?SubnetId!='${coord_subnet}'] | [0].SubnetId" --output text 2>/dev/null)
+    [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet in coordinator VPC $coord_vpc"
+
+    local vpc_subnets="${coord_subnet},${second_subnet}"
+
+    # Security group — use the node's SG (already allows port 3001 from VPC CIDR)
+    local vpc_sg
+    vpc_sg=$(node_sg_id 1)
+    [[ -n "$vpc_sg" ]] || die "No security group for node 1"
+
+    # ── Write or update lambda/config.env ──
+
+    if [[ -f "$lambda_config" ]]; then
+        echo "  Updating existing lambda/config.env..."
+        # Update only the auto-fillable fields, preserve the rest
+        for kv in \
+            "ACCOUNT_ID=${account_id}" \
+            "REGION=${coord_region}" \
+            "VPC_SUBNETS=${vpc_subnets}" \
+            "VPC_SG=${vpc_sg}" \
+            "NLB_URL=${nlb_url}"; do
+            local key="${kv%%=*}"
+            local val="${kv#*=}"
+            if grep -q "^${key}=" "$lambda_config"; then
+                sed -i.bak "s|^${key}=.*|${key}=${val}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+            else
+                echo "${key}=${val}" >> "$lambda_config"
+            fi
+        done
+    else
+        echo "  Creating lambda/config.env from example..."
+        cp "$lambda_example" "$lambda_config"
+        sed -i.bak "s|^ACCOUNT_ID=.*|ACCOUNT_ID=${account_id}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+        sed -i.bak "s|^REGION=.*|REGION=${coord_region}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+        sed -i.bak "s|^VPC_SUBNETS=.*|VPC_SUBNETS=${vpc_subnets}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+        sed -i.bak "s|^VPC_SG=.*|VPC_SG=${vpc_sg}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+        sed -i.bak "s|^NLB_URL=.*|NLB_URL=${nlb_url}|" "$lambda_config" && rm -f "${lambda_config}.bak"
+    fi
+
+    echo ""
+    echo "  Auto-populated:"
+    echo "    ACCOUNT_ID   = ${account_id}"
+    echo "    REGION       = ${coord_region}"
+    echo "    VPC_SUBNETS  = ${vpc_subnets}"
+    echo "    VPC_SG       = ${vpc_sg}"
+    echo "    NLB_URL      = ${nlb_url}"
+    echo ""
+    echo "  Still manual (fill in before running lambda/deploy.sh):"
+    echo "    API_ID, APPLE_APP_ID, APPLE_TEAM_ID, ROLE_ARN"
+    echo "    NONCES_TABLE, DEVICE_KEYS_TABLE"
+    echo ""
+    echo "  File: $lambda_config"
 }
 
 # =============================================================================
@@ -1364,15 +2135,21 @@ Steps (run in order for fresh deployment):
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
   cloudwatch    Create CloudWatch alarms for unhealthy node detection
+  frontend-nlb  Create frontend NLB targeting same-region nodes (Lambda failover)
+
+Rotation:
+  rotate <N>    Zero-downtime node replacement (staging-based reshare)
+                Requires: ./provision.sh <N> --staging first
 
 Utilities:
   auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
+  lambda-config Auto-generate lambda/config.env from deployment state
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
   pre-seal      setup-vms → pull → storage → measure
-  post-seal     privatelink → coordinator-config → start → verify
+  post-seal     privatelink → coordinator-config → start → verify → frontend-nlb
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
 EOF
@@ -1383,14 +2160,23 @@ if [[ $# -eq 0 ]]; then
     exit 0
 fi
 
-# Parse --nodes flag before processing steps
+# Parse --nodes flag and rotate argument before processing steps
 steps=()
+ROTATE_NODE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --nodes|-n)
             shift
             _NODE_FILTER=$(echo "$1" | tr ',' ' ')
             shift
+            ;;
+        rotate)
+            steps+=("rotate")
+            shift
+            if [[ $# -gt 0 && "$1" != -* ]]; then
+                ROTATE_NODE="$1"
+                shift
+            fi
             ;;
         *)
             steps+=("$1")
@@ -1421,8 +2207,14 @@ for step in "${steps[@]}"; do
         verify)       step_verify ;;
         e2e)          step_e2e ;;
         cloudwatch)   step_cloudwatch ;;
+        frontend-nlb) step_frontend_nlb ;;
+        rotate)
+            [[ -n "${ROTATE_NODE:-}" ]] || die "rotate requires a node ID: ./deploy.sh rotate <N>"
+            step_rotate
+            ;;
         auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
+        lambda-config) step_lambda_config ;;
         redeploy)     step_redeploy ;;
         lock)         step_lock ;;
         pre-seal)
@@ -1436,6 +2228,7 @@ for step in "${steps[@]}"; do
             step_coordinator_config
             step_start
             step_verify
+            step_frontend_nlb
             ;;
         all)
             step_setup_vms
@@ -1452,6 +2245,7 @@ for step in "${steps[@]}"; do
             step_coordinator_config
             step_start
             step_verify
+            step_frontend_nlb
             ;;
         -h|--help|help)
             usage ;;

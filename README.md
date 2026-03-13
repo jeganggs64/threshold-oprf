@@ -7,16 +7,22 @@ Node count and threshold are configurable — deploy 2-of-3, 3-of-5, 4-of-7, or 
 ## Architecture
 
 ```
-Mobile App → API Gateway (TLS) → Lambda (VPC) → NLB
-                                                  ↓
-                                          Coordinator Node
-                                                  ↓ AWS PrivateLink
-                                          (threshold-1) Peer Nodes
+Mobile App → API Gateway (TLS) → Lambda (VPC) → Frontend NLB
+                                                      ↓
+                                              ┌───────┴───────┐
+                                              │  Same-region   │
+                                              │  nodes (any    │
+                                              │  can coordinate)│
+                                              └───────┬───────┘
+                                                      ↓ AWS PrivateLink
+                                              (threshold-1) Peer Nodes
 ```
 
 Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to threshold-1 peer nodes via PrivateLink, verifies each peer's DLEQ proof, combines all partials via Lagrange interpolation, and returns the final OPRF evaluation.
 
-Node-to-node communication uses **AWS PrivateLink** — each node sits behind a Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
+A **frontend NLB** with health checks sits in front of all same-region nodes. If one node goes down, the NLB automatically routes to the surviving node — which coordinates with cross-region peers via PrivateLink to meet the threshold. This provides automatic failover without cross-region Lambda infrastructure, since losing all same-region nodes drops below the threshold regardless.
+
+Node-to-node communication uses **AWS PrivateLink** — each node sits behind its own per-node Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
 
 Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
 
@@ -42,9 +48,9 @@ Three Lambda functions handle the API Gateway layer in front of the OPRF nodes:
 |----------|-------|-------------|
 | **challenge** | `GET /challenge` | Issues single-use nonces (DynamoDB-backed) for device attestation |
 | **attest** | `POST /attest` | One-time Apple App Attest device key registration — validates CBOR attestation object, stores public key |
-| **evaluate** | `POST /evaluate` | Attestation-gated OPRF evaluation — verifies device assertion, proxies blinded input to coordinator node via NLB |
+| **evaluate** | `POST /evaluate` | Attestation-gated OPRF evaluation — verifies device assertion, proxies blinded input to a coordinator node via the frontend NLB |
 
-Deployed via `lambda/deploy.sh` (sources secrets from gitignored `lambda/config.env`). Uses the `toprf-lambda-exec` IAM role. The evaluate Lambda is VPC-attached to reach the coordinator node's internal NLB.
+Deployed via `lambda/deploy.sh` (sources secrets from gitignored `lambda/config.env`). Uses the `toprf-lambda-exec` IAM role. The evaluate Lambda is VPC-attached to reach the frontend NLB, which load-balances across same-region coordinator nodes with automatic failover.
 
 ### Crates
 
@@ -202,10 +208,11 @@ For each node:
 
 | Step | What it does |
 |------|-------------|
-| `privatelink` | Creates NLBs, Endpoint Services, and VPC Endpoints |
+| `privatelink` | Creates per-node NLBs, Endpoint Services, and VPC Endpoints |
 | `coordinator-config` | Generates per-node coordinator configs with peer PrivateLink endpoints |
 | `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
 | `verify` | Health-checks all nodes via SSH |
+| `frontend-nlb` | Creates frontend NLB targeting all same-region nodes (Lambda failover) |
 | `cloudwatch` | Creates CloudWatch alarms for unhealthy node detection |
 
 ```bash
@@ -263,31 +270,44 @@ Nodes are rotated monthly via an AWS Lambda / Step Functions workflow — no adm
 
 ### How it works
 
-The rotation Lambda runs on a monthly schedule (EventBridge cron) and rotates nodes **one at a time**:
+Rotation uses a **staging-based** approach: a new instance is provisioned alongside the existing node, receives its share via reshare, and only after the new node is verified healthy does the swap happen. The old node runs throughout — if anything fails, the rotation is aborted with zero impact.
 
 ```
 For each node to rotate (1..N):
-  1. Provision a new SEV-SNP VM (same region, fresh instance)
-  2. Install Docker, pull the node image
-  3. Start the new node in init-reshare mode
-     → Node generates X25519 keypair, gets attestation report, uploads to S3
-  4. Download the new node's attestation report + pubkey from S3
+  1. Provision a staging VM: tagged toprf-node-<N>-staging, key toprf-node-<N>-staging-key
+     Old node continues serving traffic
+  2. Install Docker, pull the node image on staging VM
+  3. Start staging node in init-reshare mode (same S3 bucket, staging sealed path)
+     → Generates X25519 keypair, gets attestation report, uploads to S3
+  4. Download staging node's attestation report + pubkey from S3
   5. Send POST /reshare to each donor node (the other N-1 nodes)
-     → Donors verify attestation, compute L_i(new_id) * k_i, ECIES-encrypt
-     → Upload encrypted contributions to the new node's S3 bucket
-  6. New node collects contributions, decrypts, verifies, combines → new share
-  7. New node seals share to hardware, uploads sealed blob
-  8. Restart new node in normal mode (auto-unseal)
-  9. Health-check the new node
-  10. Update NLB target: swap old node for new node
-  11. Terminate the old VM, clean up old S3 artifacts
+     → Donors verify attestation, compute L_i(node_id) * k_i, ECIES-encrypt
+     → Upload encrypted contributions to the node's S3 bucket
+  6. Staging node collects contributions, decrypts, verifies, combines → new share
+  7. Staging node seals share to hardware, uploads as node-<N>-staging-sealed.bin
+  8. Restart staging node in normal mode (auto-unseal from staging blob)
+  9. Health-check the staging node
+  10. Swap NLB targets: deregister old IP, register new IP (per-node NLB + frontend NLB)
+  11. Terminate old instance, retag staging → permanent, rename S3 blob, clean up staging key
+```
+
+If anything fails at any step, the old node is still running and serving traffic. Terminate the staging instance and clean up staging artifacts — back to 3 healthy nodes.
+
+```bash
+# Manual rotation
+./provision.sh 1 --staging       # Provision staging VM
+./deploy.sh rotate 1             # Reshare → verify → swap → cleanup
+./deploy.sh --nodes 1 lock       # Lock the new node
+
+# Abort a failed rotation
+./provision.sh 1 --terminate-staging
 ```
 
 After all nodes are rotated, each node has a fresh VM and a new share on the **same polynomial** — the group public key and OPRF function are unchanged.
 
 ### Unhealthy node detection
 
-CloudWatch alarms monitor each node's NLB target health. If a target is unhealthy for 3 consecutive minutes, the alarm fires to an SNS topic. The rotation Lambda is subscribed to this topic and automatically triggers single-node recovery for the failed node.
+CloudWatch alarms monitor each node's per-node NLB target health. If a target is unhealthy for 3 consecutive minutes, the alarm fires to an SNS topic. The rotation Lambda is subscribed to this topic and automatically triggers single-node recovery for the failed node. Meanwhile, the frontend NLB immediately stops routing traffic to the failed node — the surviving same-region node handles all requests until recovery completes.
 
 ```bash
 # Set up alarms after deployment
@@ -308,7 +328,7 @@ Traditional rotation requires bringing admin shares together to derive new node 
 
 ### Manual fallback
 
-If the Lambda fails or you need manual control, the same per-node replacement can be driven manually: provision a new VM, start it in `--init-reshare` mode, trigger `/reshare` on the donor nodes, then swap the NLB target once the new node is healthy.
+If the Lambda fails or you need manual control: `./provision.sh <N> --staging` then `./deploy.sh rotate <N>`. To abort: `./provision.sh <N> --terminate-staging`.
 
 ---
 

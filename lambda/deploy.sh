@@ -16,6 +16,11 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
+# Validate required config
+for _var in ACCOUNT_ID REGION LAMBDA_PREFIX; do
+  [[ -n "${!_var:-}" ]] || { echo "ERROR: $_var not set in config.env"; exit 1; }
+done
+
 ROLE_ARN="${ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/toprf-lambda-exec}"
 DIST_DIR="$(cd "$SCRIPT_DIR/dist" 2>/dev/null && pwd || echo "$SCRIPT_DIR/dist")"
 
@@ -34,7 +39,8 @@ ENV_VARS="{
 
 echo "=== Building OPRF Lambda handlers ==="
 cd "$PROJECT_ROOT"
-node build.mjs
+node build.mjs || { echo "ERROR: Build failed"; exit 1; }
+[[ -d dist ]] || { echo "ERROR: dist/ directory not found after build"; exit 1; }
 DIST_DIR="$(cd dist && pwd)"
 
 deploy_lambda() {
@@ -65,7 +71,26 @@ deploy_lambda() {
       --region "$REGION" \
       --query 'FunctionName' --output text > /dev/null
 
-    aws lambda wait function-updated --function-name "$func_name" --region "$REGION" 2>/dev/null || sleep 5
+    # Wait for code update to complete before applying config changes
+    echo "  Waiting for code update to finish..."
+    local _wait_attempts=0
+    while true; do
+      local _update_status
+      _update_status=$(aws lambda get-function --function-name "$func_name" --region "$REGION" \
+        --query 'Configuration.LastUpdateStatus' --output text 2>/dev/null) || true
+      if [[ "$_update_status" == "Successful" ]]; then
+        break
+      elif [[ "$_update_status" == "Failed" ]]; then
+        echo "  ERROR: Code update failed for $func_name"
+        return 1
+      fi
+      _wait_attempts=$((_wait_attempts + 1))
+      if [[ $_wait_attempts -ge 30 ]]; then
+        echo "  WARNING: Timed out waiting for code update (status: $_update_status)"
+        break
+      fi
+      sleep 2
+    done
 
     echo "  Updating config..."
     local config_args=(
@@ -81,6 +106,27 @@ deploy_lambda() {
     fi
     aws lambda update-function-configuration "${config_args[@]}" \
       --query 'FunctionName' --output text > /dev/null
+
+    # Wait for config update to complete (especially important for VPC changes)
+    echo "  Waiting for config update to finish..."
+    _wait_attempts=0
+    while true; do
+      local _config_status
+      _config_status=$(aws lambda get-function --function-name "$func_name" --region "$REGION" \
+        --query 'Configuration.LastUpdateStatus' --output text 2>/dev/null) || true
+      if [[ "$_config_status" == "Successful" ]]; then
+        break
+      elif [[ "$_config_status" == "Failed" ]]; then
+        echo "  ERROR: Config update failed for $func_name"
+        return 1
+      fi
+      _wait_attempts=$((_wait_attempts + 1))
+      if [[ $_wait_attempts -ge 60 ]]; then
+        echo "  WARNING: Timed out waiting for config update (status: $_config_status)"
+        break
+      fi
+      sleep 2
+    done
   else
     echo "  Creating function..."
     local create_args=(
@@ -99,6 +145,27 @@ deploy_lambda() {
     fi
     aws lambda create-function "${create_args[@]}" \
       --query 'FunctionName' --output text > /dev/null
+
+    # Wait for function to become active (VPC functions need ENI provisioning)
+    echo "  Waiting for function to become active..."
+    local _create_attempts=0
+    while true; do
+      local _func_state
+      _func_state=$(aws lambda get-function --function-name "$func_name" --region "$REGION" \
+        --query 'Configuration.State' --output text 2>/dev/null) || true
+      if [[ "$_func_state" == "Active" ]]; then
+        break
+      elif [[ "$_func_state" == "Failed" ]]; then
+        echo "  ERROR: Function creation failed for $func_name"
+        return 1
+      fi
+      _create_attempts=$((_create_attempts + 1))
+      if [[ $_create_attempts -ge 60 ]]; then
+        echo "  WARNING: Timed out waiting for function to become active (state: $_func_state)"
+        break
+      fi
+      sleep 2
+    done
   fi
 
   # Grant API Gateway invoke permission (idempotent)
@@ -109,6 +176,9 @@ deploy_lambda() {
     --principal apigateway.amazonaws.com \
     --source-arn "arn:aws:execute-api:${REGION}:${ACCOUNT_ID}:${API_ID}/*" \
     --region "$REGION" 2>/dev/null || true
+
+  # Clean up zip artifact
+  rm -f "$zip_path"
 
   echo "  Done: $func_name"
 }

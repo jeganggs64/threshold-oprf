@@ -2,9 +2,8 @@ import { verifyAttestation } from "../shared/attestation";
 import { RateLimitError } from "../shared/dynamo-rate-limit";
 import { ok, error } from "../shared/response";
 
-const NLB_URL =
-  process.env.NLB_URL ||
-  "http://toprf-node-1-nlb-b640dedf5418a6b4.elb.eu-west-1.amazonaws.com:3001";
+const NLB_URL = process.env.NLB_URL;
+if (!NLB_URL) throw new Error("NLB_URL environment variable is required");
 
 /**
  * POST /evaluate — attestation-gated threshold OPRF evaluation.
@@ -40,7 +39,7 @@ export async function handler(event: any) {
       return error(403, err.message || "Attestation verification failed");
     }
 
-    // Proxy to coordinator node via NLB
+    // Proxy to coordinator node via frontend NLB (load-balances across same-region nodes)
     const nodeRes = await fetch(`${NLB_URL}/evaluate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
