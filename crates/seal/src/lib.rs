@@ -14,4 +14,4 @@ pub use provider::{
     get_derived_key, FIELD_FAMILY_ID, FIELD_GUEST_POLICY, FIELD_GUEST_SVN, FIELD_IMAGE_ID,
     FIELD_MEASUREMENT, FIELD_TCB_VERSION, SAFE_FIELD_SELECT,
 };
-pub use sealing::{detect_sealed_version, parse_v2_header, seal_derived, unseal_derived};
+pub use sealing::{parse_v2_header, seal_derived, unseal_derived};

@@ -11,9 +11,8 @@
 //!
 //! 2. **Auto-unseal** (production) — When `SEALED_KEY_URL` is set, the node
 //!    fetches a sealed key blob from object storage at boot, derives the
-//!    sealing key from its AMD SEV-SNP attestation measurement, and decrypts
-//!    the share automatically. Supports both v2 (MSG_KEY_REQ) and v1 (HKDF)
-//!    sealed blobs. No admin interaction required after deployment.
+//!    sealing key via MSG_KEY_REQ (hardware-derived key), and decrypts
+//!    the share automatically. No admin interaction required after deployment.
 //!
 //! 3. **Key file** (testing/dev) — `--key-file <PATH>` loads a NodeKeyShare
 //!    JSON file from disk at boot. No network endpoint is exposed for key
@@ -48,6 +47,7 @@
 
 mod cloud_storage;
 mod coordinator;
+mod reshare_handler;
 
 use std::env;
 use std::io::BufReader;
@@ -76,20 +76,20 @@ use coordinator::CoordinatorConfig;
 
 pub struct NodeState {
     /// The loaded key material. Set exactly once at boot.
-    loaded_key: OnceLock<LoadedKey>,
+    pub(crate) loaded_key: OnceLock<LoadedKey>,
     /// Coordinator config (peer endpoints). None if running as peer-only.
     pub coordinator: Option<CoordinatorConfig>,
     /// HTTP client for calling peer nodes.
     pub http_client: reqwest::Client,
 }
 
-struct LoadedKey {
-    node_id: u16,
-    key_share: Scalar,
-    verification_share: String,
-    group_public_key: String,
-    threshold: u16,
-    total_shares: u16,
+pub(crate) struct LoadedKey {
+    pub(crate) node_id: u16,
+    pub(crate) key_share: Scalar,
+    pub(crate) verification_share: String,
+    pub(crate) group_public_key: String,
+    pub(crate) threshold: u16,
+    pub(crate) total_shares: u16,
 }
 
 // Manual Debug to avoid leaking key_share
@@ -304,41 +304,23 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
     info!("init-seal: key share decrypted and validated");
 
     // Step 7: Seal with hardware-derived key and verify round-trip
-    let sealed_blob = match toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT) {
-        Ok(derived_key) => {
-            info!("init-seal: hardware-derived key obtained (v2 sealing)");
-            let blob =
-                toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
-                    .expect("init-seal: v2 sealing failed");
+    let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT)
+        .expect("init-seal: failed to get hardware-derived key via MSG_KEY_REQ");
+    info!("init-seal: hardware-derived key obtained");
 
-            // Verify we can unseal what we just sealed
-            let unsealed = toprf_seal::unseal_derived(&blob, &derived_key)
-                .expect("init-seal: v2 unseal verification failed — sealed blob is corrupt");
-            assert_eq!(
-                unsealed,
-                &share_bytes[..],
-                "init-seal: unseal round-trip mismatch"
-            );
-            info!("init-seal: v2 seal/unseal round-trip verified");
-            blob
-        }
-        Err(e) => {
-            warn!("init-seal: MSG_KEY_REQ unavailable ({e}), falling back to v1 sealing");
-            let blob = toprf_seal::sealing::seal(&share_bytes, &report.measurement, report.policy)
-                .expect("init-seal: v1 sealing failed");
+    let sealed_blob =
+        toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
+            .expect("init-seal: sealing failed");
 
-            // Verify we can unseal what we just sealed
-            let unsealed = toprf_seal::sealing::unseal(&blob, &report.measurement, report.policy)
-                .expect("init-seal: v1 unseal verification failed — sealed blob is corrupt");
-            assert_eq!(
-                unsealed,
-                &share_bytes[..],
-                "init-seal: unseal round-trip mismatch"
-            );
-            info!("init-seal: v1 seal/unseal round-trip verified");
-            blob
-        }
-    };
+    // Verify we can unseal what we just sealed
+    let unsealed = toprf_seal::unseal_derived(&sealed_blob, &derived_key)
+        .expect("init-seal: unseal verification failed — sealed blob is corrupt");
+    assert_eq!(
+        unsealed,
+        &share_bytes[..],
+        "init-seal: unseal round-trip mismatch"
+    );
+    info!("init-seal: seal/unseal round-trip verified");
     info!(
         sealed_blob_size = sealed_blob.len(),
         "init-seal: key share sealed and verified"
@@ -400,6 +382,354 @@ async fn poll_s3_for_blob(url: &str) -> Vec<u8> {
     panic!("init-seal: timed out waiting for encrypted share after 30 minutes");
 }
 
+// -- Init-reshare mode (S3-mediated reshare key receive) --
+
+/// Run init-reshare mode: generate ephemeral keypair, get attestation,
+/// upload to S3, poll for reshare contributions from donor nodes,
+/// combine, seal, upload sealed blob.
+async fn run_init_reshare(
+    s3_bucket: &str,
+    upload_url: &str,
+    new_node_id: u16,
+    new_threshold: u16,
+    new_total_shares: u16,
+    group_public_key: &str,
+    min_contributions: u16,
+) {
+    use toprf_core::reshare::{
+        combine_recovery_contributions, decode_plaintext_sub_share, SerializableReshareContribution,
+    };
+
+    info!("init-reshare: starting S3-mediated reshare mode for node {new_node_id}");
+
+    // Step 1: Generate ephemeral X25519 keypair for receiving contributions
+    info!("init-reshare: generating ephemeral X25519 keypair");
+    let (ephemeral_secret, pubkey_bytes) = toprf_seal::ecies::generate_keypair();
+    info!(
+        pubkey = %hex::encode(pubkey_bytes),
+        "init-reshare: ephemeral X25519 keypair generated"
+    );
+
+    // Step 2: Compute SHA-256(pubkey) for REPORT_DATA binding (used on Linux/SEV-SNP)
+    #[allow(unused_variables)]
+    let pubkey_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(pubkey_bytes);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    };
+
+    // Step 3: Get attestation report (if on TEE hardware)
+    let s3_attestation_url = format!("s3://{s3_bucket}/reshare/attestation.bin");
+    let s3_pubkey_url = format!("s3://{s3_bucket}/reshare/pubkey.bin");
+    let s3_certs_url = format!("s3://{s3_bucket}/reshare/certs.bin");
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut report_data = [0u8; 64];
+        report_data[..32].copy_from_slice(&pubkey_hash);
+
+        info!("init-reshare: requesting extended attestation report");
+        let (report, cert_table) =
+            toprf_seal::provider::get_ext_attestation_report(Some(&report_data))
+                .await
+                .expect("init-reshare: failed to get extended attestation report");
+
+        // Serialize attestation report
+        let mut attestation_bytes =
+            Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
+        attestation_bytes.extend_from_slice(&report.body_bytes);
+        while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
+            attestation_bytes.push(0);
+        }
+        attestation_bytes.extend_from_slice(&report.signature_r);
+        attestation_bytes.extend_from_slice(&report.signature_s);
+        while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
+            attestation_bytes.push(0);
+        }
+
+        // Upload attestation artifacts
+        cloud_storage::upload_blob(&s3_attestation_url, attestation_bytes)
+            .await
+            .expect("init-reshare: failed to upload attestation");
+        cloud_storage::upload_blob(&s3_certs_url, cert_table)
+            .await
+            .expect("init-reshare: failed to upload certs");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Dev mode: upload empty attestation placeholders
+        warn!("init-reshare: not on Linux/SEV-SNP — uploading placeholder attestation");
+        cloud_storage::upload_blob(&s3_attestation_url, vec![0u8; 32])
+            .await
+            .expect("init-reshare: failed to upload placeholder attestation");
+        cloud_storage::upload_blob(&s3_certs_url, vec![0u8; 32])
+            .await
+            .expect("init-reshare: failed to upload placeholder certs");
+    }
+
+    // Upload pubkey
+    cloud_storage::upload_blob(&s3_pubkey_url, pubkey_bytes.to_vec())
+        .await
+        .expect("init-reshare: failed to upload pubkey");
+
+    info!("init-reshare: attestation and pubkey uploaded, polling for contributions...");
+
+    // Step 4: Poll for contributions from donor nodes
+    let mut contributions: Vec<SerializableReshareContribution> = Vec::new();
+    let max_donor_id = 100u16; // reasonable upper bound
+    let max_attempts = 360; // 30 minutes at 5s intervals
+
+    for attempt in 1..=max_attempts {
+        for donor_id in 1..=max_donor_id {
+            let contrib_url =
+                format!("s3://{s3_bucket}/reshare/contribution-from-{donor_id}.json");
+            if let Ok(data) = cloud_storage::download_blob(&contrib_url).await {
+                if !data.is_empty() {
+                    // Check if we already have this donor's contribution
+                    let already_have = contributions
+                        .iter()
+                        .any(|c| c.from_node_id == donor_id);
+                    if !already_have {
+                        match serde_json::from_slice::<SerializableReshareContribution>(&data) {
+                            Ok(c) => {
+                                info!(
+                                    from_node_id = c.from_node_id,
+                                    "init-reshare: received contribution"
+                                );
+                                contributions.push(c);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    donor_id,
+                                    "init-reshare: invalid contribution JSON: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if contributions.len() >= min_contributions as usize {
+            info!(
+                count = contributions.len(),
+                "init-reshare: received sufficient contributions"
+            );
+            break;
+        }
+
+        if attempt % 12 == 0 {
+            info!(
+                minutes = attempt / 12,
+                received = contributions.len(),
+                needed = min_contributions,
+                "init-reshare: still waiting for contributions..."
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
+    if contributions.len() < min_contributions as usize {
+        panic!(
+            "init-reshare: timed out — received {} contributions, need {}",
+            contributions.len(),
+            min_contributions
+        );
+    }
+
+    // Step 5: Decrypt and combine contributions
+    let mut decoded_contributions: Vec<(u16, k256::Scalar, String)> = Vec::new();
+    let mut participant_ids: Vec<u16> = Vec::new();
+
+    for c in &contributions {
+        participant_ids.push(c.from_node_id);
+
+        let sub_share = if c.encrypted {
+            // ECIES-decrypt
+            use base64::Engine;
+            let ciphertext = base64::engine::general_purpose::STANDARD
+                .decode(&c.sub_share_data)
+                .expect("init-reshare: invalid base64 in encrypted contribution");
+            let plaintext = toprf_seal::ecies::decrypt(&ephemeral_secret, &ciphertext)
+                .expect("init-reshare: ECIES decryption failed");
+            assert_eq!(plaintext.len(), 32, "init-reshare: decrypted sub-share is not 32 bytes");
+            let hex_str = hex::encode(&*plaintext);
+            toprf_core::hex_to_scalar(&hex_str)
+                .expect("init-reshare: decrypted sub-share is not a valid scalar")
+        } else {
+            // Plaintext (dev mode)
+            decode_plaintext_sub_share(c)
+                .expect("init-reshare: failed to decode plaintext sub-share")
+        };
+
+        decoded_contributions.push((c.from_node_id, sub_share, c.verification_share.clone()));
+    }
+
+    // Combine into new node's key share
+    let new_share = combine_recovery_contributions(
+        new_node_id,
+        &decoded_contributions,
+        &participant_ids,
+        group_public_key,
+        new_threshold,
+        new_total_shares,
+    )
+    .expect("init-reshare: failed to combine recovery contributions");
+
+    info!(
+        node_id = new_share.node_id,
+        verification_share = %new_share.verification_share,
+        "init-reshare: new key share computed"
+    );
+
+    // Step 6: Seal and upload
+    let share_bytes = serde_json::to_vec(&new_share).expect("init-reshare: JSON serialization");
+
+    let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT)
+        .expect("init-reshare: failed to get hardware-derived key via MSG_KEY_REQ");
+
+    let sealed_blob =
+        toprf_seal::seal_derived(&share_bytes, &derived_key, toprf_seal::SAFE_FIELD_SELECT)
+            .expect("init-reshare: sealing failed");
+
+    // Verify round-trip
+    let unsealed = toprf_seal::unseal_derived(&sealed_blob, &derived_key)
+        .expect("init-reshare: unseal verification failed");
+    assert_eq!(
+        unsealed,
+        &share_bytes[..],
+        "init-reshare: unseal round-trip mismatch"
+    );
+
+    cloud_storage::upload_blob(upload_url, sealed_blob)
+        .await
+        .expect("init-reshare: failed to upload sealed blob");
+
+    // Step 7: Clean up
+    let _ = cloud_storage::delete_blob(&s3_attestation_url).await;
+    let _ = cloud_storage::delete_blob(&s3_pubkey_url).await;
+    let _ = cloud_storage::delete_blob(&s3_certs_url).await;
+    for c in &contributions {
+        let contrib_url =
+            format!("s3://{s3_bucket}/reshare/contribution-from-{}.json", c.from_node_id);
+        let _ = cloud_storage::delete_blob(&contrib_url).await;
+    }
+
+    info!("init-reshare: complete — sealed blob uploaded");
+}
+
+// -- Attestation report for website publication --
+
+/// Extract the S3 bucket name from a storage URL like "s3://bucket/path/to/file".
+#[cfg(target_os = "linux")]
+fn s3_bucket_from_url(url: &str) -> Option<String> {
+    let path = url.strip_prefix("s3://")?;
+    let bucket = path.split('/').next()?;
+    if bucket.is_empty() {
+        return None;
+    }
+    Some(bucket.to_string())
+}
+
+/// Generate an attestation report bound to the loaded verification share
+/// and upload it to S3 for website publication.
+#[cfg(target_os = "linux")]
+async fn upload_attestation_for_website(sealed_key_url: &str, key: &LoadedKey) {
+    let bucket = match s3_bucket_from_url(sealed_key_url) {
+        Some(b) => b,
+        None => {
+            warn!("attestation: cannot extract S3 bucket from SEALED_KEY_URL, skipping");
+            return;
+        }
+    };
+
+    let report_url = format!("s3://{bucket}/attestation/report.bin");
+    let certs_url = format!("s3://{bucket}/attestation/certs.bin");
+    let metadata_url = format!("s3://{bucket}/attestation/metadata.json");
+
+    let vs_bytes = match hex::decode(&key.verification_share) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("attestation: failed to decode verification share hex: {e}");
+            return;
+        }
+    };
+
+    let vs_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&vs_bytes);
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    };
+
+    let mut report_data = [0u8; 64];
+    report_data[..32].copy_from_slice(&vs_hash);
+
+    info!("attestation: requesting SNP report bound to verification share");
+
+    let (report, cert_table) =
+        match toprf_seal::provider::get_ext_attestation_report(Some(&report_data)).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("attestation: failed to get attestation report: {e}");
+                return;
+            }
+        };
+
+    let mut attestation_bytes = Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
+    attestation_bytes.extend_from_slice(&report.body_bytes);
+    while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
+        attestation_bytes.push(0);
+    }
+    attestation_bytes.extend_from_slice(&report.signature_r);
+    attestation_bytes.extend_from_slice(&report.signature_s);
+    while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
+        attestation_bytes.push(0);
+    }
+
+    let metadata = serde_json::json!({
+        "node_id": key.node_id,
+        "verification_share": key.verification_share,
+        "group_public_key": key.group_public_key,
+        "threshold": key.threshold,
+        "total_shares": key.total_shares,
+        "report_data_binding": "SHA256(verification_share_bytes)",
+        "report_data_hash": hex::encode(vs_hash),
+        "measurement": hex::encode(report.measurement),
+    });
+
+    if let Err(e) = cloud_storage::upload_blob(&report_url, attestation_bytes).await {
+        warn!("attestation: failed to upload report.bin: {e}");
+        return;
+    }
+    if let Err(e) = cloud_storage::upload_blob(&certs_url, cert_table).await {
+        warn!("attestation: failed to upload certs.bin: {e}");
+        return;
+    }
+    let metadata_bytes = serde_json::to_vec_pretty(&metadata).expect("JSON serialization");
+    if let Err(e) = cloud_storage::upload_blob(&metadata_url, metadata_bytes).await {
+        warn!("attestation: failed to upload metadata.json: {e}");
+        return;
+    }
+
+    info!(
+        node_id = key.node_id,
+        "attestation: report uploaded to s3://{}/attestation/",
+        bucket,
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn upload_attestation_for_website(_sealed_key_url: &str, _key: &LoadedKey) {
+    info!("attestation: skipping upload (not on Linux/SEV-SNP hardware)");
+}
+
 // -- Main --
 
 #[tokio::main]
@@ -417,8 +747,14 @@ async fn main() {
     let mut client_ca: Option<String> = None;
     let mut key_file: Option<String> = None;
     let mut init_seal = false;
+    let mut init_reshare = false;
     let mut s3_bucket: Option<String> = None;
     let mut upload_url: Option<String> = None;
+    let mut reshare_new_node_id: Option<u16> = None;
+    let mut reshare_new_threshold: Option<u16> = None;
+    let mut reshare_new_total_shares: Option<u16> = None;
+    let mut reshare_group_public_key: Option<String> = None;
+    let mut reshare_min_contributions: Option<u16> = None;
     let mut coordinator_config_path: Option<String> = env::var("COORDINATOR_CONFIG").ok();
 
     let mut i = 1;
@@ -466,6 +802,61 @@ async fn main() {
             }
             "--init-seal" => {
                 init_seal = true;
+            }
+            "--init-reshare" => {
+                init_reshare = true;
+            }
+            "--new-node-id" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --new-node-id");
+                    std::process::exit(1);
+                }
+                reshare_new_node_id = Some(args[i].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --new-node-id: {e}");
+                    std::process::exit(1);
+                }));
+            }
+            "--new-threshold" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --new-threshold");
+                    std::process::exit(1);
+                }
+                reshare_new_threshold = Some(args[i].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --new-threshold: {e}");
+                    std::process::exit(1);
+                }));
+            }
+            "--new-total-shares" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --new-total-shares");
+                    std::process::exit(1);
+                }
+                reshare_new_total_shares = Some(args[i].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --new-total-shares: {e}");
+                    std::process::exit(1);
+                }));
+            }
+            "--group-public-key" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --group-public-key");
+                    std::process::exit(1);
+                }
+                reshare_group_public_key = Some(args[i].clone());
+            }
+            "--min-contributions" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("missing value for --min-contributions");
+                    std::process::exit(1);
+                }
+                reshare_min_contributions = Some(args[i].parse().unwrap_or_else(|e| {
+                    eprintln!("invalid --min-contributions: {e}");
+                    std::process::exit(1);
+                }));
             }
             "--s3-bucket" => {
                 i += 1;
@@ -560,12 +951,62 @@ async fn main() {
         return;
     }
 
+    if init_reshare {
+        if key_file.is_some() {
+            eprintln!("Error: --init-reshare cannot be used with --key-file");
+            std::process::exit(1);
+        }
+        if env::var("SEALED_KEY_URL").is_ok() {
+            eprintln!("Error: --init-reshare cannot be used with SEALED_KEY_URL");
+            std::process::exit(1);
+        }
+        let bucket = s3_bucket.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --s3-bucket <BUCKET>");
+            std::process::exit(1);
+        });
+        let seal_url = upload_url.unwrap_or_else(|| {
+            format!("s3://{bucket}/sealed.bin")
+        });
+        let new_node_id = reshare_new_node_id.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --new-node-id");
+            std::process::exit(1);
+        });
+        let new_threshold = reshare_new_threshold.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --new-threshold");
+            std::process::exit(1);
+        });
+        let new_total_shares = reshare_new_total_shares.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --new-total-shares");
+            std::process::exit(1);
+        });
+        let group_public_key = reshare_group_public_key.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --group-public-key");
+            std::process::exit(1);
+        });
+        let min_contributions = reshare_min_contributions.unwrap_or_else(|| {
+            eprintln!("Error: --init-reshare requires --min-contributions");
+            std::process::exit(1);
+        });
+
+        run_init_reshare(
+            &bucket,
+            &seal_url,
+            new_node_id,
+            new_threshold,
+            new_total_shares,
+            &group_public_key,
+            min_contributions,
+        )
+        .await;
+        return;
+    }
+
     if upload_url.is_some() {
-        eprintln!("Error: --upload-url can only be used with --init-seal");
+        eprintln!("Error: --upload-url can only be used with --init-seal or --init-reshare");
         std::process::exit(1);
     }
     if s3_bucket.is_some() {
-        eprintln!("Error: --s3-bucket can only be used with --init-seal");
+        eprintln!("Error: --s3-bucket can only be used with --init-seal or --init-reshare");
         std::process::exit(1);
     }
 
@@ -669,77 +1110,25 @@ async fn main() {
             .await
             .expect("failed to fetch sealed blob from object storage");
 
-        // Detect blob version to choose the right unseal path
-        let blob_version = toprf_seal::detect_sealed_version(&sealed_blob)
-            .expect("auto-unseal: failed to detect sealed blob version");
+        // Unseal with hardware-derived key via MSG_KEY_REQ
+        info!("auto-unseal: requesting hardware-derived key via MSG_KEY_REQ");
 
-        info!(
-            blob_version = blob_version,
-            "auto-unseal: detected sealed blob version"
+        let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT)
+            .expect("auto-unseal: failed to get hardware-derived key via MSG_KEY_REQ");
+
+        // Log header info
+        if let Ok(field_select) = toprf_seal::parse_v2_header(&sealed_blob) {
+            info!(
+                field_select = format!("0x{field_select:X}"),
+                "auto-unseal: sealed blob field_select"
+            );
+        }
+
+        let share_json = Zeroizing::new(
+            toprf_seal::unseal_derived(&sealed_blob, &derived_key).expect(
+                "auto-unseal: decryption failed — derived key mismatch or corrupt blob",
+            ),
         );
-
-        let share_json = match blob_version {
-            2 => {
-                // v2: Hardware-derived key via MSG_KEY_REQ
-                info!("auto-unseal: v2 blob detected, requesting hardware-derived key via MSG_KEY_REQ");
-
-                let derived_key = toprf_seal::get_derived_key(toprf_seal::SAFE_FIELD_SELECT)
-                    .expect("auto-unseal: failed to get hardware-derived key via MSG_KEY_REQ");
-
-                // Log v2 header info
-                if let Ok(field_select) = toprf_seal::parse_v2_header(&sealed_blob) {
-                    info!(
-                        field_select = format!("0x{field_select:X}"),
-                        "auto-unseal: v2 blob field_select"
-                    );
-                }
-
-                Zeroizing::new(
-                    toprf_seal::unseal_derived(&sealed_blob, &derived_key).expect(
-                        "auto-unseal: v2 decryption failed — derived key mismatch or corrupt blob",
-                    ),
-                )
-            }
-            1 => {
-                // v1: HKDF-from-measurement (backwards compatibility)
-                info!("auto-unseal: v1 blob detected, using HKDF-based unseal (legacy)");
-
-                // Get attestation measurement for v1 unseal
-                let report = toprf_seal::provider::get_attestation_report(None)
-                    .await
-                    .expect("failed to get attestation report");
-
-                // Verify report authenticity
-                toprf_seal::attestation::AttestationVerifier::verify_report(&report)
-                    .await
-                    .expect("attestation report verification failed");
-
-                let measurement = report.measurement;
-                let policy = report.policy;
-
-                // Parse sealed blob header for logging
-                if let Ok((sealed_measurement, sealed_policy)) =
-                    toprf_seal::sealing::parse_sealed_header(&sealed_blob)
-                {
-                    info!(
-                        sealed_for = %hex::encode(sealed_measurement),
-                        our_measurement = %hex::encode(measurement),
-                        sealed_policy = sealed_policy,
-                        report_policy = policy,
-                        "auto-unseal: v1 measurement comparison"
-                    );
-                }
-
-                Zeroizing::new(
-                    toprf_seal::sealing::unseal(&sealed_blob, &measurement, policy).expect(
-                        "auto-unseal: v1 decryption failed — measurement mismatch or corrupt blob",
-                    ),
-                )
-            }
-            other => {
-                panic!("auto-unseal: unsupported sealed blob version: {other}");
-            }
-        };
 
         // Parse the unsealed key share
         let share: NodeKeyShare = serde_json::from_slice(&share_json)
@@ -782,6 +1171,9 @@ async fn main() {
             .set(loaded)
             .expect("auto-unseal: OnceLock already set (should be impossible)");
         info!("auto-unseal: node is ready to serve requests");
+
+        // Generate and upload attestation report bound to verification share
+        upload_attestation_for_website(&sealed_url, state.loaded_key.get().unwrap()).await;
     }
 
     let app = Router::new()
@@ -789,7 +1181,8 @@ async fn main() {
         .route("/info", get(node_info))
         .route("/evaluate", post(coordinator::evaluate_handler))
         .route("/partial-evaluate", post(eval))
-        .layer(DefaultBodyLimit::max(8192))
+        .route("/reshare", post(reshare_handler::reshare_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024)) // 64KB for reshare requests with attestation
         .with_state(state);
 
     let bind_addr = format!("0.0.0.0:{port}");

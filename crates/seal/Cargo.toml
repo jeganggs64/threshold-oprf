@@ -36,9 +36,5 @@ name = "toprf-measure"
 path = "src/bin/toprf-measure.rs"
 
 [[bin]]
-name = "toprf-seal"
-path = "src/bin/toprf-seal.rs"
-
-[[bin]]
 name = "toprf-init-encrypt"
 path = "src/bin/toprf-init-encrypt.rs"

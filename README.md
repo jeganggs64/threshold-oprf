@@ -26,11 +26,10 @@ The API server (developer registration, billing, admin, webhooks) runs as Lambda
 
 ```
 crates/
-  core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine)
-  node/       TEE node server — coordinator + peer mode, serves /evaluate and /partial-evaluate
+  core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine, share recovery)
+  node/       TEE node server — coordinator + peer mode, serves /evaluate, /partial-evaluate, /reshare
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
-  seal/       AMD SEV-SNP key sealing/unsealing via hardware-derived keys
-  monitor/    Maintenance event monitor with webhook alerts
+  seal/       AMD SEV-SNP key sealing/unsealing, ECIES encryption, attestation
 docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation (provision.sh, deploy.sh)
 scripts/      Dev utilities (integration-test.sh)
@@ -40,11 +39,10 @@ scripts/      Dev utilities (integration-test.sh)
 
 | Crate | Description |
 |-------|-------------|
-| **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination. Built on FROST secp256k1 and k256. |
-| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Acts as both coordinator (receives client request, calls threshold-1 peers, combines partials) and peer (computes partial evaluation). Supports three key loading modes: init-seal (S3-mediated ECIES key injection with attestation), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). |
+| **toprf-core** | Core cryptographic library: Shamir secret sharing, hash-to-curve, partial OPRF evaluation, DLEQ proofs, share combination, and single-node share recovery via Lagrange interpolation. Built on FROST secp256k1 and k256. |
+| **toprf-node** | Axum server that loads one key share and evaluates OPRF requests. Acts as both coordinator (receives client request, calls threshold-1 peers, combines partials) and peer (computes partial evaluation). Exposes `/reshare` for donor-side share recovery. Supports four boot modes: init-seal (S3-mediated ECIES key injection with attestation), init-reshare (receive a recovered share from donor nodes), auto-unseal (hardware-sealed blob from S3), and key-file (dev/test). Uploads attestation reports bound to verification shares for public verifiability. |
 | **toprf-keygen** | Offline ceremony tool. Generates a new OPRF key and produces admin shares (3-of-5 for vault storage) and node shares (T-of-N for TEE deployment). Also supports re-deriving node shares from admin shares. |
-| **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes attestation report fetching and verification. |
-| **toprf-monitor** | Daemon that polls for scheduled host maintenance events and sends webhook alerts. |
+| **toprf-seal** | Hardware key sealing using AMD SEV-SNP `MSG_KEY_REQ`. Seals/unseals key material with measurement-bound derived keys. Includes ECIES encryption, attestation report fetching, and verification. |
 
 ## Quick Start
 
@@ -311,11 +309,54 @@ Teardown discovers old resources **by AWS tags** (`Slot=<name>`, `Project=toprf`
 
 ---
 
+## Share Recovery (Single-Node Replacement)
+
+When a node needs to be replaced (hardware failure, rotation), the remaining quorum produces a new share for the replacement node without reconstructing the secret. The new share lies on the **same polynomial** as the existing shares — no full reshare or new key generation required.
+
+### Protocol
+
+1. The new node boots in **init-reshare** mode: generates an ephemeral X25519 keypair, gets an AMD attestation report binding the public key, and uploads both to S3.
+2. An orchestrator (Lambda) sends each donor node a `/reshare` request containing the new node's attestation report, cert chain, and public key.
+3. Each donor node **independently verifies** the attestation (AMD signature chain + measurement + REPORT_DATA binding to public key), then computes its recovery contribution: `L_i(new_node_id) * k_i` (Lagrange basis polynomial evaluated at the new node's ID, times the donor's share). The contribution is ECIES-encrypted to the verified public key.
+4. The new node collects contributions from S3, ECIES-decrypts each one, verifies each sub-share against the donor's verification share, verifies the group public key via Lagrange reconstruction, and sums the sub-shares to obtain its new key share.
+5. The new node seals the share to hardware and uploads the sealed blob.
+
+### Security
+
+- **Donor is the trust anchor** — each donor independently verifies the target's attestation. Even a fully compromised orchestrator cannot extract sub-shares for an unattested target.
+- **Sub-share verification** — the new node verifies each contribution: `g^{s_i} == V_i^{L_i(new_node_id)}` where `V_i` is the donor's verification share.
+- **GPK verification** — the new node reconstructs the group public key from donor verification shares: `GPK == ∏ V_i^{L_i(0)}`.
+- **No secret reconstruction** — individual sub-shares reveal nothing about the original secret or other nodes' shares.
+
+### Dev mode
+
+Set `RESHARE_SKIP_ATTESTATION=true` on donor nodes to skip attestation verification and return plaintext sub-shares (for local integration testing only).
+
+---
+
+## Public Verifiability
+
+Each node generates an AMD SEV-SNP attestation report at boot, binding its verification share to the hardware measurement via `REPORT_DATA[0..32] = SHA256(verification_share_bytes)`. The report is uploaded to S3 alongside the sealed key blob.
+
+The trust chain:
+```
+AMD attestation report → verification share → DLEQ proof → OPRF evaluation
+```
+
+Third-party auditors can verify:
+1. Each node's attestation report is signed by AMD and matches the expected binary measurement
+2. The verification shares in the attestation reports combine to the published group public key
+3. The mobile app verifies DLEQ proofs against the committed group public key
+
+---
+
 ## Security Properties
 
 - **No single point of compromise** — key shares split across N nodes, each below the T-of-N threshold
-- **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP measurement-derived keys; AWS cannot decrypt
-- **TEE attestation** — key injection verified against hardware attestation reports
+- **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP `MSG_KEY_REQ`-derived keys; AWS cannot decrypt
+- **TEE attestation** — key injection and share recovery verified against hardware attestation reports with AMD certificate chain validation
+- **DLEQ proofs** — every partial evaluation includes a DLEQ proof proving the node used its correct key share; coordinator verifies before combining
+- **Attestation-bound recovery** — donor nodes independently verify the target's attestation before releasing sub-shares; compromised orchestrator cannot extract shares
 - **Network isolation** — nodes only reachable via AWS PrivateLink; traffic never crosses the public internet
 - **Device attestation** — Apple App Attest and Google Play Integrity validation (via API Gateway)
 
