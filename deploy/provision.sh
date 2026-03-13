@@ -110,6 +110,7 @@ ensure_iam_profile_for_node() {
             --instance-profile-name "$profile_name" \
             --role-name "$role_name"
         echo "  Waiting for instance profile to propagate..."
+        aws iam wait instance-profile-exists --instance-profile-name "$profile_name" 2>/dev/null || true
         sleep 10
     else
         echo "  Instance profile $profile_name already exists"
@@ -247,9 +248,11 @@ provision_node() {
 
     echo "  Instance: $instance_id"
 
-    # Wait for running state
+    # Wait for instance to be fully initialized
     echo "  Waiting for instance to be running..."
     aws ec2 wait instance-running --region "$region" --instance-ids "$instance_id"
+    echo "  Waiting for instance status checks..."
+    aws ec2 wait instance-status-ok --region "$region" --instance-ids "$instance_id"
 
     # Set IMDS hop limit to 2 (required for Docker containers to reach IMDS)
     echo "  Setting IMDS hop limit to 2..."

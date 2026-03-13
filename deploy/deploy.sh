@@ -315,6 +315,13 @@ step_privatelink() {
             aws elbv2 add-tags --region "$region" --resource-arns "$nlb_arn" \
                 --tags $(project_tags) 2>/dev/null || true
             echo "    NLB: $nlb_arn"
+
+            # Wait for NLB to be active before creating target groups / listeners
+            echo "  Waiting for NLB to become active..."
+            aws elbv2 wait load-balancer-available \
+                --region "$region" \
+                --load-balancer-arns "$nlb_arn" 2>/dev/null || true
+            echo "    NLB active."
         else
             echo "    NLB: $nlb_arn (exists)"
         fi
@@ -398,14 +405,7 @@ step_privatelink() {
             echo "    Listener: exists"
         fi
 
-        # ── 4. Wait for NLB to be active ──
-        echo "  Waiting for NLB to become active..."
-        aws elbv2 wait load-balancer-available \
-            --region "$region" \
-            --load-balancer-arns "$nlb_arn" 2>/dev/null || true
-        echo "    NLB active."
-
-        # ── 5. VPC Endpoint Service ──
+        # ── 4. VPC Endpoint Service ──
         local svc_var="ENDPOINT_SVC_ID_NODE${i}"
         local svc_id="${!svc_var:-}"
         if [[ -z "$svc_id" ]]; then
@@ -419,6 +419,20 @@ step_privatelink() {
             aws ec2 create-tags --region "$region" --resources "$svc_id" \
                 --tags $(project_tags) 2>/dev/null || true
             echo "    Endpoint Service: $svc_id"
+
+            # Wait for endpoint service to be available before modifying
+            echo "    Waiting for endpoint service to be available..."
+            local svc_attempts=0
+            while true; do
+                local svc_state
+                svc_state=$(aws ec2 describe-vpc-endpoint-service-configurations \
+                    --region "$region" --service-ids "$svc_id" \
+                    --query 'ServiceConfigurations[0].ServiceState' --output text 2>/dev/null)
+                [[ "$svc_state" == "Available" ]] && break
+                svc_attempts=$((svc_attempts + 1))
+                [[ $svc_attempts -ge 30 ]] && die "Endpoint service $svc_id not available after 60 seconds"
+                sleep 2
+            done
 
             # Allow our AWS account to connect
             aws ec2 modify-vpc-endpoint-service-permissions \
@@ -880,8 +894,26 @@ step_start() {
     done
 
     echo "  Waiting for nodes to boot..."
-    sleep 5
-    echo "  Done. Run './deploy.sh verify' to check health."
+    local boot_ok=true
+    for i in $(active_nodes); do
+        local ip attempts=0
+        ip=$(node_ip "$i")
+        echo -n "    Node $i ($ip): "
+        while true; do
+            if ssh_node "$i" "curl -sf http://localhost:3001/health" > /dev/null 2>&1; then
+                echo "healthy"
+                break
+            fi
+            attempts=$((attempts + 1))
+            if [[ $attempts -ge 30 ]]; then
+                echo "NOT healthy after 60s"
+                boot_ok=false
+                break
+            fi
+            sleep 2
+        done
+    done
+    $boot_ok && echo "  All nodes healthy." || warn "Some nodes did not become healthy — check logs with: ssh_node <N> 'sudo docker logs toprf-node'"
 }
 
 # ─── 9. Generate coordinator configs ─────────────────────────────────────────
