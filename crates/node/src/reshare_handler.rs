@@ -230,13 +230,21 @@ pub async fn reshare_handler(
         arr.copy_from_slice(&result);
         arr
     };
-    if !state.reshare_seen.lock().unwrap().insert(report_digest) {
-        warn!("reshare: duplicate attestation report — possible replay");
-        return Err((
-            StatusCode::CONFLICT,
-            "reshare request already processed for this attestation report".to_string(),
-        )
-            .into_response());
+    {
+        let mut seen = state.reshare_seen.lock().unwrap();
+        if seen.contains(&report_digest) {
+            warn!("reshare: duplicate attestation report — possible replay");
+            return Err((
+                StatusCode::CONFLICT,
+                "reshare request already processed for this attestation report".to_string(),
+            )
+                .into_response());
+        }
+        // Evict oldest entries if at capacity
+        if seen.len() >= crate::RESHARE_SEEN_MAX {
+            seen.remove(0);
+        }
+        seen.push(report_digest);
     }
 
     info!(

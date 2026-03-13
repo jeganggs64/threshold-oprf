@@ -74,6 +74,11 @@ use coordinator::CoordinatorConfig;
 
 // -- Application state --
 
+/// Maximum number of reshare attestation digests to track for replay protection.
+/// After this many entries, the oldest are evicted. Each rotation cycle produces
+/// at most N-1 entries (one per donor), so 256 covers ~85 full rotations.
+const RESHARE_SEEN_MAX: usize = 256;
+
 pub struct NodeState {
     /// The loaded key material. Set exactly once at boot.
     pub(crate) loaded_key: OnceLock<LoadedKey>,
@@ -82,8 +87,8 @@ pub struct NodeState {
     /// HTTP client for calling peer nodes.
     pub http_client: reqwest::Client,
     /// Tracks attestation report digests already processed by /reshare
-    /// to prevent replay attacks.
-    pub reshare_seen: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// to prevent replay attacks. Bounded to RESHARE_SEEN_MAX entries.
+    pub reshare_seen: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 pub(crate) struct LoadedKey {
@@ -1044,7 +1049,7 @@ async fn main() {
         loaded_key: OnceLock::new(),
         coordinator,
         http_client,
-        reshare_seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+        reshare_seen: std::sync::Mutex::new(Vec::new()),
     });
 
     // -- Load key from file (testing/dev) --

@@ -585,7 +585,9 @@ def handler(event, context):
       - SNS event from CloudWatch alarm → rotate the unhealthy node
       - EventBridge scheduled event → rotate all nodes one at a time
     """
-    logger.info(f"Event: {json.dumps(event)}")
+    # Log event type without full payload to avoid leaking config details
+    event_source = event.get("source", event.get("Records", [{}])[0].get("EventSource", "manual"))
+    logger.info(f"Event received: source={event_source}")
 
     config = get_config()
 
