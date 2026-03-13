@@ -136,9 +136,53 @@ find_instance() {
 
 # ─── Provision a single node ─────────────────────────────────────────────────
 
+_auto_fill_node_defaults() {
+    # Auto-generate key_name, s3_bucket, ssh_key if empty in nodes.json
+    local n="$1"
+    local needs_update=false
+    local tmp
+
+    local kn
+    kn=$(node_key_name "$n")
+    if [[ -z "$kn" ]]; then
+        kn="toprf-node-${n}-key"
+        needs_update=true
+    fi
+
+    local bucket
+    bucket=$(node_s3_bucket "$n")
+    if [[ -z "$bucket" ]]; then
+        # Include account ID for global uniqueness
+        local acct
+        acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "000000000000")
+        bucket="toprf-sealed-${acct}-node-${n}"
+        needs_update=true
+    fi
+
+    local ssh_key_path
+    ssh_key_path=$(node_ssh_key "$n")
+    if [[ -z "$ssh_key_path" ]]; then
+        ssh_key_path="${SCRIPT_DIR}/${kn}.pem"
+        needs_update=true
+    fi
+
+    if $needs_update; then
+        echo "  Auto-filling defaults for node $n: key_name=$kn s3_bucket=$bucket"
+        tmp=$(mktemp)
+        jq --argjson id "$n" \
+           --arg kn "$kn" --arg bucket "$bucket" --arg ssh "$ssh_key_path" \
+           '(.nodes[] | select(.id == $id)) |= . + {key_name: $kn, s3_bucket: $bucket, ssh_key: $ssh}' \
+           "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
+    fi
+}
+
 provision_node() {
     local n="$1"
     local region key_name instance_type
+
+    # Auto-fill key_name, s3_bucket, ssh_key if empty
+    _auto_fill_node_defaults "$n"
+
     region=$(node_region "$n")
     key_name=$(node_key_name "$n")
     instance_type="${INSTANCE_TYPE:-c6a.large}"
