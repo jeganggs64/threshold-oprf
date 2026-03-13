@@ -64,13 +64,16 @@ all_node_ids() { jq -r '.nodes[].id' "$NODES_JSON" | tr '\n' ' '; }
 
 # ─── Ensure IAM instance profile exists ─────────────────────────────────────
 
-ensure_iam_profile() {
-    local profile_name="${IAM_INSTANCE_PROFILE:-}"
-    [[ -n "$profile_name" ]] || die "IAM_INSTANCE_PROFILE not set in config.env"
+ensure_iam_profile_for_node() {
+    local n="$1"
+    local bucket
+    bucket=$(node_s3_bucket "$n" 2>/dev/null) || return 1
+    [[ -n "$bucket" ]] || return 1
 
-    local role_name="${profile_name%-profile}-role"
+    local role_name="toprf-node-${n}-role"
+    local profile_name="toprf-node-${n}-profile"
 
-    # Create role if it doesn't exist
+    # Create per-node role if it doesn't exist
     if ! aws iam get-role --role-name "$role_name" > /dev/null 2>&1; then
         echo "  Creating IAM role: $role_name..."
         aws iam create-role --role-name "$role_name" \
@@ -83,26 +86,18 @@ ensure_iam_profile() {
                 }]
             }' > /dev/null
 
-        # Grant S3 access — separate policy per node for isolation.
-        # TODO: For stronger isolation, create per-node IAM roles instead
-        # of a shared role, each scoped to only that node's S3 bucket.
-        for n in $(all_node_ids); do
-            local bucket
-            bucket=$(node_s3_bucket "$n" 2>/dev/null) || continue
-            [[ -n "$bucket" ]] || continue
-
-            aws iam put-role-policy --role-name "$role_name" \
-                --policy-name "sealed-s3-node-${n}" \
-                --policy-document "{
-                    \"Version\": \"2012-10-17\",
-                    \"Statement\": [{
-                        \"Effect\": \"Allow\",
-                        \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
-                        \"Resource\": [\"arn:aws:s3:::${bucket}/*\"]
-                    }]
-                }"
-            echo "  S3 policy attached for node $n bucket: $bucket"
-        done
+        # Grant S3 access scoped to ONLY this node's bucket
+        aws iam put-role-policy --role-name "$role_name" \
+            --policy-name "sealed-s3-access" \
+            --policy-document "{
+                \"Version\": \"2012-10-17\",
+                \"Statement\": [{
+                    \"Effect\": \"Allow\",
+                    \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                    \"Resource\": [\"arn:aws:s3:::${bucket}/*\"]
+                }]
+            }"
+        echo "  S3 policy attached: $bucket"
     else
         echo "  IAM role $role_name already exists"
     fi
@@ -136,17 +131,61 @@ find_instance() {
 
 # ─── Provision a single node ─────────────────────────────────────────────────
 
+_auto_fill_node_defaults() {
+    # Auto-generate key_name, s3_bucket, ssh_key if empty in nodes.json
+    local n="$1"
+    local needs_update=false
+    local tmp
+
+    local kn
+    kn=$(node_key_name "$n")
+    if [[ -z "$kn" ]]; then
+        kn="toprf-node-${n}-key"
+        needs_update=true
+    fi
+
+    local bucket
+    bucket=$(node_s3_bucket "$n")
+    if [[ -z "$bucket" ]]; then
+        # Include account ID for global uniqueness
+        local acct
+        acct=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "000000000000")
+        bucket="toprf-sealed-${acct}-node-${n}"
+        needs_update=true
+    fi
+
+    local ssh_key_path
+    ssh_key_path=$(node_ssh_key "$n")
+    if [[ -z "$ssh_key_path" ]]; then
+        ssh_key_path="${SCRIPT_DIR}/${kn}.pem"
+        needs_update=true
+    fi
+
+    if $needs_update; then
+        echo "  Auto-filling defaults for node $n: key_name=$kn s3_bucket=$bucket"
+        tmp=$(mktemp)
+        jq --argjson id "$n" \
+           --arg kn "$kn" --arg bucket "$bucket" --arg ssh "$ssh_key_path" \
+           '(.nodes[] | select(.id == $id)) |= . + {key_name: $kn, s3_bucket: $bucket, ssh_key: $ssh}' \
+           "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
+    fi
+}
+
 provision_node() {
     local n="$1"
     local region key_name instance_type
+
+    # Auto-fill key_name, s3_bucket, ssh_key if empty
+    _auto_fill_node_defaults "$n"
+
     region=$(node_region "$n")
     key_name=$(node_key_name "$n")
     instance_type="${INSTANCE_TYPE:-c6a.large}"
 
     info "Provisioning node $n in $region"
 
-    # Ensure IAM role + instance profile exist (idempotent)
-    ensure_iam_profile
+    # Ensure per-node IAM role + instance profile exist (idempotent)
+    ensure_iam_profile_for_node "$n"
 
     # Check for existing instance
     local existing
@@ -175,7 +214,7 @@ provision_node() {
         fi
     fi
 
-    # Find latest Amazon Linux 2023 AMI
+    # Find latest Amazon Linux 2023 AMI (pinned at deploy time)
     echo "  Finding latest AL2023 AMI..."
     local ami
     ami=$(aws ec2 describe-images --region "$region" \
@@ -186,6 +225,13 @@ provision_node() {
 
     [[ -n "$ami" && "$ami" != "None" ]] || die "No AL2023 AMI found in $region"
     echo "  AMI: $ami"
+
+    # Save AMI ID to nodes.json so Lambda reuses the same AMI
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson id "$n" --arg ami "$ami" \
+       '(.nodes[] | select(.id == $id)) |= . + {ami_id: $ami}' \
+       "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
 
     # Launch instance
     echo "  Launching $instance_type with SEV-SNP..."
@@ -226,12 +272,13 @@ provision_node() {
             || warn "SSH rule may already exist"
     fi
 
-    # Attach IAM instance profile (created by ensure_iam_profile above)
-    echo "  Attaching IAM instance profile: ${IAM_INSTANCE_PROFILE}..."
+    # Attach per-node IAM instance profile
+    local node_profile="toprf-node-${n}-profile"
+    echo "  Attaching IAM instance profile: ${node_profile}..."
     aws ec2 associate-iam-instance-profile \
         --region "$region" \
         --instance-id "$instance_id" \
-        --iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}" > /dev/null
+        --iam-instance-profile "Name=${node_profile}" > /dev/null
 
     # Fetch IPs
     local instance_data

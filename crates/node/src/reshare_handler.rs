@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use x25519_dalek::PublicKey;
+use zeroize::Zeroizing;
 
 use toprf_core::reshare::{generate_recovery_contribution, SerializableReshareContribution};
 
@@ -185,6 +186,26 @@ pub async fn reshare_handler(
             .into_response());
     }
 
+    // Verify VMPL == 0 (must run at the most privileged guest level)
+    if report.vmpl != 0 {
+        warn!(vmpl = report.vmpl, "reshare: target not running at VMPL 0");
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("target VMPL is {} — must be 0", report.vmpl),
+        )
+            .into_response());
+    }
+
+    // Verify guest policy debug bit is NOT set (bit 19)
+    if (report.policy >> 19) & 1 != 0 {
+        warn!(policy = report.policy, "reshare: target has debug policy enabled");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "target guest policy has debug bit set — refusing reshare".to_string(),
+        )
+            .into_response());
+    }
+
     // Verify REPORT_DATA binds to target_pubkey: REPORT_DATA[0..32] == SHA256(pubkey)
     let expected_hash = {
         let mut hasher = Sha256::new();
@@ -198,6 +219,32 @@ pub async fn reshare_handler(
             "REPORT_DATA does not bind to provided target_pubkey".to_string(),
         )
             .into_response());
+    }
+
+    // Replay protection: reject duplicate reshare requests for the same attestation
+    let report_digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(&report_bytes);
+        let result = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&result);
+        arr
+    };
+    {
+        let mut seen = state.reshare_seen.lock().unwrap();
+        if seen.contains(&report_digest) {
+            warn!("reshare: duplicate attestation report — possible replay");
+            return Err((
+                StatusCode::CONFLICT,
+                "reshare request already processed for this attestation report".to_string(),
+            )
+                .into_response());
+        }
+        // Evict oldest entries if at capacity
+        if seen.len() >= crate::RESHARE_SEEN_MAX {
+            seen.remove(0);
+        }
+        seen.push(report_digest);
     }
 
     info!(
@@ -223,7 +270,8 @@ pub async fn reshare_handler(
 
     // 8. ECIES-encrypt to the verified target pubkey
     let recipient = PublicKey::from(pubkey_arr);
-    let sub_share_bytes = sub_scalar.to_bytes();
+    let raw_bytes = sub_scalar.to_bytes();
+    let sub_share_bytes = Zeroizing::new(raw_bytes.to_vec());
     let ciphertext = toprf_seal::ecies::encrypt(&recipient, &sub_share_bytes).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

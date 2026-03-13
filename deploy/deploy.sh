@@ -41,6 +41,7 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
+  measure       Fetch SEV-SNP measurement from a running node (saves to config.env)
   init-seal     S3-mediated ECIES key injection (attested)
   privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
@@ -55,7 +56,7 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage
+  pre-seal      setup-vms → pull → storage → measure
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
@@ -298,6 +299,7 @@ step_privatelink() {
             second_subnet=$(aws ec2 describe-subnets --region "$region" \
                 --filters "Name=vpc-id,Values=$vpc_id" \
                 --query "Subnets[?SubnetId!='${subnet_id}'] | [0].SubnetId" --output text)
+            [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet found in VPC $vpc_id ($region). NLB requires ≥2 AZs."
 
             local _nlb_name
             _nlb_name=$(nlb_name "$i")
@@ -551,9 +553,11 @@ step_privatelink() {
                 local peer_region svc_name_var svc_name sg_var sg_id
                 peer_region=$(node_region "$j")
                 svc_name_var="ENDPOINT_SVC_NAME_NODE${j}"
-                svc_name="${!svc_name_var}"
+                svc_name="${!svc_name_var:-}"
+                [[ -n "$svc_name" ]] || die "No endpoint service name for node $j. Run privatelink for node $j first."
                 sg_var="VPCE_SG_${my_vi}"
-                sg_id="${!sg_var}"
+                sg_id="${!sg_var:-}"
+                [[ -n "$sg_id" ]] || die "No VPCE security group for VPC $my_vi."
 
                 echo "  Creating VPCE for node $j in $my_vpc ($my_region)..."
 
@@ -562,6 +566,7 @@ step_privatelink() {
                 second_subnet=$(aws ec2 describe-subnets --region "$my_region" \
                     --filters "Name=vpc-id,Values=$my_vpc" \
                     --query "Subnets[?SubnetId!='${my_subnet}'] | [0].SubnetId" --output text)
+                [[ -n "$second_subnet" && "$second_subnet" != "None" ]] || die "No second subnet found in VPC $my_vpc ($my_region). VPCE requires ≥2 AZs."
 
                 local vpce_args=(
                     --region "$my_region"
@@ -609,9 +614,7 @@ step_privatelink() {
                     fi
                     attempts=$((attempts + 1))
                     if [[ $attempts -ge 60 ]]; then
-                        warn "Could not get DNS for $vpce_id after 5 minutes"
-                        vpce_dns=""
-                        break
+                        die "Could not get DNS for $vpce_id after 5 minutes"
                     fi
                     sleep 5
                 done
@@ -627,6 +630,52 @@ step_privatelink() {
     echo "  State saved to: $pl_state"
     echo ""
     echo "  Next: ./deploy.sh coordinator-config  (generates per-node peer configs)"
+}
+
+# ─── 6b. Measure — fetch SEV-SNP measurement from a running node ────────────
+
+step_measure() {
+    echo ""
+    info "Fetching SEV-SNP measurement from a running node"
+    echo ""
+
+    # Pick the first active node
+    local first_node
+    first_node=$(active_nodes | awk '{print $1}')
+    local ip
+    ip=$(node_ip "$first_node")
+
+    echo "  Using node $first_node ($ip)..."
+    echo "  Running toprf-measure in Docker container..."
+
+    local measurement
+    measurement=$(ssh_node "$first_node" "sudo docker run --rm \
+        --device /dev/sev-guest:/dev/sev-guest \
+        --entrypoint /usr/local/bin/toprf-measure \
+        ${NODE_IMAGE} --json" < /dev/null 2>/dev/null \
+        | jq -r '.measurement')
+
+    if [[ -z "$measurement" || "$measurement" == "null" ]]; then
+        die "Failed to get measurement from node $first_node. Is the node running with SEV-SNP?"
+    fi
+
+    echo "  Measurement: $measurement"
+
+    # Save to config.env
+    if grep -q "^EXPECTED_MEASUREMENT=" "$CONFIG_FILE"; then
+        sed -i.bak "s|^EXPECTED_MEASUREMENT=.*|EXPECTED_MEASUREMENT=${measurement}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    else
+        echo "" >> "$CONFIG_FILE"
+        echo "# SEV-SNP measurement (auto-detected by deploy.sh measure)" >> "$CONFIG_FILE"
+        echo "EXPECTED_MEASUREMENT=${measurement}" >> "$CONFIG_FILE"
+    fi
+    # Reload into current shell
+    EXPECTED_MEASUREMENT="$measurement"
+
+    echo "  Saved to config.env as EXPECTED_MEASUREMENT"
+    echo ""
+    echo "  This measurement is tied to the AMI firmware, not the Docker image."
+    echo "  It only changes when AWS updates the Amazon Linux AMI."
 }
 
 # ─── 7. Init-seal (interactive) ──────────────────────────────────────────────
@@ -651,13 +700,17 @@ step_init_seal() {
         (cd "$REPO_ROOT" && cargo build --release -p toprf-seal --bin toprf-init-encrypt 2>&1 | tail -3)
     fi
 
-    # Get expected measurement (operator should set this in config.env or env)
+    # Get expected measurement (set in config.env, or auto-detected by 'measure' step)
     local expected_measurement="${EXPECTED_MEASUREMENT:-}"
     if [[ -z "$expected_measurement" ]]; then
         echo ""
-        echo "  EXPECTED_MEASUREMENT not set. Enter the expected measurement (96 hex chars),"
-        echo "  or press Enter to skip attestation verification (dev only):"
+        echo "  EXPECTED_MEASUREMENT not set in config.env."
+        echo "  Run './deploy.sh measure' first to auto-detect from a running node,"
+        echo "  or enter the expected measurement (96 hex chars) now:"
         read -r expected_measurement < /dev/tty
+        if [[ -z "$expected_measurement" ]]; then
+            die "EXPECTED_MEASUREMENT is required. Run './deploy.sh measure' to auto-detect it."
+        fi
     fi
 
     for i in $(active_nodes); do
@@ -733,12 +786,7 @@ step_init_seal() {
             --share-file "$share"
         )
 
-        if [[ -n "$expected_measurement" ]]; then
-            encrypt_args+=(--expected-measurement "$expected_measurement")
-        else
-            encrypt_args+=(--skip-attestation-verify --expected-measurement "$(printf '%096d' 0)")
-            echo "  WARNING: skipping attestation verification (dev mode)"
-        fi
+        encrypt_args+=(--expected-measurement "$expected_measurement")
 
         echo "  Verifying attestation and encrypting key share..."
         "$init_encrypt" "${encrypt_args[@]}" 2>&1 | sed 's/^/  /'
@@ -809,7 +857,7 @@ step_start() {
         local coord_config="${config_dir}/coordinator-node-${i}.json"
         local coord_args=""
         if [[ -f "$coord_config" ]]; then
-            scp_to_node "$i" "$coord_config"
+            scp_to_node "$i" "$coord_config" || die "Failed to upload coordinator config to node $i"
             ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json"
             coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
             echo "    Coordinator config uploaded"
@@ -1051,7 +1099,7 @@ step_cloudwatch() {
     for i in $(active_nodes); do
         local region tg_arn
         region=$(node_region "$i")
-        local tg_var="TG_ARN_NODE${i}"
+        local tg_var="PL_TG_ARN_NODE${i}"
         tg_arn="${!tg_var:-}"
         [[ -n "$tg_arn" ]] || { warn "No target group ARN for node $i — skipping"; continue; }
 
@@ -1169,12 +1217,21 @@ step_auto_config() {
             --query 'Reservations[0].Instances[0]' --output json 2>/dev/null) || true
 
         if [[ -n "$instance_data" && "$instance_data" != "null" ]]; then
-            local pub_ip priv_ip sg_id vpc_id subnet_id
+            local pub_ip priv_ip sg_id vpc_id subnet_id ami_id
             pub_ip=$(echo "$instance_data" | jq -r '.PublicIpAddress // empty')
             priv_ip=$(echo "$instance_data" | jq -r '.PrivateIpAddress // empty')
             sg_id=$(echo "$instance_data" | jq -r '.SecurityGroups[0].GroupId // empty')
             vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
             subnet_id=$(echo "$instance_data" | jq -r '.SubnetId // empty')
+            ami_id=$(echo "$instance_data" | jq -r '.ImageId // empty')
+
+            # Set ssh_key if still empty (derive from key_name)
+            local key_name ssh_key_val
+            key_name=$(node_key_name "$i")
+            ssh_key_val=$(node_ssh_key "$i")
+            if [[ -z "$ssh_key_val" && -n "$key_name" ]]; then
+                ssh_key_val="${SCRIPT_DIR}/${key_name}.pem"
+            fi
 
             # Update nodes.json in place
             local tmp
@@ -1182,10 +1239,11 @@ step_auto_config() {
             jq --argjson id "$i" \
                --arg ip "$pub_ip" --arg pip "$priv_ip" \
                --arg sg "$sg_id" --arg vpc "$vpc_id" --arg sub "$subnet_id" \
-               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub}' \
+               --arg ssh "$ssh_key_val" --arg ami "$ami_id" \
+               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub, ssh_key: $ssh, ami_id: $ami}' \
                "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
 
-            echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id"
+            echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id ami=$ami_id"
         else
             warn "Could not find Node $i in $region"
         fi
@@ -1266,6 +1324,7 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
+  measure       Fetch SEV-SNP measurement from a running node (saves to config.env)
   init-seal     S3-mediated ECIES key injection (attested)
   privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
@@ -1280,7 +1339,7 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage
+  pre-seal      setup-vms → pull → storage → measure
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
@@ -1321,6 +1380,7 @@ for step in "${steps[@]}"; do
     case "$step" in
         pull)         step_pull ;;
         storage)      step_storage ;;
+        measure)      step_measure ;;
         setup-vms)    step_setup_vms ;;
         privatelink)  step_privatelink ;;
         init-seal)    step_init_seal ;;
@@ -1337,6 +1397,7 @@ for step in "${steps[@]}"; do
             step_setup_vms
             step_pull
             step_storage
+            step_measure
             ;;
         post-seal)
             step_privatelink
@@ -1348,9 +1409,10 @@ for step in "${steps[@]}"; do
             step_setup_vms
             step_pull
             step_storage
+            step_measure
             echo ""
             echo "═══════════════════════════════════════════════════"
-            echo "  Pre-seal steps complete."
+            echo "  Pre-seal steps complete. Measurement saved."
             echo "  Next: init-seal (interactive key injection)."
             echo "═══════════════════════════════════════════════════"
             step_init_seal

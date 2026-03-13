@@ -74,6 +74,11 @@ use coordinator::CoordinatorConfig;
 
 // -- Application state --
 
+/// Maximum number of reshare attestation digests to track for replay protection.
+/// After this many entries, the oldest are evicted. Each rotation cycle produces
+/// at most N-1 entries (one per donor), so 256 covers ~85 full rotations.
+const RESHARE_SEEN_MAX: usize = 256;
+
 pub struct NodeState {
     /// The loaded key material. Set exactly once at boot.
     pub(crate) loaded_key: OnceLock<LoadedKey>,
@@ -81,6 +86,9 @@ pub struct NodeState {
     pub coordinator: Option<CoordinatorConfig>,
     /// HTTP client for calling peer nodes.
     pub http_client: reqwest::Client,
+    /// Tracks attestation report digests already processed by /reshare
+    /// to prevent replay attacks. Bounded to RESHARE_SEEN_MAX entries.
+    pub reshare_seen: std::sync::Mutex<Vec<[u8; 32]>>,
 }
 
 pub(crate) struct LoadedKey {
@@ -396,6 +404,18 @@ async fn run_init_reshare(
     group_public_key: &str,
     min_contributions: u16,
 ) {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Suppress unused parameter warnings
+        let _ = (s3_bucket, upload_url, new_node_id, new_threshold, new_total_shares, group_public_key, min_contributions);
+        panic!(
+            "init-reshare: SEV-SNP attestation is only available on Linux. \
+             This binary must run inside an AMD SEV-SNP VM."
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
     use toprf_core::reshare::{combine_recovery_contributions, SerializableReshareContribution};
 
     info!("init-reshare: starting S3-mediated reshare mode for node {new_node_id}");
@@ -408,8 +428,7 @@ async fn run_init_reshare(
         "init-reshare: ephemeral X25519 keypair generated"
     );
 
-    // Step 2: Compute SHA-256(pubkey) for REPORT_DATA binding (used on Linux/SEV-SNP)
-    #[allow(unused_variables)]
+    // Step 2: Compute SHA-256(pubkey) for REPORT_DATA binding
     let pubkey_hash = {
         let mut hasher = Sha256::new();
         hasher.update(pubkey_bytes);
@@ -419,12 +438,10 @@ async fn run_init_reshare(
         hash
     };
 
-    // Step 3: Get attestation report (if on TEE hardware)
+    // Step 3: Get attestation report
     let s3_attestation_url = format!("s3://{s3_bucket}/reshare/attestation.bin");
     let s3_pubkey_url = format!("s3://{s3_bucket}/reshare/pubkey.bin");
     let s3_certs_url = format!("s3://{s3_bucket}/reshare/certs.bin");
-
-    #[cfg(target_os = "linux")]
     {
         let mut report_data = [0u8; 64];
         report_data[..32].copy_from_slice(&pubkey_hash);
@@ -454,24 +471,12 @@ async fn run_init_reshare(
         cloud_storage::upload_blob(&s3_certs_url, cert_table)
             .await
             .expect("init-reshare: failed to upload certs");
-    }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Dev mode: upload empty attestation placeholders
-        warn!("init-reshare: not on Linux/SEV-SNP — uploading placeholder attestation");
-        cloud_storage::upload_blob(&s3_attestation_url, vec![0u8; 32])
+        // Upload pubkey (inside Linux block since non-Linux panics above)
+        cloud_storage::upload_blob(&s3_pubkey_url, pubkey_bytes.to_vec())
             .await
-            .expect("init-reshare: failed to upload placeholder attestation");
-        cloud_storage::upload_blob(&s3_certs_url, vec![0u8; 32])
-            .await
-            .expect("init-reshare: failed to upload placeholder certs");
+            .expect("init-reshare: failed to upload pubkey");
     }
-
-    // Upload pubkey
-    cloud_storage::upload_blob(&s3_pubkey_url, pubkey_bytes.to_vec())
-        .await
-        .expect("init-reshare: failed to upload pubkey");
 
     info!("init-reshare: attestation and pubkey uploaded, polling for contributions...");
 
@@ -559,8 +564,13 @@ async fn run_init_reshare(
                 32,
                 "init-reshare: decrypted sub-share is not 32 bytes"
             );
-            let hex_str = hex::encode(&*plaintext);
-            toprf_core::hex_to_scalar(&hex_str)
+            // Convert directly from bytes without hex intermediate to avoid
+            // leaking key material in string form
+            use k256::elliptic_curve::PrimeField;
+            let mut scalar_bytes = [0u8; 32];
+            scalar_bytes.copy_from_slice(&plaintext);
+            let field_bytes = k256::FieldBytes::from(scalar_bytes);
+            Option::from(Scalar::from_repr(field_bytes))
                 .expect("init-reshare: decrypted sub-share is not a valid scalar")
         };
 
@@ -620,6 +630,7 @@ async fn run_init_reshare(
     }
 
     info!("init-reshare: complete — sealed blob uploaded");
+    } // #[cfg(target_os = "linux")]
 }
 
 // -- Attestation report for website publication --
@@ -1038,6 +1049,7 @@ async fn main() {
         loaded_key: OnceLock::new(),
         coordinator,
         http_client,
+        reshare_seen: std::sync::Mutex::new(Vec::new()),
     });
 
     // -- Load key from file (testing/dev) --

@@ -38,6 +38,8 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build
 # ---------------------------------------------------------------------------
+# Pin base images to specific tags for reproducibility.
+# Update these when upgrading toolchains.
 FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
@@ -54,17 +56,20 @@ RUN mkdir -p crates/core/src crates/keygen/src crates/node/src && \
     echo "fn main() {}" > crates/keygen/src/main.rs && \
     echo "fn main() {}" > crates/node/src/main.rs && \
     mkdir -p crates/seal/src && echo "" > crates/seal/src/lib.rs && \
-    mkdir -p crates/seal/src/bin && echo "fn main(){}" > crates/seal/src/bin/toprf-measure.rs && echo "fn main(){}" > crates/seal/src/bin/toprf-seal.rs
+    mkdir -p crates/seal/src/bin && echo "fn main(){}" > crates/seal/src/bin/toprf-measure.rs && echo "fn main(){}" > crates/seal/src/bin/toprf-init-encrypt.rs
 
-RUN cargo build --release -p toprf-node 2>/dev/null || true
+RUN cargo build --release -p toprf-node -p toprf-seal 2>/dev/null || true
 
 COPY crates/ crates/
 
 RUN touch crates/core/src/lib.rs \
     crates/node/src/main.rs \
-    crates/keygen/src/main.rs
+    crates/keygen/src/main.rs \
+    crates/seal/src/lib.rs \
+    crates/seal/src/bin/toprf-measure.rs \
+    crates/seal/src/bin/toprf-init-encrypt.rs
 
-RUN cargo build --release -p toprf-node
+RUN cargo build --release -p toprf-node -p toprf-seal
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime (standard Debian -- SEV-SNP is transparent to the guest)
@@ -83,6 +88,7 @@ RUN groupadd --gid 1001 toprf && \
     useradd --uid 1001 --gid toprf --shell /bin/false --create-home toprf
 
 COPY --from=builder /build/target/release/toprf-node /usr/local/bin/toprf-node
+COPY --from=builder /build/target/release/toprf-measure /usr/local/bin/toprf-measure
 
 # Directory for TLS certificates
 RUN mkdir -p /etc/toprf/certs && chown -R toprf:toprf /etc/toprf
