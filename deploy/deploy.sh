@@ -41,6 +41,7 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
+  measure       Fetch SEV-SNP measurement from a running node (saves to config.env)
   init-seal     S3-mediated ECIES key injection (attested)
   privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
@@ -55,7 +56,7 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage
+  pre-seal      setup-vms → pull → storage → measure
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
@@ -629,6 +630,52 @@ step_privatelink() {
     echo "  Next: ./deploy.sh coordinator-config  (generates per-node peer configs)"
 }
 
+# ─── 6b. Measure — fetch SEV-SNP measurement from a running node ────────────
+
+step_measure() {
+    echo ""
+    info "Fetching SEV-SNP measurement from a running node"
+    echo ""
+
+    # Pick the first active node
+    local first_node
+    first_node=$(active_nodes | awk '{print $1}')
+    local ip
+    ip=$(node_ip "$first_node")
+
+    echo "  Using node $first_node ($ip)..."
+    echo "  Running toprf-measure in Docker container..."
+
+    local measurement
+    measurement=$(ssh_node "$first_node" "sudo docker run --rm \
+        --device /dev/sev-guest:/dev/sev-guest \
+        --entrypoint /usr/local/bin/toprf-measure \
+        ${NODE_IMAGE} --json" < /dev/null 2>/dev/null \
+        | jq -r '.measurement')
+
+    if [[ -z "$measurement" || "$measurement" == "null" ]]; then
+        die "Failed to get measurement from node $first_node. Is the node running with SEV-SNP?"
+    fi
+
+    echo "  Measurement: $measurement"
+
+    # Save to config.env
+    if grep -q "^EXPECTED_MEASUREMENT=" "$CONFIG_FILE"; then
+        sed -i.bak "s|^EXPECTED_MEASUREMENT=.*|EXPECTED_MEASUREMENT=${measurement}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    else
+        echo "" >> "$CONFIG_FILE"
+        echo "# SEV-SNP measurement (auto-detected by deploy.sh measure)" >> "$CONFIG_FILE"
+        echo "EXPECTED_MEASUREMENT=${measurement}" >> "$CONFIG_FILE"
+    fi
+    # Reload into current shell
+    EXPECTED_MEASUREMENT="$measurement"
+
+    echo "  Saved to config.env as EXPECTED_MEASUREMENT"
+    echo ""
+    echo "  This measurement is tied to the AMI firmware, not the Docker image."
+    echo "  It only changes when AWS updates the Amazon Linux AMI."
+}
+
 # ─── 7. Init-seal (interactive) ──────────────────────────────────────────────
 
 step_init_seal() {
@@ -651,13 +698,17 @@ step_init_seal() {
         (cd "$REPO_ROOT" && cargo build --release -p toprf-seal --bin toprf-init-encrypt 2>&1 | tail -3)
     fi
 
-    # Get expected measurement (operator should set this in config.env or env)
+    # Get expected measurement (set in config.env, or auto-detected by 'measure' step)
     local expected_measurement="${EXPECTED_MEASUREMENT:-}"
     if [[ -z "$expected_measurement" ]]; then
         echo ""
-        echo "  EXPECTED_MEASUREMENT not set. Enter the expected measurement (96 hex chars),"
-        echo "  or press Enter to skip attestation verification (dev only):"
+        echo "  EXPECTED_MEASUREMENT not set in config.env."
+        echo "  Run './deploy.sh measure' first to auto-detect from a running node,"
+        echo "  or enter the expected measurement (96 hex chars) now:"
         read -r expected_measurement < /dev/tty
+        if [[ -z "$expected_measurement" ]]; then
+            die "EXPECTED_MEASUREMENT is required. Run './deploy.sh measure' to auto-detect it."
+        fi
     fi
 
     for i in $(active_nodes); do
@@ -733,12 +784,7 @@ step_init_seal() {
             --share-file "$share"
         )
 
-        if [[ -n "$expected_measurement" ]]; then
-            encrypt_args+=(--expected-measurement "$expected_measurement")
-        else
-            encrypt_args+=(--skip-attestation-verify --expected-measurement "$(printf '%096d' 0)")
-            echo "  WARNING: skipping attestation verification (dev mode)"
-        fi
+        encrypt_args+=(--expected-measurement "$expected_measurement")
 
         echo "  Verifying attestation and encrypting key share..."
         "$init_encrypt" "${encrypt_args[@]}" 2>&1 | sed 's/^/  /'
@@ -1176,13 +1222,22 @@ step_auto_config() {
             vpc_id=$(echo "$instance_data" | jq -r '.VpcId // empty')
             subnet_id=$(echo "$instance_data" | jq -r '.SubnetId // empty')
 
+            # Set ssh_key if still empty (derive from key_name)
+            local key_name ssh_key_val
+            key_name=$(node_key_name "$i")
+            ssh_key_val=$(node_ssh_key "$i")
+            if [[ -z "$ssh_key_val" && -n "$key_name" ]]; then
+                ssh_key_val="${SCRIPT_DIR}/${key_name}.pem"
+            fi
+
             # Update nodes.json in place
             local tmp
             tmp=$(mktemp)
             jq --argjson id "$i" \
                --arg ip "$pub_ip" --arg pip "$priv_ip" \
                --arg sg "$sg_id" --arg vpc "$vpc_id" --arg sub "$subnet_id" \
-               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub}' \
+               --arg ssh "$ssh_key_val" \
+               '(.nodes[] | select(.id == $id)) |= . + {ip: $ip, private_ip: $pip, sg_id: $sg, vpc_id: $vpc, subnet_id: $sub, ssh_key: $ssh}' \
                "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
 
             echo "    ip=$pub_ip private_ip=$priv_ip sg=$sg_id vpc=$vpc_id subnet=$subnet_id"
@@ -1266,6 +1321,7 @@ Steps (run in order for fresh deployment):
   setup-vms     Install Docker on VMs
   pull          Pull node image from ghcr.io on each VM
   storage       Create S3 buckets for sealed key blobs
+  measure       Fetch SEV-SNP measurement from a running node (saves to config.env)
   init-seal     S3-mediated ECIES key injection (attested)
   privatelink   Create NLBs, Endpoint Services, cross-VPC VPC Endpoints
   coordinator-config  Generate per-node coordinator configs (peer endpoints)
@@ -1280,7 +1336,7 @@ Utilities:
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
-  pre-seal      setup-vms → pull → storage
+  pre-seal      setup-vms → pull → storage → measure
   post-seal     privatelink → coordinator-config → start → verify
   all           pre-seal → init-seal → post-seal
   redeploy      pull latest image → restart nodes
@@ -1321,6 +1377,7 @@ for step in "${steps[@]}"; do
     case "$step" in
         pull)         step_pull ;;
         storage)      step_storage ;;
+        measure)      step_measure ;;
         setup-vms)    step_setup_vms ;;
         privatelink)  step_privatelink ;;
         init-seal)    step_init_seal ;;
@@ -1337,6 +1394,7 @@ for step in "${steps[@]}"; do
             step_setup_vms
             step_pull
             step_storage
+            step_measure
             ;;
         post-seal)
             step_privatelink
@@ -1348,9 +1406,10 @@ for step in "${steps[@]}"; do
             step_setup_vms
             step_pull
             step_storage
+            step_measure
             echo ""
             echo "═══════════════════════════════════════════════════"
-            echo "  Pre-seal steps complete."
+            echo "  Pre-seal steps complete. Measurement saved."
             echo "  Next: init-seal (interactive key injection)."
             echo "═══════════════════════════════════════════════════"
             step_init_seal

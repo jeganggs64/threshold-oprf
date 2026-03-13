@@ -117,18 +117,17 @@ The threshold and node count in `nodes.json` must match the keygen ceremony.
 
 Two config files in `deploy/`:
 
-- **`config.env`** — Global settings (AWS account, instance type, IAM profile, domain, ceremony path)
-- **`nodes.json`** — Per-node config (regions, IPs, keys, S3 buckets, threshold)
+- **`config.env`** — Global settings (instance type, ceremony path). IAM roles/profiles are auto-created.
+- **`nodes.json`** — Per-node config (regions, threshold). IPs, keys, S3 buckets, SGs are auto-populated.
 
 ```bash
 cd deploy
 cp config.env.example config.env
 cp nodes.json.example nodes.json
-# Edit both files, then:
-./deploy.sh auto-config    # Populates IPs, SGs, VPCs from AWS
+# Set regions and threshold in nodes.json, then provision + auto-config:
 ```
 
-To change the threshold or node count, edit `nodes.json`: set `threshold` and add/remove entries in the `nodes` array. The keygen ceremony must match.
+To change the threshold or node count, edit `nodes.json`: set `threshold` and add/remove entries in the `nodes` array (only `id` and `region` are required — everything else is auto-populated). The keygen ceremony must match.
 
 ### Prerequisites
 
@@ -141,14 +140,20 @@ To change the threshold or node count, edit `nodes.json`: set `threshold` and ad
 
 Launches AMD SEV-SNP virtual machines across AWS regions.
 
-Requires `nodes.json` with node regions and S3 bucket names filled in (buckets don't need to exist yet — `deploy.sh storage` creates them), and an IAM instance profile set in `config.env` with `s3:PutObject`/`s3:GetObject` on the sealed-key buckets.
+Requires `nodes.json` with node regions filled in. Everything else is auto-created:
+- **IAM role + instance profile** — created automatically with per-node S3 policies
+- **EC2 key pairs** — created per node, `.pem` files saved locally
+- **S3 bucket names** — auto-generated as `toprf-sealed-<account>-node-<id>` if empty
+- **Security groups, VPCs, subnets** — populated by `auto-config` after provisioning
 
 For each node:
-1. Creates an EC2 key pair in the node's region (saves `.pem` locally)
-2. Finds the latest Amazon Linux 2023 AMI
-3. Launches a `c6a.large` instance with SEV-SNP enabled
-4. Sets IMDS hop limit to 2 (for Docker)
-5. Attaches the IAM instance profile
+1. Auto-fills `key_name` and `s3_bucket` in `nodes.json` if empty
+2. Creates the IAM role and instance profile (if they don't exist)
+3. Creates an EC2 key pair in the node's region (saves `.pem` locally)
+4. Finds the latest Amazon Linux 2023 AMI
+5. Launches a `c6a.large` instance with SEV-SNP enabled
+6. Sets IMDS hop limit to 2 (for Docker)
+7. Attaches the IAM instance profile
 
 ```bash
 ./provision.sh all        # All nodes
@@ -171,13 +176,14 @@ Installs Docker, injects key shares, and starts the OPRF service on each node.
 | `setup-vms` | Installs Docker on each VM |
 | `pull` | Pulls the node image from ghcr.io |
 | `storage` | Creates S3 buckets for sealed key blobs |
+| `measure` | Fetches the SEV-SNP measurement from a running node, saves to `config.env` |
 
 **Phase 2: `init-seal`** (interactive, S3-mediated ECIES)
 
 For each node:
 1. Starts a temporary container in init-seal mode — node generates an X25519 keypair, gets an attestation report binding the public key, and uploads both to S3
 2. Downloads the attestation report and public key from S3
-3. Verifies the SEV-SNP attestation (measurement + AMD certificate chain) and confirms the public key is bound to the report via REPORT_DATA
+3. Verifies the SEV-SNP attestation (measurement from `config.env` + AMD certificate chain) and confirms the public key is bound to the report via REPORT_DATA
 4. Encrypts the key share using ECIES (X25519 ECDH + HKDF-SHA256 + AES-256-GCM) to the attested public key
 5. Uploads the encrypted share to S3 — node picks it up, decrypts with its private key, seals to hardware, verifies the seal round-trips, and uploads the sealed blob
 
@@ -196,7 +202,7 @@ For each node:
 ./deploy.sh all
 
 # Or step by step
-./deploy.sh pre-seal
+./deploy.sh pre-seal         # setup-vms → pull → storage → measure
 ./deploy.sh init-seal        # Interactive — one node at a time recommended
 ./deploy.sh post-seal
 
@@ -204,6 +210,7 @@ For each node:
 ./deploy.sh setup-vms
 ./deploy.sh pull
 ./deploy.sh storage
+./deploy.sh measure          # Auto-detect SEV-SNP measurement
 ./deploy.sh init-seal
 ./deploy.sh privatelink
 ./deploy.sh coordinator-config
