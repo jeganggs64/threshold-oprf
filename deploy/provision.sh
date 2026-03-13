@@ -40,10 +40,7 @@ if [[ ! -f "$NODES_JSON" ]]; then
 fi
 command -v jq >/dev/null || { echo "ERROR: jq is required but not installed" >&2; exit 1; }
 
-# Slot support: SLOT env var controls VM tag names for blue-green deployments
-SLOT="${SLOT:-}"
-_slot_suffix() { [[ -n "$SLOT" ]] && echo "-${SLOT}" || echo ""; }
-_vm_tag() { echo "toprf-node-${1}$(_slot_suffix)"; }
+_vm_tag() { echo "toprf-node-${1}"; }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -172,7 +169,7 @@ provision_node() {
         aws ec2 create-key-pair --region "$region" \
             --key-name "$key_name" \
             --key-type ed25519 \
-            --tag-specifications "ResourceType=key-pair,Tags=[{Key=Project,Value=toprf}${SLOT:+,{Key=Slot,Value=$SLOT}}]" \
+            --tag-specifications "ResourceType=key-pair,Tags=[{Key=Project,Value=toprf}]" \
             --query 'KeyMaterial' --output text > "$key_file"
         chmod 600 "$key_file"
         echo "  Key saved to: $key_file"
@@ -204,7 +201,7 @@ provision_node() {
         --key-name "$key_name" \
         --cpu-options AmdSevSnp=enabled \
         --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=50,VolumeType=gp3}' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$(_vm_tag "$n")},{Key=Project,Value=toprf}${SLOT:+,{Key=Slot,Value=$SLOT}}]" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$(_vm_tag "$n")},{Key=Project,Value=toprf}]" \
         --query 'Instances[0].InstanceId' --output text)
 
     echo "  Instance: $instance_id"

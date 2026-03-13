@@ -238,74 +238,41 @@ This is irreversible. If a node fails after locking, terminate it (`./provision.
 
 ---
 
-## Blue-Green Rotation
+## Automated Monthly Rotation
 
-Zero-downtime node rotation using slots. Each slot is a fully independent set of nodes + NLBs + PrivateLink. Traffic switches by updating the Lambda's NLB_URL env var.
+Nodes are rotated monthly via an AWS Lambda / Step Functions workflow — no admin ceremony or human intervention required. The rotation uses the **share recovery protocol** so that the existing quorum produces shares for each new node without ever reconstructing the secret.
 
-### Prerequisites
+### How it works
 
-- 3-of-5 admin shares (from `toprf-keygen init`)
-- Current nodes tagged with a slot (e.g., `blue`)
+The rotation Lambda runs on a monthly schedule (EventBridge cron) and rotates nodes **one at a time**:
 
-### Flow
-
-```bash
-# 1. Admin ceremony: reconstruct secret, generate fresh node shares
-toprf-keygen node-shares \
-  -a admin-1.json -a admin-3.json -a admin-5.json \
-  --node-threshold 2 --node-shares 3 \
-  -o ./node-shares
-
-# 2. Create config.env + nodes.json from examples, fill in values
-
-# 3. Provision new VMs alongside old ones
-SLOT=green ./provision.sh all
-
-# 4. Deploy everything (sealed nodes + PrivateLink + start)
-./deploy.sh --slot green auto-config
-./deploy.sh --slot green all
-
-# 5. Verify new set is healthy
-./deploy.sh --slot green e2e
-
-# 6. Switch traffic (updates Lambda NLB_URL)
-./deploy.sh --slot green cutover
-
-# 7. Tear down old set (discovers resources by Slot=blue tag, deletes all)
-./deploy.sh --slot blue teardown
-
-# 8. Clean up local files
-rm -f config.env nodes.json *.pem
-rm -rf node-shares coordinator-configs-green
+```
+For each node to rotate (1..N):
+  1. Provision a new SEV-SNP VM (same region, fresh instance)
+  2. Install Docker, pull the node image
+  3. Start the new node in init-reshare mode
+     → Node generates X25519 keypair, gets attestation report, uploads to S3
+  4. Download the new node's attestation report + pubkey from S3
+  5. Send POST /reshare to each donor node (the other N-1 nodes)
+     → Donors verify attestation, compute L_i(new_id) * k_i, ECIES-encrypt
+     → Upload encrypted contributions to the new node's S3 bucket
+  6. New node collects contributions, decrypts, verifies, combines → new share
+  7. New node seals share to hardware, uploads sealed blob
+  8. Restart new node in normal mode (auto-unseal)
+  9. Health-check the new node
+  10. Update NLB target: swap old node for new node
+  11. Terminate the old VM, clean up old S3 artifacts
 ```
 
-After teardown, `green` is the active slot. Next rotation deploys to `blue`, cuts over, tears down `green`.
+After all nodes are rotated, each node has a fresh VM and a new share on the **same polynomial** — the group public key and OPRF function are unchanged.
 
----
+### Why no admin ceremony?
 
-## Local File Cleanup
+Traditional rotation requires bringing admin shares together to derive new node shares. With share recovery, the existing live nodes **are** the ceremony — they produce shares for each replacement node via the `/reshare` endpoint. The admin shares (stored in vaults) are only needed if the entire quorum is lost simultaneously.
 
-After `deploy.sh lock`, nodes are running and SSH is gone. You can delete all local deploy files and start fresh for the next rotation:
+### Manual fallback
 
-```bash
-rm -f config.env nodes.json privatelink-state.env *.pem
-rm -rf coordinator-configs node-shares
-```
-
-All of these are regenerated during deployment:
-
-| File | Created by |
-|------|------------|
-| `config.env` / `nodes.json` | Copied from `.example` templates |
-| `*.pem` | `provision.sh` |
-| `privatelink-state.env` | `deploy.sh privatelink` |
-| `coordinator-configs/` | `deploy.sh coordinator-config` |
-| `node-shares/` | `toprf-keygen node-shares` (admin ceremony) |
-| `docker/coordinator-node-*.json` | `docker compose` (local test artifacts) |
-
-Teardown discovers old resources **by AWS tags** (`Slot=<name>`, `Project=toprf`), not from local files — no previous state needed.
-
-**Caveat:** `teardown` searches only the regions listed in your current `nodes.json`. If the old slot used regions not in the new config, add them temporarily so teardown can find those resources.
+If the Lambda fails or you need manual control, the same per-node replacement can be driven manually: provision a new VM, start it in `--init-reshare` mode, trigger `/reshare` on the donor nodes, then swap the NLB target once the new node is healthy.
 
 ---
 
