@@ -352,14 +352,12 @@ impl AttestationVerifier {
                 tracing::info!("AMD ARK fingerprint verified: {actual_hex}");
                 Ok(())
             }
-            Err(_) => {
-                Err(SealError::AttestationFailed(
-                    "AMD_ARK_FINGERPRINT env var is not set — ARK certificate pinning is \
+            Err(_) => Err(SealError::AttestationFailed(
+                "AMD_ARK_FINGERPRINT env var is not set — ARK certificate pinning is \
                      mandatory. Set this to the SHA-256 hex digest of the DER-encoded ARK \
                      certificate for your AMD product family."
-                        .into(),
-                ))
-            }
+                    .into(),
+            )),
         }
     }
 

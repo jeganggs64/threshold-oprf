@@ -198,7 +198,10 @@ pub async fn reshare_handler(
 
     // Verify guest policy debug bit is NOT set (bit 19)
     if (report.policy >> 19) & 1 != 0 {
-        warn!(policy = report.policy, "reshare: target has debug policy enabled");
+        warn!(
+            policy = report.policy,
+            "reshare: target has debug policy enabled"
+        );
         return Err((
             StatusCode::FORBIDDEN,
             "target guest policy has debug bit set — refusing reshare".to_string(),

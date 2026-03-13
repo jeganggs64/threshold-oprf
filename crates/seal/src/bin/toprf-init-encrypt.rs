@@ -187,14 +187,20 @@ async fn main() {
 
     // 2b. Verify VMPL == 0 (most privileged guest level)
     if report.vmpl != 0 {
-        eprintln!("Error: VMPL is {} — must be 0 for production nodes", report.vmpl);
+        eprintln!(
+            "Error: VMPL is {} — must be 0 for production nodes",
+            report.vmpl
+        );
         process::exit(1);
     }
     eprintln!("  VMPL: 0 (OK)");
 
     // 2c. Verify guest policy debug bit is NOT set (bit 19)
     if (report.policy >> 19) & 1 != 0 {
-        eprintln!("Error: guest policy has debug bit set (policy=0x{:x})", report.policy);
+        eprintln!(
+            "Error: guest policy has debug bit set (policy=0x{:x})",
+            report.policy
+        );
         eprintln!("  Debug-enabled VMs allow the hypervisor to read guest memory.");
         process::exit(1);
     }
