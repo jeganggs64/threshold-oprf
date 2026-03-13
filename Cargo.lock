@@ -2435,23 +2435,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "toprf-monitor"
-version = "0.1.0"
-dependencies = [
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "toprf-node"
 version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "base64",
  "hex",
  "hmac",
  "k256",
@@ -2466,6 +2455,7 @@ dependencies = [
  "toprf-seal",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
  "zeroize",
 ]
 
