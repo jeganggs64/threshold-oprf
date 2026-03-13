@@ -105,10 +105,6 @@ pub fn parse_cert_table(raw: &[u8]) -> Result<CertChain, SealError> {
 pub struct AttestationVerifier;
 
 impl AttestationVerifier {
-    // TODO(L-5): Add CRL/OCSP revocation checking for VCEK certificates.
-    // AMD publishes CRLs at https://kdsintf.amd.com/vcek/v1/{product}/crl
-    // Check certs against the CRL to detect revoked VCEK keys.
-
     /// Verify the SNP report using a pre-provided certificate chain.
     ///
     /// Use this when the cert chain comes from `SNP_GET_EXT_REPORT` (e.g., on
@@ -124,8 +120,11 @@ impl AttestationVerifier {
         // Verify VCEK is signed by ASK
         Self::verify_cert_signature(&certs.vcek, &certs.ask)?;
 
-        // Verify ARK fingerprint (if pinned)
+        // Verify ARK fingerprint (mandatory)
         Self::verify_ark_fingerprint(&certs.ark)?;
+
+        // Check VCEK against CRL if AMD_CRL_URL is set
+        Self::check_vcek_revocation(&certs.vcek)?;
 
         // Verify report signature with VCEK
         let pubkey_bytes = Self::extract_vcek_pubkey(&certs.vcek)?;
@@ -150,10 +149,11 @@ impl AttestationVerifier {
         // Verify VCEK is signed by ASK
         Self::verify_cert_signature(&vcek_der, &ask_der)?;
 
-        // Verify ARK fingerprint against pinned value (if configured via
-        // AMD_ARK_FINGERPRINT env var). The value must be the lowercase hex
-        // SHA-256 digest of the DER-encoded ARK certificate.
+        // Verify ARK fingerprint (mandatory)
         Self::verify_ark_fingerprint(&ark_der)?;
+
+        // Check VCEK against CRL if AMD_CRL_URL is set
+        Self::check_vcek_revocation(&vcek_der)?;
 
         let pubkey_bytes = Self::extract_vcek_pubkey(&vcek_der)?;
         Self::verify_signature(report, &pubkey_bytes)
@@ -373,5 +373,67 @@ impl AttestationVerifier {
             0..=25 => "Milan".to_string(),
             _ => "Genoa".to_string(),
         }
+    }
+
+    /// Check VCEK certificate against AMD's Certificate Revocation List.
+    ///
+    /// If the `AMD_CRL_PEM` environment variable is set, it should contain the
+    /// path to a PEM-encoded CRL file downloaded from AMD KDS
+    /// (`https://kdsintf.amd.com/vcek/v1/{product}/crl`). The VCEK serial
+    /// number is checked against the revoked list.
+    ///
+    /// If `AMD_CRL_PEM` is not set, CRL checking is skipped with a warning.
+    /// Operators should periodically download the CRL and set this variable.
+    fn check_vcek_revocation(vcek_der: &[u8]) -> Result<(), SealError> {
+        let crl_path = match std::env::var("AMD_CRL_PEM") {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "AMD_CRL_PEM not set — skipping VCEK revocation check. \
+                     Download the CRL from AMD KDS and set this env var for production."
+                );
+                return Ok(());
+            }
+        };
+
+        // Parse the VCEK serial number
+        let (_, vcek) = X509Certificate::from_der(vcek_der)
+            .map_err(|e| SealError::AttestationFailed(format!("failed to parse VCEK: {e}")))?;
+        let vcek_serial = vcek.tbs_certificate.raw_serial();
+
+        // Read and parse the CRL
+        let crl_data = std::fs::read(&crl_path).map_err(|e| {
+            SealError::AttestationFailed(format!("failed to read CRL file {crl_path}: {e}"))
+        })?;
+
+        // Try DER first, then PEM
+        let crl_der = if crl_data.starts_with(b"-----") {
+            let pem_str = std::str::from_utf8(&crl_data)
+                .map_err(|e| SealError::AttestationFailed(format!("invalid CRL PEM: {e}")))?;
+            let pem = ::pem::parse(pem_str)
+                .map_err(|e| SealError::AttestationFailed(format!("CRL PEM parse error: {e}")))?;
+            pem.contents().to_vec()
+        } else {
+            crl_data
+        };
+
+        let (_, crl) = x509_parser::revocation_list::CertificateRevocationList::from_der(&crl_der)
+            .map_err(|e| SealError::AttestationFailed(format!("failed to parse CRL: {e}")))?;
+
+        // Check if the VCEK serial number is in the revocation list
+        for revoked in crl.iter_revoked_certificates() {
+            if revoked.raw_serial() == vcek_serial {
+                return Err(SealError::AttestationFailed(format!(
+                    "VCEK certificate serial {} is REVOKED according to AMD CRL",
+                    hex::encode(vcek_serial)
+                )));
+            }
+        }
+
+        tracing::info!(
+            serial = %hex::encode(vcek_serial),
+            "VCEK not revoked (checked against CRL)"
+        );
+        Ok(())
     }
 }
