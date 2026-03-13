@@ -64,13 +64,16 @@ all_node_ids() { jq -r '.nodes[].id' "$NODES_JSON" | tr '\n' ' '; }
 
 # ─── Ensure IAM instance profile exists ─────────────────────────────────────
 
-ensure_iam_profile() {
-    local profile_name="${IAM_INSTANCE_PROFILE:-}"
-    [[ -n "$profile_name" ]] || die "IAM_INSTANCE_PROFILE not set in config.env"
+ensure_iam_profile_for_node() {
+    local n="$1"
+    local bucket
+    bucket=$(node_s3_bucket "$n" 2>/dev/null) || return 1
+    [[ -n "$bucket" ]] || return 1
 
-    local role_name="${profile_name%-profile}-role"
+    local role_name="toprf-node-${n}-role"
+    local profile_name="toprf-node-${n}-profile"
 
-    # Create role if it doesn't exist
+    # Create per-node role if it doesn't exist
     if ! aws iam get-role --role-name "$role_name" > /dev/null 2>&1; then
         echo "  Creating IAM role: $role_name..."
         aws iam create-role --role-name "$role_name" \
@@ -83,26 +86,18 @@ ensure_iam_profile() {
                 }]
             }' > /dev/null
 
-        # Grant S3 access — separate policy per node for isolation.
-        # TODO: For stronger isolation, create per-node IAM roles instead
-        # of a shared role, each scoped to only that node's S3 bucket.
-        for n in $(all_node_ids); do
-            local bucket
-            bucket=$(node_s3_bucket "$n" 2>/dev/null) || continue
-            [[ -n "$bucket" ]] || continue
-
-            aws iam put-role-policy --role-name "$role_name" \
-                --policy-name "sealed-s3-node-${n}" \
-                --policy-document "{
-                    \"Version\": \"2012-10-17\",
-                    \"Statement\": [{
-                        \"Effect\": \"Allow\",
-                        \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
-                        \"Resource\": [\"arn:aws:s3:::${bucket}/*\"]
-                    }]
-                }"
-            echo "  S3 policy attached for node $n bucket: $bucket"
-        done
+        # Grant S3 access scoped to ONLY this node's bucket
+        aws iam put-role-policy --role-name "$role_name" \
+            --policy-name "sealed-s3-access" \
+            --policy-document "{
+                \"Version\": \"2012-10-17\",
+                \"Statement\": [{
+                    \"Effect\": \"Allow\",
+                    \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
+                    \"Resource\": [\"arn:aws:s3:::${bucket}/*\"]
+                }]
+            }"
+        echo "  S3 policy attached: $bucket"
     else
         echo "  IAM role $role_name already exists"
     fi
@@ -189,8 +184,8 @@ provision_node() {
 
     info "Provisioning node $n in $region"
 
-    # Ensure IAM role + instance profile exist (idempotent)
-    ensure_iam_profile
+    # Ensure per-node IAM role + instance profile exist (idempotent)
+    ensure_iam_profile_for_node "$n"
 
     # Check for existing instance
     local existing
@@ -277,12 +272,13 @@ provision_node() {
             || warn "SSH rule may already exist"
     fi
 
-    # Attach IAM instance profile (created by ensure_iam_profile above)
-    echo "  Attaching IAM instance profile: ${IAM_INSTANCE_PROFILE}..."
+    # Attach per-node IAM instance profile
+    local node_profile="toprf-node-${n}-profile"
+    echo "  Attaching IAM instance profile: ${node_profile}..."
     aws ec2 associate-iam-instance-profile \
         --region "$region" \
         --instance-id "$instance_id" \
-        --iam-instance-profile "Name=${IAM_INSTANCE_PROFILE}" > /dev/null
+        --iam-instance-profile "Name=${node_profile}" > /dev/null
 
     # Fetch IPs
     local instance_data

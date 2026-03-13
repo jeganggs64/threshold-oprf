@@ -86,11 +86,19 @@ pub async fn evaluate_handler(
     info!(node_id = key.node_id, "computed own partial");
 
     // 3. Call peers — collect (threshold - 1) successful responses
+    //    Shuffle to avoid always hitting the same peers in the same order,
+    //    which provides better load distribution and limits traffic analysis.
     let needed_peers = (key.threshold as usize) - 1; // self counts as one
     let mut peer_partials: Vec<PartialEvaluation> = Vec::with_capacity(needed_peers);
     let mut peer_vs: Vec<(u16, String)> = Vec::with_capacity(needed_peers);
 
-    for peer in &coordinator.peers {
+    let mut shuffled_peers = coordinator.peers.clone();
+    {
+        use rand::seq::SliceRandom;
+        shuffled_peers.shuffle(&mut rand::thread_rng());
+    }
+
+    for peer in &shuffled_peers {
         if peer_partials.len() >= needed_peers {
             break;
         }
@@ -159,6 +167,9 @@ pub async fn evaluate_handler(
     }))
 }
 
+/// Per-peer call timeout.
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Call a peer node's /partial-evaluate endpoint via PrivateLink.
 async fn call_peer(
     client: &reqwest::Client,
@@ -167,12 +178,16 @@ async fn call_peer(
 ) -> Result<PartialEvaluation, String> {
     let url = format!("{}/partial-evaluate", peer.endpoint.trim_end_matches('/'));
 
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "blinded_point": blinded_point }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let resp = tokio::time::timeout(
+        PEER_TIMEOUT,
+        client
+            .post(&url)
+            .json(&serde_json::json!({ "blinded_point": blinded_point }))
+            .send(),
+    )
+    .await
+    .map_err(|_| format!("peer call timed out after {}s", PEER_TIMEOUT.as_secs()))?
+    .map_err(|e| format!("request failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
