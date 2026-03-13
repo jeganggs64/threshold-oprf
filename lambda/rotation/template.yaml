@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Threshold OPRF automated node rotation Lambda
+
+Parameters:
+  SSMPrefix:
+    Type: String
+    Default: /toprf
+    Description: SSM Parameter Store prefix for configuration
+  SNSAlertTopic:
+    Type: String
+    Default: toprf-node-alerts
+    Description: SNS topic name for CloudWatch alarm notifications
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 6 1 * ? *)
+    Description: Monthly rotation schedule (default first of month at 06:00 UTC)
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Description: VPC subnet IDs for Lambda (must reach NLBs via PrivateLink)
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Description: Security group IDs for Lambda
+
+Resources:
+  RotationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: toprf-rotation
+      Handler: handler.handler
+      Runtime: python3.12
+      CodeUri: .
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          SSM_PREFIX: !Ref SSMPrefix
+      VpcConfig:
+        SubnetIds: !Ref VpcSubnetIds
+        SecurityGroupIds: !Ref VpcSecurityGroupIds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            # SSM Parameter Store
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:PutParameter
+              Resource:
+                - !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter${SSMPrefix}/*
+            # EC2 operations
+            - Effect: Allow
+              Action:
+                - ec2:RunInstances
+                - ec2:TerminateInstances
+                - ec2:DescribeInstances
+                - ec2:DescribeImages
+                - ec2:DescribeSubnets
+                - ec2:CreateTags
+              Resource: '*'
+            # IAM pass role for EC2 instance profile
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/ruonid-node-role
+            # S3 access for sealed keys and reshare artifacts
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:ListBucket
+                - s3:HeadObject
+              Resource:
+                - arn:aws:s3:::toprf-sealed-*
+                - arn:aws:s3:::toprf-sealed-*/*
+            # ELBv2 for NLB target management
+            - Effect: Allow
+              Action:
+                - elasticloadbalancing:RegisterTargets
+                - elasticloadbalancing:DeregisterTargets
+                - elasticloadbalancing:DescribeTargetHealth
+              Resource: '*'
+
+  # SNS subscription (CloudWatch alarm → Lambda)
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSAlertTopic}
+      Protocol: lambda
+      Endpoint: !GetAtt RotationFunction.Arn
+
+  # Allow SNS to invoke Lambda
+  SNSInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSAlertTopic}
+
+  # Monthly rotation schedule
+  MonthlySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: toprf-monthly-rotation
+      Description: Monthly rotation of all TOPRF nodes
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: RotationLambda
+          Arn: !GetAtt RotationFunction.Arn
+
+  # Allow EventBridge to invoke Lambda
+  ScheduleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlySchedule.Arn
+
+Outputs:
+  RotationFunctionArn:
+    Description: ARN of the rotation Lambda function
+    Value: !GetAtt RotationFunction.Arn
+  RotationFunctionName:
+    Description: Name of the rotation Lambda function
+    Value: !Ref RotationFunction
