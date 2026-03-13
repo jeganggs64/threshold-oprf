@@ -29,7 +29,7 @@ use crate::types::{NodeId, NodeKeyShare, TOPRFError};
 use crate::{hex_to_point, hex_to_scalar, point_to_hex, scalar_to_hex};
 
 /// Serializable recovery contribution sent from donor to new node.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SerializableReshareContribution {
     /// The donor node's ID.
     pub from_node_id: NodeId,

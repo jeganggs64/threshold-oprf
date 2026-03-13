@@ -83,31 +83,26 @@ ensure_iam_profile() {
                 }]
             }' > /dev/null
 
-        # Grant S3 access to all sealed-key buckets
-        local resources=""
-        local first=true
+        # Grant S3 access — separate policy per node for isolation.
+        # TODO: For stronger isolation, create per-node IAM roles instead
+        # of a shared role, each scoped to only that node's S3 bucket.
         for n in $(all_node_ids); do
             local bucket
             bucket=$(node_s3_bucket "$n" 2>/dev/null) || continue
             [[ -n "$bucket" ]] || continue
-            $first || resources+=","
-            resources+="\"arn:aws:s3:::${bucket}/*\""
-            first=false
-        done
 
-        if [[ -n "$resources" ]]; then
             aws iam put-role-policy --role-name "$role_name" \
-                --policy-name sealed-s3-access \
+                --policy-name "sealed-s3-node-${n}" \
                 --policy-document "{
                     \"Version\": \"2012-10-17\",
                     \"Statement\": [{
                         \"Effect\": \"Allow\",
                         \"Action\": [\"s3:GetObject\", \"s3:PutObject\"],
-                        \"Resource\": [${resources}]
+                        \"Resource\": [\"arn:aws:s3:::${bucket}/*\"]
                     }]
                 }"
-            echo "  S3 policy attached for sealed-key buckets"
-        fi
+            echo "  S3 policy attached for node $n bucket: $bucket"
+        done
     else
         echo "  IAM role $role_name already exists"
     fi

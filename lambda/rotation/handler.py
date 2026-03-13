@@ -110,6 +110,8 @@ def build_user_data(config, node, image):
     donor_ids = [n["id"] for n in config["nodes"] if n["id"] != node_id]
     min_contributions = threshold
 
+    measurement = get_measurement()
+
     script = f"""#!/bin/bash
 set -euo pipefail
 exec > /var/log/toprf-rotation.log 2>&1
@@ -130,7 +132,7 @@ docker pull {image}
 echo "Starting init-reshare..."
 docker run --rm --name toprf-init-reshare \\
     --device /dev/sev-guest:/dev/sev-guest \\
-    --privileged --user root \\
+    --cap-drop ALL --security-opt no-new-privileges:true \\
     {image} \\
     --init-reshare \\
     --s3-bucket '{bucket}' \\
@@ -150,8 +152,9 @@ aws s3 cp s3://{bucket}/coordinator.json /etc/toprf/coordinator.json
 # Start in normal mode
 docker run -d --name toprf-node --restart=unless-stopped \\
     -e SEALED_KEY_URL='s3://{bucket}/sealed.bin' \\
+    -e EXPECTED_PEER_MEASUREMENT='{measurement}' \\
     --device /dev/sev-guest:/dev/sev-guest \\
-    --privileged --user root \\
+    --cap-drop ALL --security-opt no-new-privileges:true \\
     -p 3001:3001 \\
     {image} \\
     --port 3001 \\
@@ -402,7 +405,6 @@ def orchestrate_reshare(config, node_id, new_node_bucket, new_node_region):
     Orchestrate the reshare: download attestation from new node's S3,
     send /reshare to each donor, upload contributions to new node's S3.
     """
-    measurement = get_measurement()
     group_public_key = config["group_public_key"]
     donor_nodes = [n for n in config["nodes"] if n["id"] != node_id]
     donor_ids = [n["id"] for n in donor_nodes]
@@ -418,13 +420,15 @@ def orchestrate_reshare(config, node_id, new_node_bucket, new_node_region):
     pubkey = download_s3_object(new_node_bucket, "reshare/pubkey.bin", new_node_region)
     certs = download_s3_object(new_node_bucket, "reshare/certs.bin", new_node_region)
 
+    # expected_measurement is not sent — each donor reads it from its own
+    # EXPECTED_PEER_MEASUREMENT env var, so a compromised orchestrator
+    # cannot substitute a rogue measurement.
     reshare_payload = {
         "target_pubkey": pubkey.hex(),
         "attestation_report": base64.b64encode(attestation).decode(),
         "cert_chain": base64.b64encode(certs).decode(),
         "new_node_id": node_id,
         "participant_ids": donor_ids,
-        "expected_measurement": measurement,
         "group_public_key": group_public_key,
     }
 
@@ -476,6 +480,16 @@ def rotate_node(config, node_id):
     # Step 1: Upload coordinator config for the new node
     logger.info("Step 1: Uploading coordinator config to S3")
     upload_coordinator_config(config, node)
+
+    # Step 1b: Delete stale sealed.bin to prevent TOCTOU race
+    # (old sealed.bin from previous node would cause us to proceed
+    # before the new node has actually finished sealing)
+    logger.info("Step 1b: Deleting stale sealed.bin")
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3.delete_object(Bucket=bucket, Key="sealed.bin")
+    except Exception:
+        pass  # may not exist
 
     # Step 2: Launch new instance
     logger.info("Step 2: Launching new instance")
@@ -578,13 +592,30 @@ def handler(event, context):
 
     # EventBridge scheduled trigger (monthly rotation)
     if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        threshold = config["threshold"]
         logger.info("Scheduled rotation: rotating all nodes")
         for node in config["nodes"]:
+            # Re-read config each iteration (rotate_node updates it)
+            config = get_config()
+            # Quorum check: ensure enough healthy nodes remain before rotating
+            healthy = sum(1 for n in config["nodes"] if n.get("instance_id"))
+            if healthy < threshold:
+                logger.error(
+                    f"Only {healthy} healthy nodes, need {threshold} — aborting rotation"
+                )
+                return {
+                    "statusCode": 500,
+                    "body": f"quorum lost: {healthy} < {threshold}",
+                }
             try:
                 rotate_node(config, node["id"])
             except Exception as e:
                 logger.error(f"Failed to rotate node {node['id']}: {e}")
-                # Continue with other nodes
+                # Stop — don't risk further reducing the quorum
+                return {
+                    "statusCode": 500,
+                    "body": f"rotation failed at node {node['id']}: {e}",
+                }
         return {"statusCode": 200, "body": "scheduled rotation complete"}
 
     # Manual invocation (pass node_id in event)

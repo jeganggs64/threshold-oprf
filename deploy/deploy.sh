@@ -680,7 +680,7 @@ step_init_seal() {
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             --device /dev/sev-guest:/dev/sev-guest \
-            --privileged --user root \
+            --cap-drop ALL --security-opt no-new-privileges:true \
             ${NODE_IMAGE} \
             --init-seal \
             --s3-bucket '${bucket}' \
@@ -815,12 +815,16 @@ step_start() {
             echo "    Coordinator config uploaded"
         fi
 
+        # EXPECTED_PEER_MEASUREMENT: used by /reshare to verify target attestation
+        local peer_measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
+
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
+            -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
             ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
-            --privileged --user root \
+            --cap-drop ALL --security-opt no-new-privileges:true \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --port 3001 \

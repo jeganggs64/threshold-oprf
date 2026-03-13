@@ -396,9 +396,7 @@ async fn run_init_reshare(
     group_public_key: &str,
     min_contributions: u16,
 ) {
-    use toprf_core::reshare::{
-        combine_recovery_contributions, decode_plaintext_sub_share, SerializableReshareContribution,
-    };
+    use toprf_core::reshare::{combine_recovery_contributions, SerializableReshareContribution};
 
     info!("init-reshare: starting S3-mediated reshare mode for node {new_node_id}");
 
@@ -541,8 +539,15 @@ async fn run_init_reshare(
     for c in &contributions {
         participant_ids.push(c.from_node_id);
 
-        let sub_share = if c.encrypted {
-            // ECIES-decrypt
+        if !c.encrypted {
+            panic!(
+                "init-reshare: contribution from node {} is not encrypted — all contributions must be ECIES-encrypted",
+                c.from_node_id
+            );
+        }
+
+        // ECIES-decrypt
+        let sub_share = {
             use base64::Engine;
             let ciphertext = base64::engine::general_purpose::STANDARD
                 .decode(&c.sub_share_data)
@@ -557,10 +562,6 @@ async fn run_init_reshare(
             let hex_str = hex::encode(&*plaintext);
             toprf_core::hex_to_scalar(&hex_str)
                 .expect("init-reshare: decrypted sub-share is not a valid scalar")
-        } else {
-            // Plaintext (dev mode)
-            decode_plaintext_sub_share(c)
-                .expect("init-reshare: failed to decode plaintext sub-share")
         };
 
         decoded_contributions.push((c.from_node_id, sub_share, c.verification_share.clone()));

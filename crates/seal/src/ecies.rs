@@ -44,8 +44,12 @@ pub fn encrypt(recipient_pubkey: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>
         ));
     }
 
-    // Derive AES-256 key via HKDF-SHA256
-    let aes_key = derive_aes_key(shared_secret.as_bytes())?;
+    // Derive AES-256 key via HKDF-SHA256 (binding both public keys)
+    let aes_key = derive_aes_key(
+        shared_secret.as_bytes(),
+        ephemeral_pubkey.as_bytes(),
+        recipient_pubkey.as_bytes(),
+    )?;
 
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -95,6 +99,9 @@ pub fn decrypt(
     let nonce_bytes = &data[PUBKEY_LEN..PUBKEY_LEN + NONCE_LEN];
     let ciphertext = &data[PUBKEY_LEN + NONCE_LEN..];
 
+    // Derive recipient public key from secret for HKDF binding
+    let recipient_pubkey = PublicKey::from(recipient_secret);
+
     // X25519 ECDH
     let shared_secret = recipient_secret.diffie_hellman(&ephemeral_pubkey);
     if !shared_secret.was_contributory() {
@@ -103,8 +110,12 @@ pub fn decrypt(
         ));
     }
 
-    // Derive AES-256 key via HKDF-SHA256
-    let aes_key = derive_aes_key(shared_secret.as_bytes())?;
+    // Derive AES-256 key via HKDF-SHA256 (binding both public keys)
+    let aes_key = derive_aes_key(
+        shared_secret.as_bytes(),
+        ephemeral_pubkey.as_bytes(),
+        recipient_pubkey.as_bytes(),
+    )?;
 
     // Decrypt with AES-256-GCM
     let cipher = Aes256Gcm::new_from_slice(aes_key.as_ref())
@@ -129,10 +140,22 @@ pub fn generate_keypair() -> (StaticSecret, [u8; 32]) {
 }
 
 /// Derive an AES-256 key from an ECDH shared secret using HKDF-SHA256.
-fn derive_aes_key(shared_secret: &[u8]) -> Result<Zeroizing<[u8; 32]>, SealError> {
+///
+/// Both public keys are included in the HKDF info string to bind the
+/// derived key to this specific session (prevents key-compromise
+/// impersonation if the same shared secret were somehow reused).
+fn derive_aes_key(
+    shared_secret: &[u8],
+    ephemeral_pubkey: &[u8; 32],
+    recipient_pubkey: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, SealError> {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut info = Vec::with_capacity(HKDF_INFO.len() + 64);
+    info.extend_from_slice(HKDF_INFO);
+    info.extend_from_slice(ephemeral_pubkey);
+    info.extend_from_slice(recipient_pubkey);
     let mut key = Zeroizing::new([0u8; 32]);
-    hk.expand(HKDF_INFO, key.as_mut())
+    hk.expand(&info, key.as_mut())
         .map_err(|e| SealError::SealingFailed(format!("HKDF expand failed: {e}")))?;
     Ok(key)
 }
