@@ -2410,6 +2410,7 @@ dependencies = [
 name = "toprf-core"
 version = "0.1.0"
 dependencies = [
+ "crypto-bigint",
  "frost-secp256k1",
  "hex",
  "k256",

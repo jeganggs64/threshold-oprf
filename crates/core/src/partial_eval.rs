@@ -11,7 +11,7 @@ use k256::elliptic_curve::ops::MulByGenerator;
 use k256::elliptic_curve::Field;
 use k256::{ProjectivePoint, Scalar};
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 
 use crate::types::{DLEQProof, NodeId, PartialEvaluation, TOPRFError};
 use crate::{hex_to_point, hex_to_scalar_unrestricted, point_to_hex, scalar_to_hex};
@@ -155,6 +155,9 @@ fn dleq_verify(
 }
 
 /// Compute the DLEQ challenge scalar: c = H(G, B, V, E, A1, A2).
+///
+/// Uses SHA-512 (64 bytes) reduced mod the curve order to make bias
+/// negligible (~2^{-256} for secp256k1's ~256-bit order).
 fn dleq_challenge(
     generator: &ProjectivePoint,
     base_point: &ProjectivePoint,
@@ -163,7 +166,7 @@ fn dleq_challenge(
     a1: &ProjectivePoint,
     a2: &ProjectivePoint,
 ) -> Scalar {
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha512::new();
     hasher.update(b"DLEQ");
     hasher.update(generator.to_bytes());
     hasher.update(base_point.to_bytes());
@@ -173,18 +176,19 @@ fn dleq_challenge(
     hasher.update(a2.to_bytes());
     let hash = hasher.finalize();
 
-    // Reduce hash to scalar (mod curve order)
-    let mut bytes = [0u8; 32];
+    // Wide reduction: 512 bits → ~256-bit scalar, bias is ~2^{-256}
+    let mut bytes = [0u8; 64];
     bytes.copy_from_slice(&hash);
-    // Use wide reduction to avoid bias (SHA-256 output is 256 bits,
-    // secp256k1 order is ~256 bits — bias is negligible for proofs)
-    scalar_from_bytes_reduced(&bytes)
+    scalar_from_wide_bytes(&bytes)
 }
 
-/// Convert 32 bytes to a Scalar by reducing modulo the curve order.
-fn scalar_from_bytes_reduced(bytes: &[u8; 32]) -> Scalar {
+/// Convert 64 bytes to a Scalar by wide reduction modulo the curve order.
+///
+/// Using a 512-bit intermediate for a ~256-bit modulus makes the
+/// statistical bias negligible (~2^{-256}).
+fn scalar_from_wide_bytes(bytes: &[u8; 64]) -> Scalar {
     use k256::elliptic_curve::ops::Reduce;
-    let uint = k256::U256::from_be_slice(bytes);
+    let uint = crypto_bigint::U512::from_be_slice(bytes);
     Scalar::reduce(uint)
 }
 

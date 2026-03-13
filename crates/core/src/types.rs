@@ -37,13 +37,23 @@ pub enum TOPRFError {
 pub type NodeId = u16;
 
 /// A partial OPRF evaluation from a single node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PartialEvaluation {
     pub node_id: NodeId,
     /// Compressed SEC1 encoding of the partial evaluation point (33 bytes hex).
     pub partial_point: String,
     /// DLEQ proof: (challenge, response) proving the node used its correct key share.
     pub dleq_proof: DLEQProof,
+}
+
+impl std::fmt::Debug for PartialEvaluation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialEvaluation")
+            .field("node_id", &self.node_id)
+            .field("partial_point", &"<redacted>")
+            .field("dleq_proof", &"<redacted>")
+            .finish()
+    }
 }
 
 /// DLEQ proof: proves that log_G(V) == log_B(E) where V is the verification

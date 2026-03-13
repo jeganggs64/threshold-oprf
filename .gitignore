@@ -16,6 +16,7 @@ node-shares/
 .env
 .env.*
 deploy/config.env
+deploy/nodes.json
 deploy/ecs-state.env
 deploy/privatelink-state.env
 

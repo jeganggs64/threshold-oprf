@@ -313,10 +313,6 @@ When a node needs to be replaced (hardware failure, rotation), the remaining quo
 - **GPK verification** — the new node reconstructs the group public key from donor verification shares: `GPK == ∏ V_i^{L_i(0)}`.
 - **No secret reconstruction** — individual sub-shares reveal nothing about the original secret or other nodes' shares.
 
-### Dev mode
-
-Set `RESHARE_SKIP_ATTESTATION=true` on donor nodes to skip attestation verification and return plaintext sub-shares (for local integration testing only).
-
 ---
 
 ## Public Verifiability
