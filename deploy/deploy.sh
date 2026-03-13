@@ -47,6 +47,7 @@ Steps (run in order for fresh deployment):
   start         Start nodes in coordinator mode (unseal + serve)
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
+  cloudwatch    Create CloudWatch alarms for unhealthy node detection
 
 Utilities:
   auto-config   Auto-populate nodes.json from AWS
@@ -1031,7 +1032,75 @@ step_e2e() {
     fi
 }
 
-# ─── 11. Show IPs ────────────────────────────────────────────────────────────
+# ─── 11. CloudWatch alarms (unhealthy node detection) ────────────────────────
+
+step_cloudwatch() {
+    echo ""
+    info "Setting up CloudWatch alarms for NLB target health"
+
+    local sns_topic="${SNS_ALERT_TOPIC:-toprf-node-alerts}"
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Run privatelink first."
+    source "$pl_state"
+
+    for i in $(active_nodes); do
+        local region tg_arn
+        region=$(node_region "$i")
+        local tg_var="TG_ARN_NODE${i}"
+        tg_arn="${!tg_var:-}"
+        [[ -n "$tg_arn" ]] || { warn "No target group ARN for node $i — skipping"; continue; }
+
+        echo ""
+        echo "  ━━━ Node $i ($region) ━━━"
+
+        # Ensure SNS topic exists in this region
+        local topic_arn
+        topic_arn=$(aws sns create-topic --region "$region" --name "$sns_topic" \
+            --query 'TopicArn' --output text 2>/dev/null) || die "Failed to create SNS topic in $region"
+        echo "    SNS topic: $topic_arn"
+
+        # Extract target group ID from ARN for CloudWatch dimension
+        # ARN format: arn:aws:elasticloadbalancing:region:account:targetgroup/name/id
+        local tg_suffix
+        tg_suffix=$(echo "$tg_arn" | sed 's|.*targetgroup/|targetgroup/|')
+
+        # Extract NLB ID for the dimension
+        local nlb_var="NLB_ARN_NODE${i}"
+        local nlb_arn="${!nlb_var:-}"
+        local nlb_suffix
+        nlb_suffix=$(echo "$nlb_arn" | sed 's|.*loadbalancer/|net/|')
+
+        local alarm_name="toprf-node-${i}-unhealthy"
+
+        # Create/update CloudWatch alarm on UnHealthyHostCount
+        aws cloudwatch put-metric-alarm --region "$region" \
+            --alarm-name "$alarm_name" \
+            --alarm-description "TOPRF node $i has unhealthy NLB targets — triggers rotation" \
+            --namespace "AWS/NetworkELB" \
+            --metric-name UnHealthyHostCount \
+            --dimensions \
+                "Name=TargetGroup,Value=${tg_suffix}" \
+                "Name=LoadBalancer,Value=${nlb_suffix}" \
+            --statistic Maximum \
+            --period 60 \
+            --evaluation-periods 3 \
+            --threshold 1 \
+            --comparison-operator GreaterThanOrEqualToThreshold \
+            --treat-missing-data notBreaching \
+            --alarm-actions "$topic_arn" \
+            --ok-actions "$topic_arn" \
+            --tags Key=Project,Value=toprf
+        echo "    Alarm: $alarm_name (3 consecutive unhealthy checks → alert)"
+    done
+
+    echo ""
+    echo "  CloudWatch alarms created."
+    echo "  Subscribe the rotation Lambda to the SNS topic to auto-trigger recovery."
+    echo "  Example: aws sns subscribe --topic-arn <ARN> --protocol lambda --notification-endpoint <LAMBDA_ARN>"
+}
+
+# ─── 13. Show IPs ────────────────────────────────────────────────────────────
 
 step_show_ips() {
     echo ""
@@ -1062,7 +1131,7 @@ step_show_ips() {
     done
 }
 
-# ─── 12. Auto-config ─────────────────────────────────────────────────────────
+# ─── 14. Auto-config ─────────────────────────────────────────────────────────
 
 step_auto_config() {
     echo ""
@@ -1122,7 +1191,7 @@ step_auto_config() {
     echo "  Done. Review nodes.json and fill in any remaining empty fields."
 }
 
-# ─── 13. Lock nodes (remove SSH access) ──────────────────────────────────────
+# ─── 15. Lock nodes (remove SSH access) ──────────────────────────────────────
 
 step_lock() {
     echo ""
@@ -1165,7 +1234,7 @@ step_lock() {
     echo "  Nodes are now only reachable via port 3001 (NLB / PrivateLink)."
 }
 
-# ─── 14. Redeploy ────────────────────────────────────────────────────────────
+# ─── 16. Redeploy ────────────────────────────────────────────────────────────
 
 step_redeploy() {
     echo ""
@@ -1199,6 +1268,7 @@ Steps (run in order for fresh deployment):
   start         Start nodes in coordinator mode (unseal + serve)
   verify        Health check all nodes (via SSH)
   e2e           End-to-end verify: OPRF evaluate via coordinator
+  cloudwatch    Create CloudWatch alarms for unhealthy node detection
 
 Utilities:
   auto-config   Auto-populate nodes.json from AWS
@@ -1254,6 +1324,7 @@ for step in "${steps[@]}"; do
         coordinator-config) step_coordinator_config ;;
         verify)       step_verify ;;
         e2e)          step_e2e ;;
+        cloudwatch)   step_cloudwatch ;;
         auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
         redeploy)     step_redeploy ;;
