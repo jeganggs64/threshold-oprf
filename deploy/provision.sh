@@ -219,7 +219,7 @@ provision_node() {
         fi
     fi
 
-    # Find latest Amazon Linux 2023 AMI
+    # Find latest Amazon Linux 2023 AMI (pinned at deploy time)
     echo "  Finding latest AL2023 AMI..."
     local ami
     ami=$(aws ec2 describe-images --region "$region" \
@@ -230,6 +230,13 @@ provision_node() {
 
     [[ -n "$ami" && "$ami" != "None" ]] || die "No AL2023 AMI found in $region"
     echo "  AMI: $ami"
+
+    # Save AMI ID to nodes.json so Lambda reuses the same AMI
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson id "$n" --arg ami "$ami" \
+       '(.nodes[] | select(.id == $id)) |= . + {ami_id: $ami}' \
+       "$NODES_JSON" > "$tmp" && mv "$tmp" "$NODES_JSON"
 
     # Launch instance
     echo "  Launching $instance_type with SEV-SNP..."
