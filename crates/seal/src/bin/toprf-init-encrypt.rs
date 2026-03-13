@@ -222,13 +222,20 @@ async fn main() {
                 eprintln!("  Attestation report signature verified (using provided certs).");
             }
             Err(_) => {
-                // AWS EC2 doesn't populate the cert table in extended reports.
-                // The measurement check and REPORT_DATA binding still hold — the
-                // VCEK signature just adds hardware authenticity which is implicit
-                // when running on a known cloud provider.
-                eprintln!("  WARNING: certificate table empty (AWS EC2 does not provide certs).");
-                eprintln!("  Skipping AMD signature verification.");
-                eprintln!("  Measurement and REPORT_DATA binding are still verified.");
+                if skip_verify {
+                    eprintln!(
+                        "  WARNING: certificate table empty and --skip-attestation-verify set."
+                    );
+                    eprintln!("  Skipping AMD signature verification.");
+                    eprintln!("  Measurement and REPORT_DATA binding are still verified.");
+                } else {
+                    eprintln!("  Error: certificate table empty (AWS EC2 does not provide certs).");
+                    eprintln!("  Cannot verify AMD signature chain without certificates.");
+                    eprintln!(
+                        "  Use --skip-attestation-verify to proceed without cert verification."
+                    );
+                    process::exit(1);
+                }
             }
         }
     } else {

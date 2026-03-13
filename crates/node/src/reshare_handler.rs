@@ -13,10 +13,6 @@
 //! attestation independently — Lambda/orchestrator is just a courier.
 //! Even a fully compromised orchestrator cannot extract sub-shares for an
 //! unattested or wrongly-measured target.
-//!
-//! Dev mode: when `RESHARE_SKIP_ATTESTATION=true` is set, attestation
-//! verification is skipped and the sub-share is returned as plaintext hex.
-//! This is for local integration testing only.
 
 use std::sync::Arc;
 
@@ -30,7 +26,6 @@ use tracing::{info, warn};
 use x25519_dalek::PublicKey;
 
 use toprf_core::reshare::{generate_recovery_contribution, SerializableReshareContribution};
-use toprf_core::scalar_to_hex;
 
 use crate::NodeState;
 
@@ -47,9 +42,6 @@ pub struct ReshareRequest {
     pub new_node_id: u16,
     /// IDs of all participating donor nodes (must include this node).
     pub participant_ids: Vec<u16>,
-    /// Expected measurement of the target node (hex, 96 chars / 48 bytes).
-    /// Ignored in dev mode.
-    pub expected_measurement: String,
     /// Group public key — donor verifies this matches its own.
     pub group_public_key: String,
 }
@@ -57,7 +49,7 @@ pub struct ReshareRequest {
 /// Response body from POST /reshare.
 #[derive(Serialize)]
 pub struct ReshareResponse {
-    /// The serializable contribution (encrypted or plaintext sub-share).
+    /// The serializable contribution (ECIES-encrypted sub-share).
     #[serde(flatten)]
     pub contribution: SerializableReshareContribution,
 }
@@ -122,96 +114,96 @@ pub async fn reshare_handler(
     let mut pubkey_arr = [0u8; 32];
     pubkey_arr.copy_from_slice(&pubkey_bytes);
 
-    // 6. Attestation verification (skipped in dev mode)
-    let skip_attestation = std::env::var("RESHARE_SKIP_ATTESTATION")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    // 6. Attestation verification (always required — measurement from node-local config)
+    let expected_measurement = std::env::var("EXPECTED_PEER_MEASUREMENT").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EXPECTED_PEER_MEASUREMENT env var not set — cannot verify reshare target".to_string(),
+        )
+            .into_response()
+    })?;
 
-    if skip_attestation {
-        warn!("reshare: RESHARE_SKIP_ATTESTATION is set — skipping attestation verification. DO NOT USE IN PRODUCTION.");
-    } else {
-        // Decode attestation report and cert chain
-        use base64::Engine;
-        let report_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&req.attestation_report)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid attestation_report base64: {e}"),
-                )
-                    .into_response()
-            })?;
-
-        let cert_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&req.cert_chain)
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid cert_chain base64: {e}"),
-                )
-                    .into_response()
-            })?;
-
-        // Parse the SNP report
-        let report = toprf_seal::snp_report::SnpReport::from_bytes(&report_bytes).map_err(|e| {
+    // Decode attestation report and cert chain
+    use base64::Engine;
+    let report_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.attestation_report)
+        .map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("invalid attestation report: {e}"),
+                format!("invalid attestation_report base64: {e}"),
             )
                 .into_response()
         })?;
 
-        // Parse the certificate chain
-        let certs = toprf_seal::attestation::parse_cert_table(&cert_bytes).map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("invalid cert chain: {e}")).into_response()
+    let cert_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&req.cert_chain)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid cert_chain base64: {e}"),
+            )
+                .into_response()
         })?;
 
-        // Verify AMD signature chain
-        toprf_seal::attestation::AttestationVerifier::verify_report_with_certs(&report, &certs)
-            .map_err(|e| {
-                warn!("reshare: attestation verification failed: {e}");
-                (
-                    StatusCode::FORBIDDEN,
-                    format!("attestation verification failed: {e}"),
-                )
-                    .into_response()
-            })?;
+    // Parse the SNP report
+    let report = toprf_seal::snp_report::SnpReport::from_bytes(&report_bytes).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid attestation report: {e}"),
+        )
+            .into_response()
+    })?;
 
-        // Verify measurement matches expected
-        let report_measurement_hex = hex::encode(report.measurement);
-        if report_measurement_hex != req.expected_measurement {
-            warn!(
-                expected = %req.expected_measurement,
-                got = %report_measurement_hex,
-                "reshare: measurement mismatch"
-            );
-            return Err((
+    // Parse the certificate chain
+    let certs = toprf_seal::attestation::parse_cert_table(&cert_bytes).map_err(|e| {
+        (StatusCode::BAD_REQUEST, format!("invalid cert chain: {e}")).into_response()
+    })?;
+
+    // Verify AMD signature chain
+    toprf_seal::attestation::AttestationVerifier::verify_report_with_certs(&report, &certs)
+        .map_err(|e| {
+            warn!("reshare: attestation verification failed: {e}");
+            (
                 StatusCode::FORBIDDEN,
-                "measurement does not match expected value".to_string(),
+                format!("attestation verification failed: {e}"),
             )
-                .into_response());
-        }
+                .into_response()
+        })?;
 
-        // Verify REPORT_DATA binds to target_pubkey: REPORT_DATA[0..32] == SHA256(pubkey)
-        let expected_hash = {
-            let mut hasher = Sha256::new();
-            hasher.update(&pubkey_bytes);
-            hasher.finalize()
-        };
-        if report.report_data[..32] != expected_hash[..] {
-            warn!("reshare: REPORT_DATA does not match SHA256(target_pubkey)");
-            return Err((
-                StatusCode::FORBIDDEN,
-                "REPORT_DATA does not bind to provided target_pubkey".to_string(),
-            )
-                .into_response());
-        }
-
-        info!(
-            measurement = %report_measurement_hex,
-            "reshare: attestation verified successfully"
+    // Verify measurement matches node-local expected value
+    let report_measurement_hex = hex::encode(report.measurement);
+    if report_measurement_hex != expected_measurement {
+        warn!(
+            expected = %expected_measurement,
+            got = %report_measurement_hex,
+            "reshare: measurement mismatch"
         );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "measurement does not match expected value".to_string(),
+        )
+            .into_response());
     }
+
+    // Verify REPORT_DATA binds to target_pubkey: REPORT_DATA[0..32] == SHA256(pubkey)
+    let expected_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&pubkey_bytes);
+        hasher.finalize()
+    };
+    if report.report_data[..32] != expected_hash[..] {
+        warn!("reshare: REPORT_DATA does not match SHA256(target_pubkey)");
+        return Err((
+            StatusCode::FORBIDDEN,
+            "REPORT_DATA does not bind to provided target_pubkey".to_string(),
+        )
+            .into_response());
+    }
+
+    info!(
+        measurement = %report_measurement_hex,
+        "reshare: attestation verified successfully"
+    );
 
     // 7. Generate recovery contribution: L_i(new_node_id) * k_i
     let sub_scalar = generate_recovery_contribution(
@@ -229,27 +221,18 @@ pub async fn reshare_handler(
             .into_response()
     })?;
 
-    // 8. Encrypt or return plaintext based on mode
-    let (sub_share_data, encrypted) = if skip_attestation {
-        // Dev mode: return plaintext hex
-        (scalar_to_hex(&sub_scalar), false)
-    } else {
-        // Production: ECIES-encrypt to the verified target pubkey
-        let recipient = PublicKey::from(pubkey_arr);
-        let sub_share_bytes = sub_scalar.to_bytes();
-        let ciphertext = toprf_seal::ecies::encrypt(&recipient, &sub_share_bytes).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("ECIES encryption failed: {e}"),
-            )
-                .into_response()
-        })?;
-        use base64::Engine;
+    // 8. ECIES-encrypt to the verified target pubkey
+    let recipient = PublicKey::from(pubkey_arr);
+    let sub_share_bytes = sub_scalar.to_bytes();
+    let ciphertext = toprf_seal::ecies::encrypt(&recipient, &sub_share_bytes).map_err(|e| {
         (
-            base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-            true,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("ECIES encryption failed: {e}"),
         )
-    };
+            .into_response()
+    })?;
+    let sub_share_data = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+    let encrypted = true;
 
     // Donor's verification share for the new node to verify the contribution
     let donor_vs = key.verification_share.clone();

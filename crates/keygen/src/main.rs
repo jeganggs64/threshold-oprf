@@ -133,9 +133,9 @@ fn cmd_init(args: &[String]) {
                 existing_key = Some(key_hex);
             }
             "--existing-key" | "-k" => {
-                eprintln!("WARNING: passing keys via CLI is insecure (visible in ps output). Use --existing-key-file instead.");
-                i += 1;
-                existing_key = Some(args[i].clone());
+                eprintln!("Error: --existing-key / -k is removed (keys visible in ps output).");
+                eprintln!("Use --existing-key-file <PATH> instead.");
+                std::process::exit(1);
             }
             "--help" | "-h" => {
                 eprintln!("Usage: toprf-keygen init [OPTIONS]");
@@ -147,7 +147,7 @@ fn cmd_init(args: &[String]) {
                     "  -o, --output-dir <DIR>     Output directory (default: ./admin-shares)"
                 );
                 eprintln!("  --existing-key-file <PATH> Read existing key (hex) from file");
-                eprintln!("  -k, --existing-key <HEX>   Split an existing key (INSECURE — use --existing-key-file)");
+                eprintln!("  -k, --existing-key <HEX>   (REMOVED — use --existing-key-file)");
                 eprintln!("  -h, --help                 Show this help");
                 return;
             }
