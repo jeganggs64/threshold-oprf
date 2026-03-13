@@ -27,7 +27,7 @@
     },
     {
       "id": 3,
-      "region": "eu-west-1",
+      "region": "us-east-2",
       "key_name": "",
       "ssh_key": "",
       "ip": "",
