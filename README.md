@@ -266,7 +266,7 @@ This is irreversible. If a node fails after locking, terminate it (`./provision.
 
 ## Automated Monthly Rotation
 
-Nodes are rotated monthly via an AWS Lambda / Step Functions workflow — no admin ceremony or human intervention required. The rotation uses the **share recovery protocol** so that the existing quorum produces shares for each new node without ever reconstructing the secret.
+Nodes are rotated monthly via an AWS Lambda — no admin ceremony or human intervention required. The rotation uses the **share recovery protocol** so that the existing quorum produces shares for each new node without ever reconstructing the secret.
 
 ### How it works
 
@@ -325,6 +325,30 @@ The NLB health check polls `GET /health` every 30 seconds. A node is marked unhe
 ### Why no admin ceremony?
 
 Traditional rotation requires bringing admin shares together to derive new node shares. With share recovery, the existing live nodes **are** the ceremony — they produce shares for each replacement node via the `/reshare` endpoint. The admin shares (stored in vaults) are only needed if the entire quorum is lost simultaneously.
+
+### Rotation Lambda setup
+
+The rotation Lambda (`lambda/rotation/`) uses SSM Run Command to manage Docker on staging instances. Prerequisites:
+
+1. **SSM agent on nodes**: Amazon Linux 2023 includes the SSM agent by default. `provision.sh` attaches the `AmazonSSMManagedInstanceCore` managed policy to each node's IAM role.
+
+2. **Sync state to SSM**: After deployment, push local state to SSM Parameter Store so the Lambda can read node configs, coordinator configs, and measurements:
+   ```bash
+   ./deploy.sh sync-state
+   ```
+   Re-run `sync-state` after any change to nodes.json, coordinator configs, or PrivateLink state.
+
+3. **Deploy the Lambda**: The SAM template is at `lambda/rotation/template.yaml`. Deploy with:
+   ```bash
+   cd lambda/rotation
+   sam build && sam deploy --guided
+   ```
+
+4. **Test rotation manually**: Invoke the Lambda with a test event:
+   ```bash
+   aws lambda invoke --function-name toprf-rotation \
+     --payload '{"node_id": 1}' /dev/stdout
+   ```
 
 ### Manual fallback
 

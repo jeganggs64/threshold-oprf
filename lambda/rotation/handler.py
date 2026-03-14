@@ -1,13 +1,15 @@
 """
 Rotation Lambda — automated single-node replacement via share recovery.
 
+Uses SSM Run Command for VM operations (Docker install, image pull, container
+management) instead of EC2 user data, giving step-by-step observability and
+error handling. Follows a staging-based approach: a new instance runs alongside
+the old node until verified healthy, then the swap happens atomically.
+
 Triggers:
   1. SNS notification from CloudWatch alarm (unhealthy node detected)
   2. EventBridge scheduled event (monthly rotation of all nodes)
-
-The Lambda replaces one node at a time using the share recovery protocol.
-The existing quorum produces a new share for the replacement node without
-reconstructing the secret.
+  3. Manual invocation (pass node_id or action in event)
 
 Configuration is stored in SSM Parameter Store under /toprf/:
   /toprf/config          — JSON with node configs, threshold, image, etc.
@@ -23,11 +25,11 @@ import json
 import logging
 import os
 import re
-import shlex
 import time
 import base64
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -35,17 +37,19 @@ logger.setLevel(logging.INFO)
 SSM_PREFIX = os.environ.get("SSM_PREFIX", "/toprf")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
-# Timeouts
-VM_BOOT_TIMEOUT = 300       # 5 min for VM to boot and start init-reshare
+# Timeouts (seconds)
+SSM_AGENT_TIMEOUT = 300     # 5 min for SSM agent to come online
+DOCKER_SETUP_TIMEOUT = 300  # 5 min for Docker install + image pull
 ATTESTATION_TIMEOUT = 180   # 3 min for attestation to appear in S3
 RESHARE_TIMEOUT = 120       # 2 min for /reshare response from donor
 SEALED_TIMEOUT = 300        # 5 min for new node to combine + seal
 HEALTH_TIMEOUT = 120        # 2 min for new node to become healthy
-POLL_INTERVAL = 5           # seconds between S3 polls
+NLB_HEALTH_TIMEOUT = 120    # 2 min for NLB target to become healthy
+POLL_INTERVAL = 5           # seconds between polls
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (SSM Parameter Store)
 # ---------------------------------------------------------------------------
 
 def get_config():
@@ -97,105 +101,111 @@ def update_node_config(config, node_id, updates):
 
 
 # ---------------------------------------------------------------------------
-# EC2 Operations
+# Input Validation
 # ---------------------------------------------------------------------------
 
 def _validate_shell_safe(value, name):
-    """Validate that a value is safe for shell interpolation (alphanumeric, hyphens, dots, colons, slashes)."""
+    """Validate that a value is safe for shell interpolation."""
     if not re.match(r'^[a-zA-Z0-9._:/@\-]+$', str(value)):
         raise ValueError(f"Unsafe characters in {name}: {value!r}")
     return str(value)
 
 
-def build_user_data(config, node, image):
-    """Build EC2 user data script that bootstraps init-reshare."""
-    node_id = int(node["id"])
-    bucket = _validate_shell_safe(node["s3_bucket"], "s3_bucket")
-    threshold = int(config["threshold"])
-    total = len(config["nodes"])
-    group_public_key = _validate_shell_safe(config["group_public_key"], "group_public_key")
-    image = _validate_shell_safe(image, "image")
+# ---------------------------------------------------------------------------
+# SSM Run Command
+# ---------------------------------------------------------------------------
 
-    # Donor IDs = all nodes except the one being replaced
-    donor_ids = [n["id"] for n in config["nodes"] if n["id"] != node_id]
-    min_contributions = threshold
+def wait_for_ssm_agent(region, instance_id):
+    """Wait for the SSM agent on an instance to become online."""
+    ssm = boto3.client("ssm", region_name=region)
+    deadline = time.time() + SSM_AGENT_TIMEOUT
+    logger.info(f"Waiting for SSM agent on {instance_id}...")
 
-    measurement = _validate_shell_safe(get_measurement(), "measurement")
+    while time.time() < deadline:
+        try:
+            resp = ssm.describe_instance_information(
+                Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
+            )
+            if resp["InstanceInformationList"]:
+                if resp["InstanceInformationList"][0].get("PingStatus") == "Online":
+                    logger.info(f"SSM agent online: {instance_id}")
+                    return
+        except Exception:
+            pass
+        time.sleep(POLL_INTERVAL)
 
-    script = f"""#!/bin/bash
-set -euo pipefail
-exec > /var/log/toprf-rotation.log 2>&1
-
-echo "=== TOPRF Rotation Bootstrap ==="
-echo "Node ID: {node_id}"
-echo "S3 Bucket: {bucket}"
-
-# Install Docker
-yum install -y docker
-systemctl start docker
-systemctl enable docker
-
-# Pull node image
-docker pull {shlex.quote(image)}
-
-# Run init-reshare mode
-echo "Starting init-reshare..."
-docker run --rm --name toprf-init-reshare \\
-    --device /dev/sev-guest:/dev/sev-guest \\
-    --cap-drop ALL --security-opt no-new-privileges:true \\
-    {shlex.quote(image)} \\
-    --init-reshare \\
-    --s3-bucket {shlex.quote(bucket)} \\
-    --upload-url {shlex.quote('s3://' + bucket + '/sealed.bin')} \\
-    --new-node-id {node_id} \\
-    --new-threshold {threshold} \\
-    --new-total-shares {total} \\
-    --group-public-key {shlex.quote(group_public_key)} \\
-    --min-contributions {min_contributions}
-
-echo "Init-reshare complete. Starting normal mode..."
-
-# Write coordinator config (uploaded by Lambda via S3)
-mkdir -p /etc/toprf
-aws s3 cp {shlex.quote('s3://' + bucket + '/coordinator.json')} /etc/toprf/coordinator.json
-
-# Start in normal mode
-docker run -d --name toprf-node --restart=unless-stopped \\
-    -e SEALED_KEY_URL={shlex.quote('s3://' + bucket + '/sealed.bin')} \\
-    -e EXPECTED_PEER_MEASUREMENT={shlex.quote(measurement)} \\
-    --device /dev/sev-guest:/dev/sev-guest \\
-    --cap-drop ALL --security-opt no-new-privileges:true \\
-    -p 3001:3001 \\
-    {shlex.quote(image)} \\
-    --port 3001 \\
-    --coordinator-config /etc/toprf/coordinator.json
-
-echo "=== TOPRF node started ==="
-"""
-    return base64.b64encode(script.encode()).decode()
+    raise TimeoutError(
+        f"SSM agent not online on {instance_id} within {SSM_AGENT_TIMEOUT}s"
+    )
 
 
-def launch_instance(config, node):
-    """Launch a new SEV-SNP EC2 instance for a node."""
+def run_ssm_command(region, instance_id, commands, comment="", timeout=300):
+    """Execute shell commands on an instance via SSM Run Command.
+
+    Returns stdout on success, raises on failure or timeout.
+    """
+    ssm = boto3.client("ssm", region_name=region)
+    if isinstance(commands, str):
+        commands = [commands]
+
+    if DRY_RUN:
+        logger.info(f"DRY_RUN: would run on {instance_id}: {commands[0][:80]}")
+        return ""
+
+    resp = ssm.send_command(
+        InstanceIds=[instance_id],
+        DocumentName="AWS-RunShellScript",
+        Parameters={"commands": commands},
+        Comment=(comment or "toprf-rotation")[:100],
+        TimeoutSeconds=timeout,
+    )
+    command_id = resp["Command"]["CommandId"]
+    logger.info(f"SSM command {command_id}: {comment or commands[0][:50]}")
+
+    deadline = time.time() + timeout + 30  # extra buffer for API
+    while time.time() < deadline:
+        try:
+            result = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+            status = result["Status"]
+            if status == "Success":
+                return result.get("StandardOutputContent", "")
+            elif status in ("Failed", "TimedOut", "Cancelled"):
+                stderr = result.get("StandardErrorContent", "")
+                raise RuntimeError(
+                    f"SSM command failed ({status}): {stderr[:500]}"
+                )
+        except ssm.exceptions.InvocationDoesNotExist:
+            pass  # Not ready yet
+        time.sleep(POLL_INTERVAL)
+
+    raise TimeoutError(f"SSM command {command_id} timed out")
+
+
+# ---------------------------------------------------------------------------
+# EC2 Operations
+# ---------------------------------------------------------------------------
+
+def launch_staging_instance(config, node):
+    """Launch a staging EC2 instance for rotation (no user data — SSM used)."""
     region = node["region"]
     ec2 = boto3.client("ec2", region_name=region)
+    node_id = node["id"]
 
     instance_type = config.get("instance_type", "c6a.large")
-    iam_profile = f"toprf-node-{node['id']}-profile"
-    image = config.get("node_image", "ghcr.io/jeganggs64/toprf-node:latest")
+    iam_profile = f"toprf-node-{node_id}-profile"
 
     # Use pinned AMI from node config (set at provision time).
-    # This ensures rotated nodes use the same AMI as the original deployment,
-    # keeping the SEV-SNP measurement stable. To update the AMI, redeploy
-    # all nodes from scratch.
+    # Keeps the SEV-SNP measurement stable across rotations.
     ami_id = node.get("ami_id")
     if not ami_id:
         raise ValueError(
-            f"ami_id not set for node {node['id']}. "
-            "Reprovision nodes or set ami_id in SSM config."
+            f"ami_id not set for node {node_id}. "
+            "Reprovision or set ami_id in SSM config."
         )
 
-    # Find a subnet in the target VPC
     subnet_id = node.get("subnet_id")
     if not subnet_id:
         subnets = ec2.describe_subnets(
@@ -203,9 +213,10 @@ def launch_instance(config, node):
         )
         subnet_id = subnets["Subnets"][0]["SubnetId"]
 
-    user_data = build_user_data(config, node, image)
-
-    logger.info(f"Launching instance: region={region}, ami={ami_id}, type={instance_type}")
+    staging_tag = f"toprf-node-{node_id}-staging"
+    logger.info(
+        f"Launching staging: region={region}, ami={ami_id}, tag={staging_tag}"
+    )
 
     if DRY_RUN:
         logger.info("DRY_RUN: skipping instance launch")
@@ -219,7 +230,6 @@ def launch_instance(config, node):
         SubnetId=subnet_id,
         SecurityGroupIds=[node["sg_id"]] if node.get("sg_id") else [],
         IamInstanceProfile={"Name": iam_profile},
-        UserData=user_data,
         CpuOptions={"AmdSevSnp": "enabled"},
         MetadataOptions={"HttpPutResponseHopLimit": 2},
         BlockDeviceMappings=[{
@@ -229,19 +239,19 @@ def launch_instance(config, node):
         TagSpecifications=[{
             "ResourceType": "instance",
             "Tags": [
-                {"Key": "Name", "Value": f"toprf-node-{node['id']}"},
+                {"Key": "Name", "Value": staging_tag},
                 {"Key": "Project", "Value": "toprf"},
             ],
         }],
     )
 
     instance_id = response["Instances"][0]["InstanceId"]
-    logger.info(f"Instance launched: {instance_id}")
+    logger.info(f"Staging instance launched: {instance_id}")
     return instance_id
 
 
 def wait_for_instance(region, instance_id):
-    """Wait for an EC2 instance to be running."""
+    """Wait for an EC2 instance to be running and return its private IP."""
     ec2 = boto3.client("ec2", region_name=region)
     logger.info(f"Waiting for instance {instance_id} to be running...")
 
@@ -265,7 +275,21 @@ def terminate_instance(region, instance_id):
 
     ec2 = boto3.client("ec2", region_name=region)
     ec2.terminate_instances(InstanceIds=[instance_id])
-    logger.info(f"Terminated instance {instance_id}")
+    logger.info(f"Terminated: {instance_id}")
+
+
+def retag_instance(region, instance_id, new_name):
+    """Update the Name tag on an EC2 instance."""
+    if DRY_RUN:
+        logger.info(f"DRY_RUN: would retag {instance_id} to {new_name}")
+        return
+
+    ec2 = boto3.client("ec2", region_name=region)
+    ec2.create_tags(
+        Resources=[instance_id],
+        Tags=[{"Key": "Name", "Value": new_name}],
+    )
+    logger.info(f"Retagged {instance_id} to {new_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +306,7 @@ def wait_for_s3_object(bucket, key, region, timeout):
             s3.head_object(Bucket=bucket, Key=key)
             logger.info(f"Found s3://{bucket}/{key}")
             return True
-        except s3.exceptions.ClientError:
+        except ClientError:
             time.sleep(POLL_INTERVAL)
 
     return False
@@ -302,73 +326,57 @@ def upload_s3_object(bucket, key, data, region):
     logger.info(f"Uploaded s3://{bucket}/{key}")
 
 
-def upload_coordinator_config(config, node):
-    """Generate and upload coordinator config for a node to its S3 bucket."""
-    node_id = node["id"]
-    bucket = node["s3_bucket"]
-    region = node["region"]
-
-    peers = []
-    for other in config["nodes"]:
-        if other["id"] == node_id:
-            continue
-        peers.append({
-            "node_id": other["id"],
-            "endpoint": other["nlb_endpoint"],
-            "verification_share": other["verification_share"],
-        })
-
-    coord_config = json.dumps({"peers": peers}, indent=2)
-    upload_s3_object(bucket, "coordinator.json", coord_config.encode(), region)
-
-    # Also save to SSM for future reference
-    save_coordinator_config(node_id, coord_config)
-
-
 def cleanup_reshare_artifacts(bucket, region):
     """Remove temporary reshare artifacts from S3."""
     s3 = boto3.client("s3", region_name=region)
-    prefixes = ["reshare/"]
-    for prefix in prefixes:
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
-        for obj in response.get("Contents", []):
-            s3.delete_object(Bucket=bucket, Key=obj["Key"])
-            logger.info(f"Cleaned up s3://{bucket}/{obj['Key']}")
+    response = s3.list_objects_v2(Bucket=bucket, Prefix="reshare/")
+    for obj in response.get("Contents", []):
+        s3.delete_object(Bucket=bucket, Key=obj["Key"])
+        logger.info(f"Cleaned up s3://{bucket}/{obj['Key']}")
 
 
 # ---------------------------------------------------------------------------
 # NLB Operations
 # ---------------------------------------------------------------------------
 
-def swap_nlb_target(region, tg_arn, old_ip, new_ip):
-    """Deregister old target and register new target in an NLB target group."""
+def wait_target_healthy(region, tg_arn, ip, label, timeout=NLB_HEALTH_TIMEOUT):
+    """Wait for a target to become healthy in a target group."""
     if DRY_RUN:
-        logger.info(f"DRY_RUN: would swap {old_ip} → {new_ip} in {tg_arn}")
+        return
+
+    elbv2 = boto3.client("elbv2", region_name=region)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = elbv2.describe_target_health(
+            TargetGroupArn=tg_arn,
+            Targets=[{"Id": ip, "Port": 3001}],
+        )
+        state = resp["TargetHealthDescriptions"][0]["TargetHealth"]["State"]
+        if state == "healthy":
+            logger.info(f"{ip} healthy in {label}")
+            return
+        time.sleep(POLL_INTERVAL)
+
+    logger.warning(f"{ip} not healthy in {label} after {timeout}s — continuing")
+
+
+def swap_nlb_target(region, tg_arn, old_ip, new_ip, label="NLB"):
+    """Register new target, wait for healthy, then deregister old target."""
+    if DRY_RUN:
+        logger.info(f"DRY_RUN: would swap {old_ip} -> {new_ip} in {tg_arn}")
         return
 
     elbv2 = boto3.client("elbv2", region_name=region)
 
-    # Register new target
+    # Register new target first
     elbv2.register_targets(
         TargetGroupArn=tg_arn,
         Targets=[{"Id": new_ip, "Port": 3001}],
     )
-    logger.info(f"Registered new target {new_ip}:3001")
+    logger.info(f"Registered {new_ip} in {label}")
 
-    # Wait for new target to be healthy before deregistering old
-    deadline = time.time() + HEALTH_TIMEOUT
-    while time.time() < deadline:
-        health = elbv2.describe_target_health(
-            TargetGroupArn=tg_arn,
-            Targets=[{"Id": new_ip, "Port": 3001}],
-        )
-        state = health["TargetHealthDescriptions"][0]["TargetHealth"]["State"]
-        if state == "healthy":
-            logger.info(f"New target {new_ip} is healthy")
-            break
-        time.sleep(POLL_INTERVAL)
-    else:
-        raise TimeoutError(f"New target {new_ip} did not become healthy within {HEALTH_TIMEOUT}s")
+    # Wait for healthy before removing old
+    wait_target_healthy(region, tg_arn, new_ip, label)
 
     # Deregister old target
     if old_ip:
@@ -376,7 +384,50 @@ def swap_nlb_target(region, tg_arn, old_ip, new_ip):
             TargetGroupArn=tg_arn,
             Targets=[{"Id": old_ip, "Port": 3001}],
         )
-        logger.info(f"Deregistered old target {old_ip}:3001")
+        logger.info(f"Deregistered {old_ip} from {label}")
+
+
+# ---------------------------------------------------------------------------
+# Health Checks
+# ---------------------------------------------------------------------------
+
+def check_donor_health(donor_node):
+    """Health-check a donor node via its NLB endpoint."""
+    import urllib.request
+
+    endpoint = donor_node["nlb_endpoint"]
+    url = f"{endpoint}/health"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode())
+            if body.get("status") == "ready":
+                return True
+    except Exception as e:
+        logger.warning(f"Health check failed for node {donor_node['id']}: {e}")
+    return False
+
+
+def check_staging_health_via_ssm(region, instance_id, timeout=HEALTH_TIMEOUT):
+    """Health-check a staging node via SSM (runs curl loop on instance).
+
+    Efficient: one SSM call with internal polling instead of repeated SSM calls.
+    """
+    attempts = timeout // 2
+    try:
+        result = run_ssm_command(region, instance_id, [
+            f"for i in $(seq 1 {attempts}); do "
+            f"  if curl -sf http://localhost:3001/health 2>/dev/null "
+            f"    | grep -q ready; then "
+            f"    echo HEALTHY; exit 0; "
+            f"  fi; "
+            f"  sleep 2; "
+            f"done; "
+            f"echo NOT_HEALTHY; exit 1",
+        ], comment="Health check loop", timeout=timeout + 30)
+        return "HEALTHY" in result
+    except RuntimeError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -406,29 +457,39 @@ def send_reshare_request(donor_node, reshare_payload):
             logger.info(f"Received contribution from node {donor_node['id']}")
             return body
     except Exception as e:
-        logger.error(f"Failed to get contribution from node {donor_node['id']}: {e}")
+        logger.error(
+            f"Failed to get contribution from node {donor_node['id']}: {e}"
+        )
         raise
 
 
-def orchestrate_reshare(config, node_id, new_node_bucket, new_node_region):
+def orchestrate_reshare(config, node_id, bucket, region):
     """
-    Orchestrate the reshare: download attestation from new node's S3,
-    send /reshare to each donor, upload contributions to new node's S3.
+    Orchestrate the reshare: download attestation from staging node's S3,
+    send /reshare to each donor, upload contributions to staging node's S3.
     """
     group_public_key = config["group_public_key"]
     donor_nodes = [n for n in config["nodes"] if n["id"] != node_id]
     donor_ids = [n["id"] for n in donor_nodes]
 
-    # Wait for attestation artifacts from new node
+    # Wait for attestation artifacts from staging node
     logger.info("Waiting for attestation artifacts in S3...")
-    for key in ["reshare/attestation.bin", "reshare/pubkey.bin", "reshare/certs.bin"]:
-        if not wait_for_s3_object(new_node_bucket, key, new_node_region, ATTESTATION_TIMEOUT):
-            raise TimeoutError(f"Timed out waiting for {key} in s3://{new_node_bucket}")
+    for key in [
+        "reshare/attestation.bin",
+        "reshare/pubkey.bin",
+        "reshare/certs.bin",
+    ]:
+        if not wait_for_s3_object(bucket, key, region, ATTESTATION_TIMEOUT):
+            raise TimeoutError(
+                f"Timed out waiting for {key} in s3://{bucket}"
+            )
 
     # Download artifacts
-    attestation = download_s3_object(new_node_bucket, "reshare/attestation.bin", new_node_region)
-    pubkey = download_s3_object(new_node_bucket, "reshare/pubkey.bin", new_node_region)
-    certs = download_s3_object(new_node_bucket, "reshare/certs.bin", new_node_region)
+    attestation = download_s3_object(
+        bucket, "reshare/attestation.bin", region
+    )
+    pubkey = download_s3_object(bucket, "reshare/pubkey.bin", region)
+    certs = download_s3_object(bucket, "reshare/certs.bin", region)
 
     # expected_measurement is not sent — each donor reads it from its own
     # EXPECTED_PEER_MEASUREMENT env var, so a compromised orchestrator
@@ -450,33 +511,65 @@ def orchestrate_reshare(config, node_id, new_node_bucket, new_node_region):
     for donor in donor_nodes:
         contribution = send_reshare_request(donor, reshare_payload)
 
-        # Upload contribution to new node's S3 for it to pick up
+        # Upload contribution to staging node's S3 for it to pick up
         contrib_key = f"reshare/contribution-from-{donor['id']}.json"
         upload_s3_object(
-            new_node_bucket,
+            bucket,
             contrib_key,
             json.dumps(contribution).encode(),
-            new_node_region,
+            region,
         )
 
 
 # ---------------------------------------------------------------------------
-# Single-Node Rotation
+# Docker Command Builders
+# ---------------------------------------------------------------------------
+
+def _build_docker_run_cmd(
+    name, image, args, env=None, volumes=None, detach=True, port=None,
+):
+    """Build a docker run command string with security options."""
+    parts = ["docker run"]
+    if detach:
+        parts.append("-d")
+    parts.extend(["--name", name, "--restart=unless-stopped"])
+    parts.extend([
+        "--device /dev/sev-guest:/dev/sev-guest",
+        "--cap-drop ALL --security-opt no-new-privileges:true",
+    ])
+    if port:
+        parts.append(f"-p {port}:{port}")
+    for k, v in (env or {}).items():
+        parts.append(f"-e {k}='{v}'")
+    for v in (volumes or []):
+        parts.append(f"-v {v}")
+    parts.append(image)
+    parts.extend(args)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Single-Node Rotation (Staging-Based)
 # ---------------------------------------------------------------------------
 
 def rotate_node(config, node_id):
     """
-    Replace a single node using the share recovery protocol.
+    Replace a single node using staging-based approach + share recovery.
+
+    Old node continues serving traffic throughout. If anything fails,
+    the staging instance is terminated and the old node is unaffected.
 
     Steps:
-      1. Upload coordinator config to new node's S3
-      2. Launch new VM (user data starts init-reshare, then normal mode)
-      3. Wait for attestation, send /reshare to donors, upload contributions
-      4. Wait for sealed blob (init-reshare finished combining)
-      5. Wait for new node to become healthy
-      6. Swap NLB target (register new, deregister old)
-      7. Terminate old VM
-      8. Update config with new instance info
+      1. Pre-flight: verify donor nodes are healthy
+      2. Clean up stale reshare/staging artifacts
+      3. Launch staging instance (no user data — SSM used)
+      4. Setup staging VM: install Docker, pull image (via SSM)
+      5. Start init-reshare on staging (via SSM)
+      6. Orchestrate reshare: attestation -> /reshare to donors -> contributions
+      7. Wait for staging node to seal
+      8. Start normal mode on staging, health-check (via SSM)
+      9. Swap NLB targets (per-node + frontend)
+      10. Terminate old, retag staging, rename S3 blob, update config
     """
     node = next(n for n in config["nodes"] if n["id"] == node_id)
     bucket = node["s3_bucket"]
@@ -485,71 +578,276 @@ def rotate_node(config, node_id):
     old_instance = node.get("instance_id")
     tg_arn = node.get("tg_arn")
 
+    image = _validate_shell_safe(
+        config.get("node_image", "ghcr.io/jeganggs64/toprf-node:latest"),
+        "node_image",
+    )
+    measurement = _validate_shell_safe(get_measurement(), "measurement")
+    threshold = int(config["threshold"])
+    total = len(config["nodes"])
+    group_public_key = _validate_shell_safe(
+        config["group_public_key"], "gpk"
+    )
+
+    staging_sealed_key = f"node-{node_id}-staging-sealed.bin"
+    staging_sealed_url = f"s3://{bucket}/{staging_sealed_key}"
+    canonical_sealed_key = f"node-{node_id}-sealed.bin"
+    canonical_sealed_url = f"s3://{bucket}/{canonical_sealed_key}"
+
+    vs = node.get("verification_share", "")
+    if vs:
+        _validate_shell_safe(vs, "verification_share")
+
     logger.info(f"=== Rotating node {node_id} (region={region}) ===")
 
-    # Step 1: Upload coordinator config for the new node
-    logger.info("Step 1: Uploading coordinator config to S3")
-    upload_coordinator_config(config, node)
+    # ── Step 1: Pre-flight donor health checks ──
+    logger.info("Step 1: Pre-flight donor health checks")
+    donor_nodes = [n for n in config["nodes"] if n["id"] != node_id]
+    for donor in donor_nodes:
+        if not check_donor_health(donor):
+            raise RuntimeError(
+                f"Donor node {donor['id']} is not healthy — aborting rotation"
+            )
+        logger.info(f"  Node {donor['id']}: healthy")
 
-    # Step 1b: Delete stale sealed.bin to prevent TOCTOU race
-    # (old sealed.bin from previous node would cause us to proceed
-    # before the new node has actually finished sealing)
-    logger.info("Step 1b: Deleting stale sealed.bin")
+    # ── Step 2: Clean up stale artifacts ──
+    logger.info("Step 2: Cleaning stale artifacts")
+    cleanup_reshare_artifacts(bucket, region)
     s3 = boto3.client("s3", region_name=region)
     try:
-        s3.delete_object(Bucket=bucket, Key="sealed.bin")
+        s3.delete_object(Bucket=bucket, Key=staging_sealed_key)
     except Exception:
-        pass  # may not exist
+        pass
 
-    # Step 2: Launch new instance
-    logger.info("Step 2: Launching new instance")
-    new_instance_id = launch_instance(config, node)
-    new_ip = wait_for_instance(region, new_instance_id)
+    # ── Step 3: Launch staging instance ──
+    logger.info("Step 3: Launching staging instance")
+    staging_id = launch_staging_instance(config, node)
+    staging_ip = wait_for_instance(region, staging_id)
 
     try:
-        # Step 3: Orchestrate reshare
-        logger.info("Step 3: Orchestrating reshare")
+        # ── Step 4: Setup staging VM via SSM ──
+        logger.info("Step 4: Setting up staging VM via SSM")
+        wait_for_ssm_agent(region, staging_id)
+
+        run_ssm_command(
+            region, staging_id,
+            ["yum install -y docker && systemctl enable --now docker"],
+            comment=f"Install Docker on node-{node_id}-staging",
+            timeout=DOCKER_SETUP_TIMEOUT,
+        )
+        logger.info("  Docker installed")
+
+        run_ssm_command(
+            region, staging_id,
+            [f"docker pull {image}"],
+            comment=f"Pull image on node-{node_id}-staging",
+            timeout=DOCKER_SETUP_TIMEOUT,
+        )
+        logger.info(f"  Image pulled: {image}")
+
+        # ── Step 5: Start init-reshare ──
+        logger.info("Step 5: Starting init-reshare on staging")
+        _validate_shell_safe(bucket, "bucket")
+
+        init_cmd = _build_docker_run_cmd(
+            "toprf-init-reshare", image,
+            args=[
+                "--init-reshare",
+                f"--s3-bucket {bucket}",
+                f"--upload-url {staging_sealed_url}",
+                f"--new-node-id {node_id}",
+                f"--new-threshold {threshold}",
+                f"--new-total-shares {total}",
+                f"--group-public-key {group_public_key}",
+                f"--min-contributions {threshold}",
+            ],
+        )
+        run_ssm_command(
+            region, staging_id, [init_cmd],
+            comment=f"Init-reshare on node-{node_id}-staging",
+        )
+
+        # ── Step 6: Orchestrate reshare ──
+        logger.info("Step 6: Orchestrating reshare")
         orchestrate_reshare(config, node_id, bucket, region)
 
-        # Step 4: Wait for sealed blob (init-reshare completed)
-        logger.info("Step 4: Waiting for sealed blob")
-        if not wait_for_s3_object(bucket, "sealed.bin", region, SEALED_TIMEOUT):
-            raise TimeoutError("Timed out waiting for sealed blob")
-        logger.info("Sealed blob found — init-reshare complete")
+        # ── Step 7: Wait for seal ──
+        logger.info("Step 7: Waiting for init-reshare to complete")
+        try:
+            exit_code = run_ssm_command(
+                region, staging_id,
+                ["docker wait toprf-init-reshare"],
+                comment=f"Wait init-reshare node-{node_id}",
+                timeout=SEALED_TIMEOUT,
+            )
+            exit_code = exit_code.strip()
+            if exit_code != "0":
+                logs = run_ssm_command(
+                    region, staging_id,
+                    ["docker logs --tail 30 toprf-init-reshare 2>&1"],
+                    comment="Get init-reshare logs",
+                )
+                raise RuntimeError(
+                    f"Init-reshare exited {exit_code}: {logs[:500]}"
+                )
+        except TimeoutError:
+            raise TimeoutError("Init-reshare timed out waiting for seal")
 
-        # Step 5: Wait for node to become healthy via NLB
-        logger.info("Step 5: Waiting for new node to become healthy")
+        if not wait_for_s3_object(bucket, staging_sealed_key, region, 30):
+            raise TimeoutError(
+                "Sealed blob not found after init-reshare completed"
+            )
+        logger.info("  Sealed blob uploaded")
+
+        run_ssm_command(
+            region, staging_id,
+            ["docker rm -f toprf-init-reshare 2>/dev/null || true"],
+            comment="Cleanup init-reshare container",
+        )
+
+        # ── Step 8: Start normal mode ──
+        logger.info("Step 8: Starting staging node in normal mode")
+
+        # Reuse the existing coordinator config (same VPC, same PrivateLink
+        # endpoints — only the instance behind the NLB changed)
+        coord_config = get_coordinator_config(node_id)
+
+        # Write coordinator config + start node via SSM
+        node_cmd = _build_docker_run_cmd(
+            "toprf-node", image,
+            args=[
+                "--port 3001",
+                "--coordinator-config /etc/toprf/coordinator.json",
+            ],
+            env={
+                "SEALED_KEY_URL": staging_sealed_url,
+                "EXPECTED_VERIFICATION_SHARE": vs,
+                "EXPECTED_PEER_MEASUREMENT": measurement,
+            },
+            volumes=[
+                "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
+            ],
+            port=3001,
+        )
+        run_ssm_command(
+            region, staging_id,
+            [
+                "mkdir -p /etc/toprf",
+                f"cat > /etc/toprf/coordinator.json << 'COORD_EOF'\n"
+                f"{coord_config}\nCOORD_EOF",
+                node_cmd,
+            ],
+            comment=f"Start node-{node_id} normal mode",
+        )
+
+        # Health check via SSM
+        if not check_staging_health_via_ssm(region, staging_id):
+            raise TimeoutError(
+                "Staging node not healthy after starting normal mode"
+            )
+
+        # ── Step 9: Swap NLB targets ──
+        logger.info("Step 9: Swapping NLB targets")
+
+        # Per-node NLB
         if tg_arn:
-            # Step 6: Swap NLB target
-            logger.info("Step 6: Swapping NLB target")
-            swap_nlb_target(region, tg_arn, old_ip, new_ip)
+            swap_nlb_target(
+                region, tg_arn, old_ip, staging_ip,
+                f"per-node NLB (node {node_id})",
+            )
         else:
-            logger.warning("No TG ARN configured — skipping NLB swap")
+            logger.warning(
+                "No per-node TG ARN — skipping per-node NLB swap"
+            )
 
-        # Step 7: Terminate old instance
+        # Frontend NLB (only if node is in the coordinator VPC)
+        frontend_tg = config.get("frontend_tg_arn")
+        coordinator_vpc = config.get("coordinator_vpc_id")
+        node_vpc = node.get("vpc_id")
+        if frontend_tg and coordinator_vpc and node_vpc == coordinator_vpc:
+            swap_nlb_target(
+                region, frontend_tg, old_ip, staging_ip,
+                f"frontend NLB (node {node_id})",
+            )
+
+        # ── Step 10: Finalize ──
+        logger.info("Step 10: Finalizing")
+
+        # Terminate old instance
         if old_instance:
-            logger.info(f"Step 7: Terminating old instance {old_instance}")
             terminate_instance(region, old_instance)
-        else:
-            logger.info("Step 7: No old instance to terminate")
 
-        # Step 8: Update config
-        logger.info("Step 8: Updating config")
+        # Retag staging -> permanent
+        retag_instance(region, staging_id, f"toprf-node-{node_id}")
+
+        # Copy sealed blob: staging -> canonical, then delete staging
+        s3.copy_object(
+            Bucket=bucket,
+            Key=canonical_sealed_key,
+            CopySource={"Bucket": bucket, "Key": staging_sealed_key},
+        )
+        try:
+            s3.head_object(Bucket=bucket, Key=canonical_sealed_key)
+            s3.delete_object(Bucket=bucket, Key=staging_sealed_key)
+            logger.info(
+                f"Sealed blob renamed: "
+                f"{staging_sealed_key} -> {canonical_sealed_key}"
+            )
+        except ClientError:
+            logger.warning(
+                "Could not verify sealed blob copy — "
+                "keeping staging blob as backup"
+            )
+
+        # Restart container with canonical sealed URL
+        node_cmd_canonical = _build_docker_run_cmd(
+            "toprf-node", image,
+            args=[
+                "--port 3001",
+                "--coordinator-config /etc/toprf/coordinator.json",
+            ],
+            env={
+                "SEALED_KEY_URL": canonical_sealed_url,
+                "EXPECTED_VERIFICATION_SHARE": vs,
+                "EXPECTED_PEER_MEASUREMENT": measurement,
+            },
+            volumes=[
+                "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
+            ],
+            port=3001,
+        )
+        run_ssm_command(
+            region, staging_id,
+            [
+                "docker rm -f toprf-node 2>/dev/null || true",
+                node_cmd_canonical,
+            ],
+            comment=f"Restart node-{node_id} with canonical sealed URL",
+        )
+
+        # Verify health after restart
+        if not check_staging_health_via_ssm(region, staging_id):
+            logger.warning(
+                "Node not healthy after restart — may need manual check"
+            )
+
+        # Update SSM config with new instance info
         update_node_config(config, node_id, {
-            "instance_id": new_instance_id,
-            "private_ip": new_ip,
-            "ip": "",  # public IP unknown until queried
+            "instance_id": staging_id,
+            "private_ip": staging_ip,
         })
 
-        # Clean up reshare artifacts
+        # Clean up
         cleanup_reshare_artifacts(bucket, region)
 
         logger.info(f"=== Node {node_id} rotation complete ===")
 
     except Exception:
-        # Rollback: terminate new instance if anything fails after launch
-        logger.error(f"Rotation failed for node {node_id}, terminating new instance {new_instance_id}")
-        terminate_instance(region, new_instance_id)
+        logger.error(
+            f"Rotation failed for node {node_id}, "
+            f"terminating staging instance {staging_id}"
+        )
+        terminate_instance(region, staging_id)
         cleanup_reshare_artifacts(bucket, region)
         raise
 
@@ -559,13 +857,16 @@ def rotate_node(config, node_id):
 # ---------------------------------------------------------------------------
 
 def parse_sns_alarm(event):
-    """Extract the unhealthy node ID from an SNS CloudWatch alarm notification."""
+    """Extract the unhealthy node ID from an SNS CloudWatch alarm."""
     for record in event.get("Records", []):
         message = json.loads(record["Sns"]["Message"])
         alarm_name = message.get("AlarmName", "")
 
         # Alarm name format: toprf-node-<id>-unhealthy
-        if alarm_name.startswith("toprf-node-") and alarm_name.endswith("-unhealthy"):
+        if (
+            alarm_name.startswith("toprf-node-")
+            and alarm_name.endswith("-unhealthy")
+        ):
             try:
                 node_id = int(alarm_name.split("-")[2])
                 state = message.get("NewStateValue", "")
@@ -582,17 +883,23 @@ def handler(event, context):
     Lambda entry point.
 
     Handles:
-      - SNS event from CloudWatch alarm → rotate the unhealthy node
-      - EventBridge scheduled event → rotate all nodes one at a time
+      - SNS event from CloudWatch alarm -> rotate the unhealthy node
+      - EventBridge scheduled event -> rotate all nodes one at a time
+      - Manual invocation -> {"node_id": N} or {"action": "rotate_all"}
     """
     # Log event type without full payload to avoid leaking config details
-    event_source = event.get("source", event.get("Records", [{}])[0].get("EventSource", "manual"))
+    event_source = event.get(
+        "source",
+        event.get("Records", [{}])[0].get("EventSource", "manual"),
+    )
     logger.info(f"Event received: source={event_source}")
 
     config = get_config()
 
     # SNS trigger (unhealthy node)
-    if "Records" in event and event["Records"][0].get("EventSource") == "aws:sns":
+    if "Records" in event and event["Records"][0].get(
+        "EventSource"
+    ) == "aws:sns":
         node_id = parse_sns_alarm(event)
         if node_id is None:
             logger.info("SNS event is not an ALARM trigger — ignoring")
@@ -603,17 +910,23 @@ def handler(event, context):
         return {"statusCode": 200, "body": f"rotated node {node_id}"}
 
     # EventBridge scheduled trigger (monthly rotation)
-    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+    if (
+        event.get("source") == "aws.events"
+        or event.get("detail-type") == "Scheduled Event"
+    ):
         threshold = config["threshold"]
         logger.info("Scheduled rotation: rotating all nodes")
         for node in config["nodes"]:
             # Re-read config each iteration (rotate_node updates it)
             config = get_config()
-            # Quorum check: ensure enough healthy nodes remain before rotating
-            healthy = sum(1 for n in config["nodes"] if n.get("instance_id"))
+            # Quorum check
+            healthy = sum(
+                1 for n in config["nodes"] if n.get("instance_id")
+            )
             if healthy < threshold:
                 logger.error(
-                    f"Only {healthy} healthy nodes, need {threshold} — aborting rotation"
+                    f"Only {healthy} healthy nodes, need {threshold} "
+                    "— aborting rotation"
                 )
                 return {
                     "statusCode": 500,
@@ -630,11 +943,28 @@ def handler(event, context):
                 }
         return {"statusCode": 200, "body": "scheduled rotation complete"}
 
-    # Manual invocation (pass node_id in event)
+    # Manual invocation (single node)
     node_id = event.get("node_id")
     if node_id:
         rotate_node(config, int(node_id))
         return {"statusCode": 200, "body": f"rotated node {node_id}"}
+
+    # Manual invocation (all nodes)
+    action = event.get("action")
+    if action == "rotate_all":
+        threshold = config["threshold"]
+        for node in config["nodes"]:
+            config = get_config()
+            healthy = sum(
+                1 for n in config["nodes"] if n.get("instance_id")
+            )
+            if healthy < threshold:
+                return {
+                    "statusCode": 500,
+                    "body": f"quorum lost: {healthy} < {threshold}",
+                }
+            rotate_node(config, node["id"])
+        return {"statusCode": 200, "body": "all nodes rotated"}
 
     logger.warning(f"Unknown event type: {json.dumps(event)}")
     return {"statusCode": 400, "body": "unknown event type"}

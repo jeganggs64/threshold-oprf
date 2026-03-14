@@ -100,9 +100,14 @@ ensure_iam_profile_for_node() {
                 }]
             }"
         echo "  S3 policy attached: $bucket"
+
     else
         echo "  IAM role $role_name already exists"
     fi
+
+    # Attach SSM managed policy for automated rotation via Lambda (idempotent)
+    aws iam attach-role-policy --role-name "$role_name" \
+        --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" 2>/dev/null || true
 
     # Create instance profile if it doesn't exist
     if ! aws iam get-instance-profile --instance-profile-name "$profile_name" > /dev/null 2>&1; then

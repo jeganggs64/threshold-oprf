@@ -59,6 +59,7 @@ Utilities:
   auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
   lambda-config Auto-generate lambda/config.env from deployment state
+  sync-state    Push local state to SSM Parameter Store (for rotation Lambda)
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
@@ -2112,6 +2113,127 @@ step_lambda_config() {
     echo "  File: $lambda_config"
 }
 
+# ─── Sync state to SSM Parameter Store (for rotation Lambda) ─────────────
+
+step_sync_state() {
+    echo ""
+    info "Syncing local state to SSM Parameter Store"
+
+    load_ceremony
+
+    local pl_state
+    pl_state=$(pl_state_file)
+    [[ -f "$pl_state" ]] || die "$(basename "$pl_state") not found. Run './deploy.sh privatelink' first."
+    source "$pl_state"
+
+    local ssm_prefix="${SSM_PREFIX:-/toprf}"
+    local coord_region
+    coord_region=$(node_region 1)
+    local coord_vpc
+    coord_vpc=$(node_vpc_id 1)
+    local coord_vi
+    coord_vi=$(vpc_ident "$coord_vpc")
+
+    # Build config JSON from nodes.json + runtime state
+    local config_json
+    config_json=$(jq '.' "$NODES_JSON")
+
+    # Add per-node runtime fields
+    for i in $(all_node_ids); do
+        local tg_var="PL_TG_ARN_NODE${i}"
+        local tg_arn="${!tg_var:-}"
+        local nlb_endpoint=""
+
+        # Determine Lambda-accessible endpoint for this node
+        # (Lambda runs in the coordinator VPC)
+        local node_vpc_i
+        node_vpc_i=$(node_vpc_id "$i")
+        if [[ "$node_vpc_i" == "$coord_vpc" ]]; then
+            # Same VPC: use NLB DNS directly
+            local nlb_dns_var="NLB_DNS_NODE${i}"
+            nlb_endpoint="http://${!nlb_dns_var:-}:3001"
+        else
+            # Cross-VPC: use PrivateLink VPCE DNS
+            local vpce_dns_var="VPCE_DNS_NODE${i}_IN_${coord_vi}"
+            nlb_endpoint="http://${!vpce_dns_var:-}:3001"
+        fi
+
+        local vs
+        vs=$(node_vs "$i")
+
+        config_json=$(echo "$config_json" | jq \
+            --argjson id "$i" \
+            --arg tg "$tg_arn" \
+            --arg ep "$nlb_endpoint" \
+            --arg vs "$vs" \
+            '(.nodes[] | select(.id == $id)) |= . + {
+                tg_arn: $tg,
+                nlb_endpoint: $ep,
+                verification_share: $vs
+            }')
+    done
+
+    # Add top-level config fields
+    config_json=$(echo "$config_json" | jq \
+        --arg gpk "$GROUP_PUBLIC_KEY" \
+        --arg image "$NODE_IMAGE" \
+        --arg itype "${INSTANCE_TYPE:-c6a.large}" \
+        --arg frontend_tg "${FRONTEND_TG_ARN:-}" \
+        --arg coord_vpc "$coord_vpc" \
+        '. + {
+            group_public_key: $gpk,
+            node_image: $image,
+            instance_type: $itype,
+            frontend_tg_arn: $frontend_tg,
+            coordinator_vpc_id: $coord_vpc
+        }')
+
+    # Push config to SSM
+    echo "  Pushing config to ${ssm_prefix}/config..."
+    aws ssm put-parameter \
+        --name "${ssm_prefix}/config" \
+        --value "$config_json" \
+        --type SecureString \
+        --overwrite \
+        --region "$coord_region" > /dev/null
+    echo "    Done."
+
+    # Push measurement
+    local measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
+    if [[ -n "$measurement" ]]; then
+        echo "  Pushing measurement to ${ssm_prefix}/measurement..."
+        aws ssm put-parameter \
+            --name "${ssm_prefix}/measurement" \
+            --value "$measurement" \
+            --type String \
+            --overwrite \
+            --region "$coord_region" > /dev/null
+        echo "    Done."
+    fi
+
+    # Push per-node coordinator configs
+    local config_dir
+    config_dir=$(coord_config_dir)
+    if [[ -d "$config_dir" ]]; then
+        for i in $(all_node_ids); do
+            local coord_config="${config_dir}/coordinator-node-${i}.json"
+            if [[ -f "$coord_config" ]]; then
+                echo "  Pushing coordinator config for node $i..."
+                aws ssm put-parameter \
+                    --name "${ssm_prefix}/coordinator-config/${i}" \
+                    --value "$(cat "$coord_config")" \
+                    --type String \
+                    --overwrite \
+                    --region "$coord_region" > /dev/null
+                echo "    Done."
+            fi
+        done
+    fi
+
+    echo ""
+    echo "  State synced to SSM (prefix: ${ssm_prefix}, region: ${coord_region})"
+}
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -2145,6 +2267,7 @@ Utilities:
   auto-config   Auto-populate nodes.json from AWS
   show-ips      Fetch public/private IPs for all nodes
   lambda-config Auto-generate lambda/config.env from deployment state
+  sync-state    Push local state to SSM Parameter Store (for rotation Lambda)
   lock          Remove SSH access + delete keys (irreversible)
 
 Shortcuts:
@@ -2215,6 +2338,7 @@ for step in "${steps[@]}"; do
         auto-config)  step_auto_config ;;
         show-ips)     step_show_ips ;;
         lambda-config) step_lambda_config ;;
+        sync-state)   step_sync_state ;;
         redeploy)     step_redeploy ;;
         lock)         step_lock ;;
         pre-seal)
