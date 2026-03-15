@@ -156,11 +156,12 @@ pub async fn reshare_handler(
     })?;
 
     // Build certificate chain (fetches ASK/ARK from AMD KDS if not in cert table)
-    let certs = toprf_seal::attestation::AttestationVerifier::build_cert_chain(&cert_bytes, &report)
-        .await
-        .map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("invalid cert chain: {e}")).into_response()
-        })?;
+    let certs =
+        toprf_seal::attestation::AttestationVerifier::build_cert_chain(&cert_bytes, &report)
+            .await
+            .map_err(|e| {
+                (StatusCode::BAD_REQUEST, format!("invalid cert chain: {e}")).into_response()
+            })?;
 
     // Verify AMD signature chain
     toprf_seal::attestation::AttestationVerifier::verify_report_with_certs(&report, &certs)
