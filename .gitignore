@@ -6,6 +6,7 @@ certs/
 
 # Build artifacts
 /target/
+__pycache__/
 
 # Ceremony outputs (key shares)
 ceremony/
