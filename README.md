@@ -7,15 +7,9 @@ Node count and threshold are configurable — deploy 2-of-3, 3-of-5, 4-of-7, or 
 ## Architecture
 
 ```
-Mobile App → API Gateway (TLS) → Lambda (VPC) → Frontend NLB
-                                                      ↓
-                                              ┌───────┴───────┐
-                                              │  Same-region   │
-                                              │  nodes (any    │
-                                              │  can coordinate)│
-                                              └───────┬───────┘
-                                                      ↓ AWS PrivateLink
-                                              (threshold-1) Peer Nodes
+Mobile App → API Gateway (TLS) → Lambda (VPC) → Frontend NLB → Coordinator Node
+                                                                       ↓ AWS PrivateLink
+                                                               (threshold-1) Peer Nodes
 ```
 
 Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to threshold-1 peer nodes via PrivateLink, verifies each peer's DLEQ proof, combines all partials via Lagrange interpolation, and returns the final OPRF evaluation.
