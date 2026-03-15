@@ -463,6 +463,17 @@ step_privatelink() {
         local svc_var="ENDPOINT_SVC_ID_NODE${i}"
         local svc_id="${!svc_var:-}"
         if [[ -z "$svc_id" ]]; then
+            # Check if an endpoint service already exists for this NLB
+            svc_id=$(aws ec2 describe-vpc-endpoint-service-configurations \
+                --region "$region" \
+                --query "ServiceConfigurations[?NetworkLoadBalancerArns[?contains(@, '${nlb_arn}')]].ServiceId | [0]" \
+                --output text 2>/dev/null)
+            if [[ -n "$svc_id" && "$svc_id" != "None" ]]; then
+                echo "  Reusing existing VPC Endpoint Service: $svc_id"
+                echo "${svc_var}=${svc_id}" >> "$pl_state"
+            fi
+        fi
+        if [[ -z "$svc_id" || "$svc_id" == "None" ]]; then
             echo "  Creating VPC Endpoint Service..."
             svc_id=$(aws ec2 create-vpc-endpoint-service-configuration \
                 --region "$region" \
@@ -515,6 +526,7 @@ step_privatelink() {
             done
         else
             echo "    Endpoint Service: $svc_id (exists)"
+            eval "${svc_var}='${svc_id}'"
         fi
 
         # Get the service name (needed to create VPC endpoints)
@@ -570,17 +582,26 @@ step_privatelink() {
             _vpce_sg_name=$(vpce_sg_name "$my_vi")
             echo "  Creating VPCE security group in $my_vpc ($my_region)..."
             local sg_id
-            sg_id=$(aws ec2 create-security-group \
+            # Reuse existing SG if it already exists
+            sg_id=$(aws ec2 describe-security-groups \
                 --region "$my_region" \
-                --vpc-id "$my_vpc" \
-                --group-name "$_vpce_sg_name" \
-                --description "Allow nodes to reach peers via PrivateLink" \
-                --query 'GroupId' --output text)
-            aws ec2 authorize-security-group-ingress \
-                --region "$my_region" \
-                --group-id "$sg_id" \
-                --protocol tcp --port 3001 \
-                --cidr "$vpc_cidr"
+                --filters "Name=group-name,Values=$_vpce_sg_name" "Name=vpc-id,Values=$my_vpc" \
+                --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+            if [[ -n "$sg_id" && "$sg_id" != "None" ]]; then
+                echo "    Reusing existing SG: $sg_id"
+            else
+                sg_id=$(aws ec2 create-security-group \
+                    --region "$my_region" \
+                    --vpc-id "$my_vpc" \
+                    --group-name "$_vpce_sg_name" \
+                    --description "Allow nodes to reach peers via PrivateLink" \
+                    --query 'GroupId' --output text)
+                aws ec2 authorize-security-group-ingress \
+                    --region "$my_region" \
+                    --group-id "$sg_id" \
+                    --protocol tcp --port 3001 \
+                    --cidr "$vpc_cidr" 2>/dev/null || true
+            fi
             echo "${sg_var}=${sg_id}" >> "$pl_state"
             eval "${sg_var}=${sg_id}"
             aws ec2 create-tags --region "$my_region" --resources "$sg_id" \
@@ -627,6 +648,15 @@ step_privatelink() {
                 sg_id="${!sg_var:-}"
                 [[ -n "$sg_id" ]] || die "No VPCE security group for VPC $my_vi."
 
+                # Check if a VPCE already exists for this service in this VPC
+                vpce_id=$(aws ec2 describe-vpc-endpoints --region "$my_region" \
+                    --filters "Name=service-name,Values=$svc_name" "Name=vpc-id,Values=$my_vpc" \
+                    --query "VpcEndpoints[?State!='deleted'] | [0].VpcEndpointId" --output text 2>/dev/null)
+                if [[ -n "$vpce_id" && "$vpce_id" != "None" ]]; then
+                    echo "  Reusing existing VPCE for node $j in $my_vpc: $vpce_id"
+                    echo "${vpce_id_var}=${vpce_id}" >> "$pl_state"
+                    eval "${vpce_id_var}=${vpce_id}"
+                else
                 echo "  Creating VPCE for node $j in $my_vpc ($my_region)..."
 
                 # Find a second subnet in a different AZ within the consumer VPC
@@ -675,6 +705,7 @@ step_privatelink() {
                 aws ec2 create-tags --region "$my_region" --resources "$vpce_id" \
                     --tags $(project_tags) 2>/dev/null || true
                 echo "    VPCE: $vpce_id"
+                fi
             else
                 echo "    VPCE for node $j in $my_vpc: $vpce_id (exists)"
             fi
