@@ -35,6 +35,7 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 SSM_PREFIX = os.environ.get("SSM_PREFIX", "/toprf")
+SNS_RESULTS_TOPIC = os.environ.get("SNS_RESULTS_TOPIC", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # Timeouts (seconds)
@@ -841,6 +842,12 @@ def rotate_node(config, node_id):
         cleanup_reshare_artifacts(bucket, region)
 
         logger.info(f"=== Node {node_id} rotation complete ===")
+        return {
+            "node_id": node_id,
+            "region": region,
+            "old_instance_id": old_instance,
+            "new_instance_id": staging_id,
+        }
 
     except Exception:
         logger.error(
@@ -850,6 +857,31 @@ def rotate_node(config, node_id):
         terminate_instance(region, staging_id)
         cleanup_reshare_artifacts(bucket, region)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Success Notifications
+# ---------------------------------------------------------------------------
+
+def notify_success(trigger, summary, details=None):
+    """Publish a rotation-success message to the results SNS topic."""
+    if not SNS_RESULTS_TOPIC:
+        logger.info("SNS_RESULTS_TOPIC not set — skipping notification")
+        return
+    sns = boto3.client("sns")
+    body = {
+        "trigger": trigger,
+        "summary": summary,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if details:
+        body["details"] = details
+    sns.publish(
+        TopicArn=SNS_RESULTS_TOPIC,
+        Subject=f"[TOPRF] {summary}",
+        Message=json.dumps(body, indent=2),
+    )
+    logger.info(f"Success notification sent: {summary}")
 
 
 # ---------------------------------------------------------------------------
@@ -885,7 +917,7 @@ def handler(event, context):
     Handles:
       - SNS event from CloudWatch alarm -> rotate the unhealthy node
       - EventBridge scheduled event -> rotate all nodes one at a time
-      - Manual invocation -> {"node_id": N} or {"action": "rotate_all"}
+      - Manual invocation -> {"node_id": N}
     """
     # Log event type without full payload to avoid leaking config details
     event_source = event.get(
@@ -906,7 +938,12 @@ def handler(event, context):
             return {"statusCode": 200, "body": "not an alarm"}
 
         logger.info(f"CloudWatch alarm: node {node_id} is unhealthy")
-        rotate_node(config, node_id)
+        result = rotate_node(config, node_id)
+        notify_success(
+            "alarm",
+            f"Node {node_id} reprovisioned (unhealthy)",
+            details=result,
+        )
         return {"statusCode": 200, "body": f"rotated node {node_id}"}
 
     # EventBridge scheduled trigger (monthly rotation)
@@ -916,6 +953,7 @@ def handler(event, context):
     ):
         threshold = config["threshold"]
         logger.info("Scheduled rotation: rotating all nodes")
+        rotated = []
         for node in config["nodes"]:
             # Re-read config each iteration (rotate_node updates it)
             config = get_config()
@@ -933,7 +971,8 @@ def handler(event, context):
                     "body": f"quorum lost: {healthy} < {threshold}",
                 }
             try:
-                rotate_node(config, node["id"])
+                result = rotate_node(config, node["id"])
+                rotated.append(result)
             except Exception as e:
                 logger.error(f"Failed to rotate node {node['id']}: {e}")
                 # Stop — don't risk further reducing the quorum
@@ -941,30 +980,23 @@ def handler(event, context):
                     "statusCode": 500,
                     "body": f"rotation failed at node {node['id']}: {e}",
                 }
+        notify_success(
+            "scheduled",
+            f"Monthly rotation complete ({len(rotated)} nodes)",
+            details=rotated,
+        )
         return {"statusCode": 200, "body": "scheduled rotation complete"}
 
     # Manual invocation (single node)
     node_id = event.get("node_id")
     if node_id:
-        rotate_node(config, int(node_id))
+        result = rotate_node(config, int(node_id))
+        notify_success(
+            "manual",
+            f"Node {node_id} rotated (manual)",
+            details=result,
+        )
         return {"statusCode": 200, "body": f"rotated node {node_id}"}
-
-    # Manual invocation (all nodes)
-    action = event.get("action")
-    if action == "rotate_all":
-        threshold = config["threshold"]
-        for node in config["nodes"]:
-            config = get_config()
-            healthy = sum(
-                1 for n in config["nodes"] if n.get("instance_id")
-            )
-            if healthy < threshold:
-                return {
-                    "statusCode": 500,
-                    "body": f"quorum lost: {healthy} < {threshold}",
-                }
-            rotate_node(config, node["id"])
-        return {"statusCode": 200, "body": "all nodes rotated"}
 
     logger.warning(f"Unknown event type: {json.dumps(event)}")
     return {"statusCode": 400, "body": "unknown event type"}

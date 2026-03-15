@@ -235,7 +235,12 @@ pub async fn reshare_handler(
     };
     {
         let mut seen = state.reshare_seen.lock().unwrap();
-        if seen.contains(&report_digest) {
+
+        // Evict entries older than TTL
+        let now = std::time::Instant::now();
+        seen.retain(|(_, ts)| now.duration_since(*ts) < crate::RESHARE_SEEN_TTL);
+
+        if seen.iter().any(|(digest, _)| digest == &report_digest) {
             warn!("reshare: duplicate attestation report — possible replay");
             return Err((
                 StatusCode::CONFLICT,
@@ -243,11 +248,7 @@ pub async fn reshare_handler(
             )
                 .into_response());
         }
-        // Evict oldest entries if at capacity
-        if seen.len() >= crate::RESHARE_SEEN_MAX {
-            seen.remove(0);
-        }
-        seen.push(report_digest);
+        seen.push((report_digest, now));
     }
 
     info!(

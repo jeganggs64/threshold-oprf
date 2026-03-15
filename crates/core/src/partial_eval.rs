@@ -167,7 +167,7 @@ fn dleq_challenge(
     a2: &ProjectivePoint,
 ) -> Scalar {
     let mut hasher = Sha512::new();
-    hasher.update(b"DLEQ");
+    hasher.update(b"TOPRF-DLEQ-secp256k1-v1");
     hasher.update(generator.to_bytes());
     hasher.update(base_point.to_bytes());
     hasher.update(public_share.to_bytes());

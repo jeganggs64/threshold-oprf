@@ -18,13 +18,16 @@ export async function handler(event: any) {
       return error(400, "Missing or invalid nonce");
     }
 
-    // Consume nonce (single-use + TTL)
+    // Verify attestation BEFORE consuming nonce — if attestation fails,
+    // the nonce remains valid for a legitimate retry.
+    const deviceId = await getProvider().attest(attestationObject, keyId, nonce);
+
+    // Consume nonce only after successful attestation (single-use + TTL)
     const valid = await consumeNonce(nonce);
     if (!valid) {
       return error(403, "Invalid or expired nonce");
     }
 
-    const deviceId = await getProvider().attest(attestationObject, keyId, nonce);
     return ok({ deviceId });
   } catch (err: any) {
     console.error("attest error:", err.message);
