@@ -760,12 +760,46 @@ step_measure() {
         echo "# SEV-SNP measurement (auto-detected by deploy.sh measure)" >> "$CONFIG_FILE"
         echo "EXPECTED_MEASUREMENT=${measurement}" >> "$CONFIG_FILE"
     fi
-    # Reload into current shell
     EXPECTED_MEASUREMENT="$measurement"
 
     echo "  Saved to config.env as EXPECTED_MEASUREMENT"
+
+    # Fetch AMD ARK fingerprint from KDS (try VLEK chain first, fall back to VCEK)
     echo ""
-    echo "  This measurement is tied to the AMI firmware, not the Docker image."
+    echo "  Fetching AMD ARK certificate fingerprint from KDS..."
+    local ark_fingerprint=""
+    for key_type in vlek vcek; do
+        local chain_pem
+        chain_pem=$(curl -sf "https://kdsintf.amd.com/${key_type}/v1/Milan/cert_chain" 2>/dev/null) || continue
+
+        # Extract the second PEM certificate (ARK) and compute SHA-256 of its DER
+        ark_fingerprint=$(echo "$chain_pem" \
+            | awk '/-----BEGIN CERTIFICATE-----/{n++} n==2' \
+            | openssl x509 -inform PEM -outform DER 2>/dev/null \
+            | shasum -a 256 \
+            | awk '{print $1}')
+
+        if [[ -n "$ark_fingerprint" ]]; then
+            echo "  ARK fingerprint (${key_type}): ${ark_fingerprint}"
+            break
+        fi
+    done
+
+    if [[ -z "$ark_fingerprint" ]]; then
+        die "Failed to fetch AMD ARK certificate from KDS"
+    fi
+
+    if grep -q "^AMD_ARK_FINGERPRINT=" "$CONFIG_FILE"; then
+        sed -i.bak "s|^AMD_ARK_FINGERPRINT=.*|AMD_ARK_FINGERPRINT=${ark_fingerprint}|" "$CONFIG_FILE" && rm -f "${CONFIG_FILE}.bak"
+    else
+        echo "# AMD ARK certificate fingerprint (auto-detected by deploy.sh measure)" >> "$CONFIG_FILE"
+        echo "AMD_ARK_FINGERPRINT=${ark_fingerprint}" >> "$CONFIG_FILE"
+    fi
+    AMD_ARK_FINGERPRINT="$ark_fingerprint"
+
+    echo "  Saved to config.env as AMD_ARK_FINGERPRINT"
+    echo ""
+    echo "  Measurement is tied to the AMI firmware, not the Docker image."
     echo "  It only changes when AWS updates the Amazon Linux AMI."
 }
 
@@ -880,7 +914,8 @@ step_init_seal() {
         encrypt_args+=(--expected-measurement "$expected_measurement")
 
         echo "  Verifying attestation and encrypting key share..."
-        "$init_encrypt" "${encrypt_args[@]}" 2>&1 | sed 's/^/  /'
+        AMD_ARK_FINGERPRINT="${AMD_ARK_FINGERPRINT:-}" \
+            "$init_encrypt" "${encrypt_args[@]}" 2>&1 | sed 's/^/  /'
 
         # Upload encrypted share to S3
         echo "  Uploading encrypted share to S3..."
@@ -962,6 +997,7 @@ step_start() {
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+            -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
             ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
             --user root \
@@ -1669,6 +1705,7 @@ step_rotate() {
         -e SEALED_KEY_URL='${staging_sealed_url}' \
         -e EXPECTED_VERIFICATION_SHARE=${vs} \
         -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+        -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
         --user root \
@@ -1790,6 +1827,7 @@ step_rotate() {
         -e SEALED_KEY_URL='${canonical_s3}' \
         -e EXPECTED_VERIFICATION_SHARE=${vs} \
         -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+        -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
         --user root \
@@ -1828,6 +1866,7 @@ step_rotate() {
                 -e SEALED_KEY_URL='${other_url}' \
                 -e EXPECTED_VERIFICATION_SHARE=${other_vs} \
                 -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
+                -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
                 ${other_coord_args} \
                 --device /dev/sev-guest:/dev/sev-guest \
                 --user root \
@@ -2232,6 +2271,18 @@ step_sync_state() {
         aws ssm put-parameter \
             --name "${ssm_prefix}/measurement" \
             --value "$measurement" \
+            --type String \
+            --overwrite \
+            --region "$coord_region" > /dev/null
+        echo "    Done."
+    fi
+
+    # Push ARK fingerprint
+    if [[ -n "${AMD_ARK_FINGERPRINT:-}" ]]; then
+        echo "  Pushing ARK fingerprint to ${ssm_prefix}/ark-fingerprint..."
+        aws ssm put-parameter \
+            --name "${ssm_prefix}/ark-fingerprint" \
+            --value "$AMD_ARK_FINGERPRINT" \
             --type String \
             --overwrite \
             --region "$coord_region" > /dev/null

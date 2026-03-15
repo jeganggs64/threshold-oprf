@@ -67,6 +67,16 @@ def get_measurement():
     return param["Parameter"]["Value"]
 
 
+def get_ark_fingerprint():
+    """Load AMD ARK fingerprint from SSM (optional)."""
+    ssm = boto3.client("ssm")
+    try:
+        param = ssm.get_parameter(Name=f"{SSM_PREFIX}/ark-fingerprint")
+        return param["Parameter"]["Value"]
+    except ssm.exceptions.ParameterNotFound:
+        return ""
+
+
 def get_coordinator_config(node_id):
     """Load coordinator config for a node from SSM."""
     ssm = boto3.client("ssm")
@@ -584,6 +594,7 @@ def rotate_node(config, node_id):
         "node_image",
     )
     measurement = _validate_shell_safe(get_measurement(), "measurement")
+    ark_fingerprint = _validate_shell_safe(get_ark_fingerprint(), "ark_fingerprint")
     threshold = int(config["threshold"])
     total = len(config["nodes"])
     group_public_key = _validate_shell_safe(
@@ -724,6 +735,7 @@ def rotate_node(config, node_id):
                 "SEALED_KEY_URL": staging_sealed_url,
                 "EXPECTED_VERIFICATION_SHARE": vs,
                 "EXPECTED_PEER_MEASUREMENT": measurement,
+                "AMD_ARK_FINGERPRINT": ark_fingerprint,
             },
             volumes=[
                 "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
@@ -811,6 +823,7 @@ def rotate_node(config, node_id):
                 "SEALED_KEY_URL": canonical_sealed_url,
                 "EXPECTED_VERIFICATION_SHARE": vs,
                 "EXPECTED_PEER_MEASUREMENT": measurement,
+                "AMD_ARK_FINGERPRINT": ark_fingerprint,
             },
             volumes=[
                 "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
