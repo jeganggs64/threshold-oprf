@@ -20,7 +20,7 @@ use std::process;
 use sha2::{Digest, Sha256};
 use x25519_dalek::PublicKey;
 
-use toprf_seal::attestation::{parse_cert_table, AttestationVerifier};
+use toprf_seal::attestation::AttestationVerifier;
 use toprf_seal::ecies;
 use toprf_seal::snp_report::SnpReport;
 
@@ -216,23 +216,25 @@ async fn main() {
             process::exit(1);
         });
 
-        let certs = parse_cert_table(&cert_table_bytes).unwrap_or_else(|e| {
-            eprintln!("Error: failed to parse certificate table: {e}");
-            process::exit(1);
-        });
+        let certs = AttestationVerifier::build_cert_chain(&cert_table_bytes, &report)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Error: failed to build certificate chain: {e}");
+                process::exit(1);
+            });
 
         eprintln!(
-            "  Certificates: VCEK={} bytes, ASK={} bytes, ARK={} bytes",
+            "  Certificates: signing={} bytes, ASK={} bytes, ARK={} bytes",
             certs.vcek.len(),
             certs.ask.len(),
             certs.ark.len()
         );
-        eprintln!("  Verifying AMD certificate chain (VCEK -> ASK -> ARK)...");
+        eprintln!("  Verifying AMD certificate chain...");
         AttestationVerifier::verify_report_with_certs(&report, &certs).unwrap_or_else(|e| {
             eprintln!("Error: attestation verification failed: {e}");
             process::exit(1);
         });
-        eprintln!("  Attestation report signature verified (using provided certs).");
+        eprintln!("  Attestation report signature verified.");
     } else {
         // Fall back to fetching from AMD KDS (requires non-zero chip ID)
         eprintln!("  Verifying AMD certificate chain (fetching from AMD KDS)...");

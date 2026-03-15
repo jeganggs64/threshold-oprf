@@ -207,9 +207,100 @@ impl AttestationVerifier {
         Ok(der_bytes.to_vec())
     }
 
+    /// Build a complete certificate chain from an extended report's cert table.
+    ///
+    /// On AWS with VLEK, the cert table only contains the VLEK certificate.
+    /// ASK and ARK are fetched from AMD KDS when missing.
+    pub async fn build_cert_chain(
+        cert_table: &[u8],
+        report: &SnpReport,
+    ) -> Result<CertChain, SealError> {
+        let mut signing_cert: Option<Vec<u8>> = None;
+        let mut is_vlek = false;
+        let mut ask: Option<Vec<u8>> = None;
+        let mut ark: Option<Vec<u8>> = None;
+
+        let zero_guid = [0u8; 16];
+        let mut pos = 0;
+
+        loop {
+            if pos + CERT_TABLE_ENTRY_SIZE > cert_table.len() {
+                break;
+            }
+
+            let guid: [u8; 16] = cert_table[pos..pos + 16].try_into().unwrap();
+            if guid == zero_guid {
+                break;
+            }
+
+            let offset =
+                u32::from_le_bytes(cert_table[pos + 16..pos + 20].try_into().unwrap()) as usize;
+            let length =
+                u32::from_le_bytes(cert_table[pos + 20..pos + 24].try_into().unwrap()) as usize;
+
+            if offset + length > cert_table.len() {
+                return Err(SealError::AttestationFailed(format!(
+                    "cert table entry at offset {pos} references data beyond buffer \
+                     (offset={offset}, length={length}, buf_len={})",
+                    cert_table.len()
+                )));
+            }
+
+            let cert_data = cert_table[offset..offset + length].to_vec();
+
+            if guid == GUID_VCEK {
+                signing_cert = Some(cert_data);
+            } else if guid == GUID_VLEK {
+                signing_cert = Some(cert_data);
+                is_vlek = true;
+            } else if guid == GUID_ASK {
+                ask = Some(cert_data);
+            } else if guid == GUID_ARK {
+                ark = Some(cert_data);
+            }
+
+            pos += CERT_TABLE_ENTRY_SIZE;
+        }
+
+        let vcek = signing_cert.ok_or_else(|| {
+            SealError::AttestationFailed(
+                "no signing certificate (VCEK or VLEK) found in cert table".into(),
+            )
+        })?;
+
+        // If ASK/ARK missing (common on AWS with VLEK), fetch from AMD KDS
+        if ask.is_none() || ark.is_none() {
+            let product = Self::detect_product(report);
+            let key_type = if is_vlek { "vlek" } else { "vcek" };
+            tracing::info!(
+                product = %product,
+                key_type = %key_type,
+                "ASK/ARK not in cert table, fetching from AMD KDS"
+            );
+            let (fetched_ask, fetched_ark) =
+                Self::fetch_cert_chain_by_type(&product, key_type).await?;
+            ask = ask.or(Some(fetched_ask));
+            ark = ark.or(Some(fetched_ark));
+        }
+
+        Ok(CertChain {
+            vcek,
+            ask: ask.unwrap(),
+            ark: ark.unwrap(),
+        })
+    }
+
     /// Fetch the AMD certificate chain (ASK + ARK) from AMD KDS.
     async fn fetch_cert_chain(product: &str) -> Result<(Vec<u8>, Vec<u8>), SealError> {
-        let url = format!("https://kdsintf.amd.com/vcek/v1/{}/cert_chain", product);
+        Self::fetch_cert_chain_by_type(product, "vcek").await
+    }
+
+    /// Fetch the AMD certificate chain for a given key type (vcek or vlek).
+    async fn fetch_cert_chain_by_type(
+        product: &str,
+        key_type: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), SealError> {
+        let url = format!("https://kdsintf.amd.com/{key_type}/v1/{product}/cert_chain");
 
         tracing::debug!(url = %url, "fetching AMD certificate chain from KDS");
 
