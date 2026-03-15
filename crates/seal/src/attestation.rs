@@ -409,7 +409,7 @@ impl AttestationVerifier {
         let tbs_bytes = cert.tbs_certificate.as_ref();
         let sig_bytes = &cert.signature_value.data;
 
-        public_key.verify(tbs_bytes, &sig_bytes).map_err(|_| {
+        public_key.verify(tbs_bytes, sig_bytes).map_err(|_| {
             SealError::AttestationFailed("cert signature verification failed (ring)".into())
         })
     }
