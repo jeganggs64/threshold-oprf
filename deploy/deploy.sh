@@ -731,15 +731,23 @@ step_measure() {
     echo "  Using node $first_node ($ip)..."
     echo "  Running toprf-measure in Docker container..."
 
-    local measurement
-    measurement=$(ssh_node "$first_node" "sudo docker run --rm \
+    local raw_output measurement
+    raw_output=$(ssh_node "$first_node" "sudo docker run --rm \
         --device /dev/sev-guest:/dev/sev-guest \
+        --user root \
         --entrypoint /usr/local/bin/toprf-measure \
-        ${NODE_IMAGE} --json" < /dev/null 2>/dev/null \
-        | jq -r '.measurement')
+        ${NODE_IMAGE} --json" < /dev/null 2>&1) || {
+        echo "  SSH/Docker command failed. Output:"
+        echo "$raw_output" | sed 's/^/    /'
+        die "Failed to get measurement from node $first_node. Is the node running with SEV-SNP and is the image pulled?"
+    }
+
+    measurement=$(echo "$raw_output" | jq -r '.measurement' 2>/dev/null) || true
 
     if [[ -z "$measurement" || "$measurement" == "null" ]]; then
-        die "Failed to get measurement from node $first_node. Is the node running with SEV-SNP?"
+        echo "  Raw output from node:"
+        echo "$raw_output" | sed 's/^/    /'
+        die "Failed to parse measurement from node $first_node. Is the node running with SEV-SNP?"
     fi
 
     echo "  Measurement: $measurement"
@@ -816,7 +824,7 @@ step_init_seal() {
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
             --device /dev/sev-guest:/dev/sev-guest \
-            --cap-drop ALL --security-opt no-new-privileges:true \
+            --user root \
             ${NODE_IMAGE} \
             --init-seal \
             --s3-bucket '${bucket}' \
@@ -956,7 +964,7 @@ step_start() {
             -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
             ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
-            --cap-drop ALL --security-opt no-new-privileges:true \
+            --user root \
             -p 3001:3001 \
             ${NODE_IMAGE} \
             --port 3001 \
@@ -1520,7 +1528,7 @@ step_rotate() {
     _ssh_staging "sudo docker rm -f toprf-init-reshare 2>/dev/null || true" < /dev/null
     _ssh_staging "sudo docker run -d --name toprf-init-reshare \
         --device /dev/sev-guest:/dev/sev-guest \
-        --cap-drop ALL --security-opt no-new-privileges:true \
+        --user root \
         ${NODE_IMAGE} \
         --init-reshare \
         --s3-bucket '${bucket}' \
@@ -1663,7 +1671,7 @@ step_rotate() {
         -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
-        --cap-drop ALL --security-opt no-new-privileges:true \
+        --user root \
         -p 3001:3001 \
         ${NODE_IMAGE} \
         --port 3001 \
@@ -1784,7 +1792,7 @@ step_rotate() {
         -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
-        --cap-drop ALL --security-opt no-new-privileges:true \
+        --user root \
         -p 3001:3001 \
         ${NODE_IMAGE} \
         --port 3001 \
@@ -1822,7 +1830,7 @@ step_rotate() {
                 -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
                 ${other_coord_args} \
                 --device /dev/sev-guest:/dev/sev-guest \
-                --cap-drop ALL --security-opt no-new-privileges:true \
+                --user root \
                 -p 3001:3001 \
                 ${NODE_IMAGE} \
                 --port 3001 \

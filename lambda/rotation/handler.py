@@ -536,7 +536,7 @@ def _build_docker_run_cmd(
     parts.extend(["--name", name, "--restart=unless-stopped"])
     parts.extend([
         "--device /dev/sev-guest:/dev/sev-guest",
-        "--cap-drop ALL --security-opt no-new-privileges:true",
+        "--user root",
     ])
     if port:
         parts.append(f"-p {port}:{port}")
