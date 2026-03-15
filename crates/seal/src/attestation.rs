@@ -347,7 +347,7 @@ impl AttestationVerifier {
     }
 
     /// Verify that `cert_der` was signed by the issuer whose public key is in
-    /// `issuer_der`.
+    /// `issuer_der`. Supports both ECDSA-P384 (VCEK chain) and RSA-PSS (VLEK chain).
     fn verify_cert_signature(cert_der: &[u8], issuer_der: &[u8]) -> Result<(), SealError> {
         let (_, cert) = X509Certificate::from_der(cert_der)
             .map_err(|e| SealError::AttestationFailed(format!("failed to parse cert: {e}")))?;
@@ -363,14 +363,92 @@ impl AttestationVerifier {
             ));
         }
 
-        // Use x509-parser's built-in verify_signature which handles the TBS
-        // extraction and signature algorithm correctly
-        cert.verify_signature(Some(&issuer.tbs_certificate.subject_pki))
-            .map_err(|e| {
-                SealError::AttestationFailed(format!("cert signature verification failed: {e}"))
-            })?;
+        // Try x509-parser's built-in verification first (handles ECDSA).
+        // Fall back to ring for RSA-PSS which x509-parser 0.16 doesn't support.
+        match cert.verify_signature(Some(&issuer.tbs_certificate.subject_pki)) {
+            Ok(()) => Ok(()),
+            Err(_) => Self::verify_cert_signature_ring(&cert, &issuer),
+        }
+    }
 
-        Ok(())
+    /// Verify a certificate signature using ring directly.
+    /// Handles RSA-PSS with SHA-256/SHA-384/SHA-512 (used by VLEK chains).
+    fn verify_cert_signature_ring(
+        cert: &X509Certificate<'_>,
+        issuer: &X509Certificate<'_>,
+    ) -> Result<(), SealError> {
+        use ring::signature as ring_sig;
+
+        let sig_alg_oid = cert.signature_algorithm.algorithm.to_id_string();
+
+        // Select the ring verification algorithm based on the signature OID
+        let algorithm: &dyn ring_sig::VerificationAlgorithm = match sig_alg_oid.as_str() {
+            // RSA-PSS (OID 1.2.840.113549.1.1.10) — need to check hash from params
+            "1.2.840.113549.1.1.10" => {
+                // Determine hash algorithm from PSS parameters.
+                // AMD VLEK chains use SHA-384, but we try to detect from the cert.
+                Self::detect_rsa_pss_algorithm(cert)?
+            }
+            // RSASSA-PKCS1-v1_5 with SHA-256/384/512
+            "1.2.840.113549.1.1.11" => &ring_sig::RSA_PKCS1_2048_8192_SHA256,
+            "1.2.840.113549.1.1.12" => &ring_sig::RSA_PKCS1_2048_8192_SHA384,
+            "1.2.840.113549.1.1.13" => &ring_sig::RSA_PKCS1_2048_8192_SHA512,
+            oid => {
+                return Err(SealError::AttestationFailed(format!(
+                    "unsupported signature algorithm OID: {oid}"
+                )));
+            }
+        };
+
+        let public_key = ring_sig::UnparsedPublicKey::new(
+            algorithm,
+            &issuer.tbs_certificate.subject_pki.subject_public_key.data,
+        );
+
+        // The TBS (to-be-signed) certificate bytes and signature value
+        let tbs_bytes = cert.tbs_certificate.as_ref();
+        let sig_bytes = &cert.signature_value.data;
+
+        public_key.verify(tbs_bytes, &sig_bytes).map_err(|_| {
+            SealError::AttestationFailed("cert signature verification failed (ring)".into())
+        })
+    }
+
+    /// Detect the RSA-PSS hash algorithm from certificate parameters.
+    fn detect_rsa_pss_algorithm(
+        cert: &X509Certificate<'_>,
+    ) -> Result<&'static dyn ring::signature::VerificationAlgorithm, SealError> {
+        use ring::signature as ring_sig;
+
+        // Try to extract hash algorithm OID from PSS parameters.
+        // If we can't parse params, default to SHA-384 (AMD VLEK standard).
+        if let Some(params) = &cert.signature_algorithm.parameters {
+            let param_bytes = params.as_bytes();
+            // Look for SHA-256 OID (2.16.840.1.101.3.4.2.1) = 60 86 48 01 65 03 04 02 01
+            if param_bytes
+                .windows(9)
+                .any(|w| w == [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01])
+            {
+                return Ok(&ring_sig::RSA_PSS_2048_8192_SHA256);
+            }
+            // Look for SHA-384 OID (2.16.840.1.101.3.4.2.2) = 60 86 48 01 65 03 04 02 02
+            if param_bytes
+                .windows(9)
+                .any(|w| w == [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02])
+            {
+                return Ok(&ring_sig::RSA_PSS_2048_8192_SHA384);
+            }
+            // Look for SHA-512 OID (2.16.840.1.101.3.4.2.3) = 60 86 48 01 65 03 04 02 03
+            if param_bytes
+                .windows(9)
+                .any(|w| w == [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03])
+            {
+                return Ok(&ring_sig::RSA_PSS_2048_8192_SHA512);
+            }
+        }
+
+        // Default to SHA-384 (used by AMD SEV-SNP VLEK chains)
+        Ok(&ring::signature::RSA_PSS_2048_8192_SHA384)
     }
 
     /// Extract the P-384 public key bytes from a DER-encoded VCEK certificate.
