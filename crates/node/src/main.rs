@@ -257,14 +257,19 @@ async fn run_init_seal(s3_bucket: &str, upload_url: &str) {
         "init-seal: certificate chain obtained from host firmware"
     );
 
-    // Serialize the full attestation report (body + signature, padded)
+    // Serialize the full attestation report preserving AMD's 72-byte signature fields
     let mut attestation_bytes = Vec::with_capacity(toprf_seal::snp_report::REPORT_TOTAL_SIZE);
     attestation_bytes.extend_from_slice(&report.body_bytes);
     while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
         attestation_bytes.push(0);
     }
+    // R component in 72-byte field (48 bytes value + 24 bytes zero padding)
     attestation_bytes.extend_from_slice(&report.signature_r);
+    attestation_bytes.extend_from_slice(&[0u8; 24]);
+    // S component in 72-byte field (48 bytes value + 24 bytes zero padding)
     attestation_bytes.extend_from_slice(&report.signature_s);
+    attestation_bytes.extend_from_slice(&[0u8; 24]);
+    // Remaining reserved bytes
     while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
         attestation_bytes.push(0);
     }

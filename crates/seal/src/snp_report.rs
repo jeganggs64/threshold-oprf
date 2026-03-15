@@ -94,11 +94,11 @@ impl SnpReport {
         }
 
         let body_bytes = data[..REPORT_BODY_SIZE].to_vec();
-        // Each signature component is 72 bytes (0x48) per AMD SEV-SNP ABI spec
-        // (Table 22, SIGNATURE structure). Only the first 48 bytes contain the
-        // P-384 scalar (little-endian), the remaining 24 bytes must be zero.
+        // Per AMD SEV-SNP ABI spec (Table 22), each signature component occupies
+        // 72 bytes (0x48). Only the first 48 bytes contain the P-384 scalar
+        // (little-endian); the remaining 24 bytes are zero padding.
         let signature_r: [u8; 48] = read_array(data, 0x2A0);
-        let signature_s: [u8; 48] = read_array(data, 0x2A0 + 72);
+        let signature_s: [u8; 48] = read_array(data, 0x2A0 + 0x48);
 
         Ok(Self {
             version,
@@ -215,9 +215,9 @@ mod tests {
         report[0x1E9] = 51;
         report[0x1EA] = 1;
 
-        // signature r (48 bytes at 0x2A0, in a 72-byte field)
+        // signature r (48 bytes at 0x2A0, in 72-byte field)
         report[0x2A0..0x2D0].copy_from_slice(&[0x11; 48]);
-        // signature s (48 bytes at 0x2E8 = 0x2A0 + 72, in a 72-byte field)
+        // signature s (48 bytes at 0x2E8 = 0x2A0 + 0x48, in 72-byte field)
         report[0x2E8..0x318].copy_from_slice(&[0x22; 48]);
 
         report
