@@ -34,7 +34,9 @@ crates/
   node/       TEE node server — coordinator + peer mode, serves /evaluate, /partial-evaluate, /reshare
   keygen/     Offline ceremony tool — generates OPRF key, splits into shares
   seal/       AMD SEV-SNP key sealing/unsealing, ECIES encryption, attestation
-lambda/       OPRF Lambda functions (challenge, attest, evaluate)
+lambda/
+  handlers/   OPRF Lambda functions (challenge, attest, evaluate)
+  rotation/   Automated rotation Lambda (SAM template + handler)
 docker/       Dockerfiles, docker-compose, SEV-SNP config
 deploy/       Deployment automation (provision.sh, deploy.sh)
 scripts/      Dev utilities (integration-test.sh)
@@ -213,7 +215,6 @@ For each node:
 | `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
 | `verify` | Health-checks all nodes via SSH |
 | `frontend-nlb` | Creates frontend NLB targeting all same-region nodes (Lambda failover) |
-| `cloudwatch` | Creates CloudWatch alarms for unhealthy node detection |
 
 ```bash
 # Full deployment
@@ -235,6 +236,10 @@ For each node:
 ./deploy.sh start
 ./deploy.sh verify
 ./deploy.sh e2e              # End-to-end OPRF evaluation via coordinator
+./deploy.sh frontend-nlb     # Frontend NLB for same-region failover
+./deploy.sh cloudwatch       # Per-node unhealthy alarms → SNS
+./deploy.sh lambda-config    # Auto-generate lambda/config.env
+./deploy.sh sync-state       # Push state to SSM Parameter Store
 ```
 
 ### Step 3: Lock Nodes (`deploy.sh lock`)
@@ -260,6 +265,8 @@ This is irreversible. If a node fails after locking, terminate it (`./provision.
 ./deploy.sh --nodes 2 redeploy     # Single node
 ./deploy.sh verify                  # Health-check nodes
 ./deploy.sh show-ips                # Fetch node IPs from AWS
+./deploy.sh auto-config             # Re-populate IPs, SGs, VPCs in nodes.json
+./deploy.sh e2e                     # End-to-end OPRF evaluation test
 ```
 
 ---
@@ -312,15 +319,29 @@ CloudWatch alarms monitor each node's per-node NLB target health. If a target is
 ```bash
 # Set up alarms after deployment
 ./deploy.sh cloudwatch
-
-# Subscribe rotation Lambda to the SNS topic
-aws sns subscribe \
-  --topic-arn arn:aws:sns:<region>:<account>:toprf-node-alerts \
-  --protocol lambda \
-  --notification-endpoint arn:aws:lambda:<region>:<account>:function:toprf-rotation
 ```
 
+The rotation Lambda is subscribed to the SNS topic automatically via the SAM template — no manual subscription needed.
+
 The NLB health check polls `GET /health` every 30 seconds. A node is marked unhealthy after 2 consecutive failures (60s). The CloudWatch alarm requires 3 consecutive unhealthy data points at 1-minute resolution (3 minutes total) before alerting — this avoids false alarms from transient issues.
+
+### Success notifications
+
+The rotation Lambda publishes to an SNS topic (`toprf-rotation-results`, created by the SAM template) after each successful rotation. Subscribe to receive email notifications:
+
+```bash
+aws sns subscribe \
+  --topic-arn <RotationResultsTopicArn from stack outputs> \
+  --protocol email \
+  --notification-endpoint your@email.com
+```
+
+You'll be notified when:
+- An unhealthy node is automatically reprovisioned (alarm-triggered)
+- The monthly scheduled rotation completes all nodes
+- A manual single-node rotation succeeds
+
+Each notification includes the trigger type, node ID, old/new instance IDs, and timestamp.
 
 ### Why no admin ceremony?
 

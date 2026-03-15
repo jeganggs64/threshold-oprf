@@ -193,6 +193,16 @@ node_vs() {
     jq -r --argjson id "$1" '.verification_shares[] | select(.node_id == $id) | .verification_share' "$config"
 }
 
+# Validate that the number of active nodes meets the threshold requirement
+validate_threshold() {
+    load_ceremony
+    local count=0
+    for _ in $(active_nodes); do count=$((count + 1)); done
+    if [[ "$count" -lt "$CEREMONY_THRESHOLD" ]]; then
+        die "Only $count active node(s) but threshold is $CEREMONY_THRESHOLD. Need at least $CEREMONY_THRESHOLD nodes."
+    fi
+}
+
 # =============================================================================
 # Steps
 # =============================================================================
@@ -207,7 +217,9 @@ step_pull() {
         local ip
         ip=$(node_ip "$i")
         echo "  Node $i ($ip)..."
-        ssh_node "$i" "sudo docker pull ${NODE_IMAGE}" < /dev/null
+        if ! ssh_node "$i" "sudo docker pull ${NODE_IMAGE}" < /dev/null; then
+            die "Docker pull failed on node $i ($ip). Check image name and registry credentials."
+        fi
     done
 
     echo "  Done."
@@ -224,8 +236,14 @@ step_storage() {
         bucket=$(node_s3_bucket "$i")
         region=$(node_region "$i")
         echo "  Node $i: s3://${bucket} ($region)"
-        aws s3 mb "s3://${bucket}" --region "$region" 2>/dev/null \
-            || warn "bucket may already exist"
+        # Check if bucket already exists (owned by us)
+        if aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+            echo "    Bucket already exists."
+        else
+            if ! aws s3 mb "s3://${bucket}" --region "$region"; then
+                die "Failed to create S3 bucket ${bucket} in ${region}. Check permissions and bucket name availability."
+            fi
+        fi
     done
 
     echo "  Done."
@@ -904,6 +922,7 @@ step_start() {
     info "Starting nodes in normal mode"
 
     load_ceremony
+    validate_threshold
 
     local config_dir
     config_dir=$(coord_config_dir)

@@ -23,6 +23,11 @@ Parameters:
     Description: Security group IDs for Lambda
 
 Resources:
+  RotationResultsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: toprf-rotation-results
+
   RotationFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -35,6 +40,7 @@ Resources:
       Environment:
         Variables:
           SSM_PREFIX: !Ref SSMPrefix
+          SNS_RESULTS_TOPIC: !Ref RotationResultsTopic
       VpcConfig:
         SubnetIds: !Ref VpcSubnetIds
         SecurityGroupIds: !Ref VpcSecurityGroupIds
@@ -122,6 +128,12 @@ Resources:
                 - s3:CopyObject
               Resource:
                 - arn:aws:s3:::toprf-sealed-*/*
+            # SNS — publish rotation success notifications
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource:
+                - !Ref RotationResultsTopic
 
   # SNS subscription (CloudWatch alarm → Lambda)
   SNSSubscription:
@@ -168,3 +180,6 @@ Outputs:
   RotationFunctionName:
     Description: Name of the rotation Lambda function
     Value: !Ref RotationFunction
+  RotationResultsTopicArn:
+    Description: ARN of the SNS topic for rotation success notifications
+    Value: !Ref RotationResultsTopic

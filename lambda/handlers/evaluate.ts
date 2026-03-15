@@ -12,6 +12,7 @@ if (!NLB_URL) throw new Error("NLB_URL environment variable is required");
  * to the coordinator node via the internal NLB.
  */
 export async function handler(event: any) {
+  const requestId = event.requestContext?.requestId ?? crypto.randomUUID();
   try {
     const body = JSON.parse(event.body || "{}");
     const { blindedPoint } = body;
@@ -42,14 +43,14 @@ export async function handler(event: any) {
     // Proxy to coordinator node via frontend NLB (load-balances across same-region nodes)
     const nodeRes = await fetch(`${NLB_URL}/evaluate`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "X-Request-ID": requestId },
       body: JSON.stringify({ blinded_point: blindedPoint }),
       signal: AbortSignal.timeout(30_000),
     });
 
     if (!nodeRes.ok) {
       const err = await nodeRes.json().catch(() => ({}));
-      console.error("node error:", nodeRes.status, err);
+      console.error("node error:", nodeRes.status, err, { requestId });
       if (nodeRes.status === 503) {
         return error(503, "Service temporarily unavailable");
       }
@@ -59,7 +60,7 @@ export async function handler(event: any) {
     const result = await nodeRes.json();
     return ok(result);
   } catch (err: any) {
-    console.error("evaluate error:", err.message);
+    console.error("evaluate error:", err.message, { requestId });
     return error(502, "OPRF evaluation failed");
   }
 }

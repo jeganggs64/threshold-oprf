@@ -66,11 +66,30 @@ export async function checkDeviceRateLimit(deviceId: string): Promise<void> {
         })
       );
     } catch (resetErr: any) {
-      if (resetErr.name === "ConditionalCheckFailedException") {
-        // Window is still active but count >= limit — rate limited.
-        throw new RateLimitError();
+      if (resetErr.name !== "ConditionalCheckFailedException") throw resetErr;
+
+      // Another concurrent request already reset the window — retry the increment.
+      // This eliminates the race where two requests both see an expired window,
+      // one resets it, and the other gets falsely rejected.
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: TABLE,
+            Key: { keyId: deviceId },
+            UpdateExpression: "SET rateLimitCount = rateLimitCount + :one",
+            ConditionExpression: "rateLimitCount < :maxReq",
+            ExpressionAttributeValues: {
+              ":one": 1,
+              ":maxReq": MAX_REQUESTS,
+            },
+          })
+        );
+      } catch (retryErr: any) {
+        if (retryErr.name === "ConditionalCheckFailedException") {
+          throw new RateLimitError();
+        }
+        throw retryErr;
       }
-      throw resetErr;
     }
   }
 }
