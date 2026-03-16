@@ -241,7 +241,37 @@ cd lambda/rotation
 sam build && sam deploy --guided
 ```
 
-After deploying, return to the `deploy/` directory for the final step.
+The rotation Lambda runs in the coordinator VPC (for NLB access via PrivateLink). It needs VPC endpoints to reach AWS services privately:
+
+```bash
+# From the coordinator VPC (eu-west-1), create endpoints for:
+# S3 (gateway, free), SSM, EC2, STS, SSM Messages, EC2 Messages (interface, ~$7/month each)
+aws ec2 create-vpc-endpoint --vpc-id <VPC_ID> --service-name com.amazonaws.<REGION>.s3 \
+  --vpc-endpoint-type Gateway --route-table-ids <RT_ID>
+
+for svc in ssm ec2 sts ssmmessages ec2messages; do
+  aws ec2 create-vpc-endpoint --vpc-id <VPC_ID> \
+    --service-name com.amazonaws.<REGION>.$svc \
+    --vpc-endpoint-type Interface \
+    --subnet-ids <SUBNET_1> <SUBNET_2> \
+    --security-group-ids <SG_ID> \
+    --private-dns-enabled
+done
+```
+
+These are created once and never need updating — they route by service, not by specific resource.
+
+After deploying, subscribe the Lambda to the CloudWatch alarm SNS topics:
+
+```bash
+aws sns subscribe --topic-arn <ALERT_TOPIC_ARN> --protocol lambda \
+  --notification-endpoint <ROTATION_LAMBDA_ARN>
+aws lambda add-permission --function-name toprf-rotation \
+  --statement-id sns-invoke --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com --source-arn <ALERT_TOPIC_ARN>
+```
+
+Return to the `deploy/` directory for the final step.
 
 ### Step 11: Lock Nodes (production)
 
