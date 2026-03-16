@@ -1,78 +1,82 @@
 # Threshold OPRF
 
-A distributed threshold Oblivious Pseudorandom Function (OPRF) system. The OPRF key is split into shares using T-of-N Shamir secret sharing, with each share running inside an AMD SEV-SNP Trusted Execution Environment on a separate AWS instance. No single node holds enough shares to evaluate the function.
-
-Node count and threshold are configurable — deploy 2-of-3, 3-of-5, 4-of-7, or any T-of-N split.
+A distributed threshold Oblivious Pseudorandom Function (OPRF) system using T-of-N Shamir secret sharing. Each share runs inside an AMD SEV-SNP Trusted Execution Environment on a separate AWS instance. Node count and threshold are configurable (2-of-3, 3-of-5, etc).
 
 ## Architecture
 
 ```
-Mobile App → API Gateway (oprf.ruonlabs.com) → Lambda (VPC) → Frontend NLB → Coordinator Node
-                                                                                    ↓ AWS PrivateLink
-                                                                            (threshold-1) Peer Nodes
+Client → API Gateway (oprf.ruonlabs.com) → Lambda → Frontend NLB → Coordinator Node
+                                                                          ↓ PrivateLink
+                                                                  (threshold-1) Peer Nodes
 ```
 
-Each node can act as **coordinator**: it receives the client's blinded point, computes its own partial evaluation, forwards to threshold-1 peer nodes via PrivateLink, verifies each peer's DLEQ proof, combines all partials via Lagrange interpolation, and returns the final OPRF evaluation.
-
-A **frontend NLB** with health checks sits in front of all same-region nodes. If one node goes down, the NLB automatically routes to the surviving node — which coordinates with cross-region peers via PrivateLink to meet the threshold. This provides automatic failover without cross-region Lambda infrastructure, since losing all same-region nodes drops below the threshold regardless.
-
-Node-to-node communication uses **AWS PrivateLink** — each node sits behind its own per-node Network Load Balancer with a VPC Endpoint Service, and peer nodes reach each other via Interface VPC Endpoints over AWS's private backbone. No public internet exposure, no TLS certificate management.
-
-Each node runs in a Docker container on an AMD SEV-SNP Confidential VM. Key shares are sealed to the hardware and stored encrypted in S3 — AWS cannot read them.
-
-The OPRF endpoints (`/challenge`, `/attest`, `/evaluate`) are served from a **dedicated API Gateway** (`oprf.ruonlabs.com`), separate from the developer-facing frontend API (`api.ruonlabs.com`).
+- **Coordinator**: receives blinded point, computes own partial evaluation, forwards to peers via PrivateLink, verifies DLEQ proofs, combines via Lagrange interpolation
+- **Frontend NLB**: health-checked load balancer across same-region nodes — automatic failover
+- **PrivateLink**: node-to-node traffic stays on AWS's private backbone, no public exposure
+- **SEV-SNP**: key shares sealed to hardware, stored encrypted in S3 — AWS cannot read them
 
 ## Repository Structure
 
 ```
 crates/
-  core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine, share recovery)
-  node/       TEE node server — coordinator + peer mode, serves /evaluate, /partial-evaluate, /reshare
-  keygen/     Offline ceremony tool — generates OPRF key, splits into shares
-  seal/       AMD SEV-SNP key sealing/unsealing, ECIES encryption, attestation
+  core/       Threshold OPRF cryptography (Shamir, partial eval, DLEQ, combine, recovery)
+  node/       TEE node server (coordinator + peer mode)
+  keygen/     Offline ceremony tool (generate key, split into shares)
+  seal/       AMD SEV-SNP sealing, ECIES, attestation verification
 lambda/
-  handlers/   OPRF Lambda functions (challenge, attest, evaluate)
-  rotation/   Automated rotation Lambda (SAM template + handler)
-docker/       Dockerfiles, docker-compose, SEV-SNP config
-deploy/       Deployment automation (provision.sh, deploy.sh)
-scripts/      Dev utilities (integration-test.sh)
+  handlers/   API Lambda functions (challenge, attest, evaluate)
+  rotation/   Automated rotation Lambda (SAM template)
+deploy/       Deployment scripts (provision.sh, deploy.sh)
+scripts/      Dev utilities (integration-test.sh, gen-certs.sh)
 ```
 
-## Full Deployment Guide (Start to Finish)
+## Prerequisites
 
-### Prerequisites
+**Local tools:**
+- AWS CLI (authenticated)
+- `jq`, `openssl`, `curl`
+- Rust toolchain
+- Node.js
+- AWS SAM CLI
 
-- AWS CLI authenticated with appropriate IAM permissions
-- `jq`, `openssl`, `curl` installed locally
-- Rust toolchain installed (for building keygen + init-encrypt)
-- Node.js installed (for building Lambda handlers)
-- Docker for local development/testing
+**AWS resources (create before deployment):**
+- HTTP API Gateway with custom domain (`oprf.ruonlabs.com`)
+- ACM certificate for the domain
+- Route 53 hosted zone with CNAME to API Gateway
+- Lambda execution IAM role (`toprf-lambda-exec`) with DynamoDB, S3, VPC, CloudWatch permissions
+- DynamoDB tables: `ruonid-nonces`, `ruonid-device-keys`
+- KMS signing key (secp256k1, `alias/ruonid-signing`)
 
-### Step 1: Build
+**AWS resources (created by deployment scripts):**
+- EC2 instances (SEV-SNP VMs)
+- Per-node IAM roles, instance profiles, key pairs
+- S3 buckets for sealed key blobs
+- NLBs (per-node + frontend)
+- PrivateLink (endpoint services, VPC endpoints, security groups)
+- CloudWatch alarms + SNS topics
+- SSM Parameter Store entries
+- VPC endpoints (S3, SSM, EC2, STS, SSM Messages, EC2 Messages)
+
+## Deployment
+
+### 1. Build
 
 ```bash
 cargo build --release
 cargo test --release
 ```
 
-### Step 2: Key Ceremony (air-gapped machine recommended)
+### 2. Key Ceremony
 
-#### 2a. Create admin shares (one-time, store in separate secure locations)
+Run on an air-gapped machine.
 
 ```bash
+# Create admin shares (one-time, store in separate secure locations)
 cargo run --release -p toprf-keygen -- init \
     --admin-threshold 3 --admin-shares 5 \
     --output-dir ./ceremony/admin-shares
-```
 
-This produces 5 admin shares with a 3-of-5 threshold. Store these in physically separate secure locations (bank vaults, safes, etc). The admin shares are only needed if the entire quorum is lost.
-
-#### 2b. Derive node shares (per deployment)
-
-Bring 3 of the 5 admin shares together to produce T-of-N node shares:
-
-```bash
-# 2-of-3 deployment
+# Derive node shares (bring 3 admin shares together)
 cargo run --release -p toprf-keygen -- node-shares \
     --admin-share ceremony/admin-shares/admin-1.json \
     --admin-share ceremony/admin-shares/admin-3.json \
@@ -81,339 +85,151 @@ cargo run --release -p toprf-keygen -- node-shares \
     --output-dir ./ceremony/node-shares
 ```
 
-Output: `node-shares/node-{1..N}-share.json` + `node-shares/public-config.json`.
-
-### Step 3: Configure Deployment
+### 3. Configure
 
 ```bash
 cd deploy
-cp config.env.example config.env
-cp nodes.json.example nodes.json
+cp config.env.example config.env    # Set NODE_SHARES_DIR, manual values
+cp nodes.json.example nodes.json    # Set threshold, node regions
 ```
 
-Edit `nodes.json`: set `threshold` and configure node regions. Only `id` and `region` are required per node — everything else is auto-populated.
-
-Edit `config.env`: set `NODE_SHARES_DIR=../ceremony/node-shares` and any other values not marked `[auto]`.
-
-### Step 4: Provision TEE Nodes
+### 4. Provision + Deploy
 
 ```bash
-./provision.sh all
+./provision.sh all          # Launch SEV-SNP VMs
+./deploy.sh auto-config     # Populate IPs, SGs, VPCs
+./deploy.sh all             # pre-seal → init-seal → post-seal
+./deploy.sh e2e             # Verify end-to-end
 ```
 
-For each node, this:
-1. Creates an IAM role (`toprf-node-<id>-role`) scoped to that node's S3 bucket
-2. Creates an EC2 key pair (saves `.pem` locally)
-3. Finds the latest Amazon Linux 2023 AMI with SEV-SNP support
-4. Launches a `c6a.large` instance with SEV-SNP enabled
-5. Attaches the IAM instance profile
-
-After provisioning, auto-populate IPs, security groups, and VPC IDs:
+### 5. Deploy Lambdas
 
 ```bash
-./deploy.sh auto-config
+./deploy.sh lambda-config   # Auto-generate lambda/config.env
+# Manually set: API_ID, ROLE_ARN, APPLE_APP_ID, APPLE_TEAM_ID
+
+cd lambda && ./deploy.sh    # Deploy + wire API Gateway routes
 ```
 
-### Step 5: Deploy OPRF Nodes
-
-#### Option A: Full deployment (all steps)
-
-```bash
-./deploy.sh all
-```
-
-This runs pre-seal → init-seal → post-seal in sequence.
-
-#### Option B: Step by step
-
-**Pre-seal** (automated):
-
-```bash
-./deploy.sh pre-seal
-```
-
-| Step | What it does |
-|------|-------------|
-| `setup-vms` | Installs Docker on each VM |
-| `pull` | Pulls the node image from ghcr.io |
-| `storage` | Creates S3 buckets for sealed key blobs |
-| `measure` | Fetches the SEV-SNP measurement, saves to `config.env`. Also fetches the AMD ARK fingerprint from KDS. |
-
-**Init-seal** (interactive, S3-mediated ECIES key injection):
-
-```bash
-./deploy.sh init-seal
-```
-
-For each node:
-1. Starts a temporary container in init-seal mode — generates X25519 keypair, gets attestation report, uploads to S3
-2. Downloads attestation report and public key from S3
-3. Verifies SEV-SNP attestation (measurement + AMD certificate chain + ARK fingerprint)
-4. Encrypts key share via ECIES to the attested public key
-5. Uploads encrypted share to S3 — node decrypts, seals to hardware, uploads sealed blob
-
-**Post-seal** (automated):
-
-```bash
-./deploy.sh post-seal
-```
-
-| Step | What it does |
-|------|-------------|
-| `privatelink` | Creates per-node NLBs, Endpoint Services, and cross-VPC VPC Endpoints |
-| `coordinator-config` | Generates per-node coordinator configs with peer PrivateLink endpoints |
-| `start` | Starts nodes in coordinator mode (auto-unseal + peer config) |
-| `verify` | Health-checks all nodes via SSH |
-| `frontend-nlb` | Creates frontend NLB targeting all same-region nodes |
-
-### Step 6: Verify End-to-End
-
-```bash
-./deploy.sh e2e
-```
-
-Runs an OPRF evaluation through the coordinator to verify the full system works.
-
-### Step 7: Deploy Lambda Functions
-
-Before deploying Lambdas, you need an API Gateway and custom domain set up:
-
-1. Create an HTTP API Gateway in the AWS console or via CLI
-2. Request an ACM certificate for `oprf.ruonlabs.com` (DNS validation)
-3. Create a custom domain mapping in API Gateway pointing to the cert
-4. Add a Route 53 CNAME record: `oprf.ruonlabs.com` → API Gateway domain
-5. Create a Lambda execution IAM role with DynamoDB, S3, VPC, and CloudWatch permissions
-
-The three Lambda functions handle the API Gateway layer:
-
-| Function | Route | Description |
-|----------|-------|-------------|
-| **challenge** | `GET /challenge` | Issues single-use nonces for device attestation |
-| **attest** | `POST /attest` | One-time Apple App Attest device key registration |
-| **evaluate** | `POST /evaluate` | Attestation-gated OPRF evaluation via frontend NLB |
-
-#### 7a. Generate Lambda config
+### 6. Monitoring + Rotation
 
 ```bash
 # From deploy/ directory
-./deploy.sh lambda-config
-```
+./deploy.sh cloudwatch      # Health alarms → SNS
+./deploy.sh sync-state      # Push config to SSM for rotation Lambda
 
-This auto-populates `lambda/config.env` from deployment state (account ID, region, VPC subnets, NLB URL). You'll need to manually set:
-- `API_ID` — the OPRF API Gateway ID (for `oprf.ruonlabs.com`)
-- `ROLE_ARN` — Lambda execution role ARN
-- `APPLE_APP_ID` — Apple App Attest app ID (e.g. `TEAMID.com.yourapp`)
-- `APPLE_TEAM_ID` — Apple Developer Team ID
-
-#### 7b. Deploy Lambdas
-
-```bash
-cd lambda
-./deploy.sh
-```
-
-This builds the Lambda handlers, creates/updates the Lambda functions, wires API Gateway routes, and grants invoke permissions.
-
-After deploying, return to the `deploy/` directory for the remaining steps.
-
-### Step 8: Set Up Monitoring
-
-```bash
-# From deploy/ directory
-./deploy.sh cloudwatch
-```
-
-Creates CloudWatch alarms for each node's NLB target health. Unhealthy nodes trigger SNS notifications and automatic rotation.
-
-### Step 9: Sync State for Rotation Lambda
-
-```bash
-# From deploy/ directory
-./deploy.sh sync-state
-```
-
-Pushes node configs, coordinator configs, measurement, and ARK fingerprint to SSM Parameter Store. The rotation Lambda reads these for automated node replacement.
-
-### Step 10: Deploy Rotation Lambda
-
-```bash
+# Deploy rotation Lambda
 cd lambda/rotation
 sam build && sam deploy --guided
 ```
 
-The rotation Lambda runs in the coordinator VPC (for NLB access via PrivateLink). It needs VPC endpoints to reach AWS services privately:
+Create VPC endpoints in the coordinator VPC so the rotation Lambda can reach AWS services:
 
 ```bash
-# From the coordinator VPC (eu-west-1), create endpoints for:
-# S3 (gateway, free), SSM, EC2, STS, SSM Messages, EC2 Messages (interface, ~$7/month each)
-aws ec2 create-vpc-endpoint --vpc-id <VPC_ID> --service-name com.amazonaws.<REGION>.s3 \
+# S3 gateway (free)
+aws ec2 create-vpc-endpoint --vpc-id <VPC_ID> \
+  --service-name com.amazonaws.<REGION>.s3 \
   --vpc-endpoint-type Gateway --route-table-ids <RT_ID>
 
+# Interface endpoints (~$7/month each)
 for svc in ssm ec2 sts ssmmessages ec2messages; do
   aws ec2 create-vpc-endpoint --vpc-id <VPC_ID> \
     --service-name com.amazonaws.<REGION>.$svc \
     --vpc-endpoint-type Interface \
-    --subnet-ids <SUBNET_1> <SUBNET_2> \
-    --security-group-ids <SG_ID> \
+    --subnet-ids <SUB1> <SUB2> --security-group-ids <SG> \
     --private-dns-enabled
 done
 ```
 
-These are created once and never need updating — they route by service, not by specific resource.
-
-After deploying, subscribe the Lambda to the CloudWatch alarm SNS topics:
+Subscribe the Lambda to CloudWatch alarm SNS topics:
 
 ```bash
-aws sns subscribe --topic-arn <ALERT_TOPIC_ARN> --protocol lambda \
+aws sns subscribe --topic-arn <ALERT_TOPIC> --protocol lambda \
   --notification-endpoint <ROTATION_LAMBDA_ARN>
 aws lambda add-permission --function-name toprf-rotation \
   --statement-id sns-invoke --action lambda:InvokeFunction \
-  --principal sns.amazonaws.com --source-arn <ALERT_TOPIC_ARN>
+  --principal sns.amazonaws.com --source-arn <ALERT_TOPIC>
 ```
 
-Return to the `deploy/` directory for the final step.
-
-### Step 11: Lock Nodes (production)
+### 7. Lock Nodes
 
 ```bash
-# From deploy/ directory
-./deploy.sh lock
+./deploy.sh lock    # Irreversible — removes SSH, deletes keys
 ```
-
-Removes SSH access permanently. Nodes become stateless black boxes — only reachable on port 3001 through PrivateLink. **This is irreversible.** If a node fails after locking, terminate and reprovision from scratch.
-
----
 
 ## Common Operations
 
 ```bash
-./deploy.sh verify                  # Health-check nodes
-./deploy.sh e2e                     # End-to-end OPRF evaluation test
-./deploy.sh show-ips                # Fetch node IPs from AWS
-./deploy.sh auto-config             # Re-populate IPs, SGs, VPCs in nodes.json
-./deploy.sh redeploy                # Pull latest image + restart all nodes
-./deploy.sh --nodes 2 redeploy     # Single node redeploy
-./deploy.sh lambda-config           # Regenerate lambda/config.env
-./deploy.sh sync-state              # Push state to SSM (after any config change)
+./deploy.sh e2e                 # End-to-end test
+./deploy.sh verify              # Health-check nodes
+./deploy.sh show-ips            # Fetch node IPs
+./deploy.sh redeploy            # Pull latest image + restart
+./deploy.sh sync-state          # Push config to SSM
 ```
 
----
+## Rotation
 
-## Automated Monthly Rotation
+Automated monthly via Lambda. Uses staging-based share recovery — no admin ceremony needed.
 
-Nodes are rotated monthly via an AWS Lambda — no admin ceremony or human intervention required. The rotation uses the **share recovery protocol** so that the existing quorum produces shares for each new node without ever reconstructing the secret.
+1. Provision staging VM alongside existing node
+2. Start init-reshare → attestation report + ephemeral keypair to S3
+3. Send `/reshare` to donor nodes → donors verify attestation, compute + encrypt contributions
+4. Staging node collects, decrypts, verifies, combines → new share
+5. Seal to hardware, health-check, swap NLB targets
+6. Terminate old instance
 
-### How it works
-
-Rotation uses a **staging-based** approach: a new instance is provisioned alongside the existing node, receives its share via reshare, and only after the new node is verified healthy does the swap happen. The old node runs throughout — if anything fails, the rotation is aborted with zero impact.
-
-```
-For each node to rotate (1..N):
-  1. Provision a staging VM (old node continues serving traffic)
-  2. Install Docker, pull the node image on staging VM
-  3. Start staging node in init-reshare mode
-     → Generates X25519 keypair, gets attestation report, uploads to S3
-  4. Download staging node's attestation report + pubkey from S3
-  5. Send POST /reshare to each donor node (the other N-1 nodes)
-     → Donors verify attestation, compute recovery contribution, ECIES-encrypt
-     → Upload encrypted contributions to S3
-  6. Staging node collects contributions, decrypts, verifies, combines → new share
-  7. Staging node seals share to hardware
-  8. Restart staging node in normal mode, health-check
-  9. Swap NLB targets: deregister old IP, register new IP
-  10. Terminate old instance, retag staging → permanent, clean up
-```
-
-If anything fails at any step, the old node is still running. Terminate the staging instance and clean up — back to healthy nodes.
+If anything fails, the old node is still running. Zero-downtime.
 
 ```bash
 # Manual rotation
-./provision.sh 1 --staging       # Provision staging VM
-./deploy.sh rotate 1             # Reshare → verify → swap → cleanup
-./deploy.sh --nodes 1 lock       # Lock the new node
+./provision.sh 1 --staging && ./deploy.sh rotate 1 && ./deploy.sh --nodes 1 lock
 
-# Abort a failed rotation
+# Abort
 ./provision.sh 1 --terminate-staging
 ```
 
-### Unhealthy node detection
+**Triggers:**
+- CloudWatch alarm (unhealthy node) → SNS → Lambda
+- EventBridge schedule (monthly)
+- Manual invocation
 
-CloudWatch alarms monitor each node's NLB target health. If a target is unhealthy for 3 consecutive minutes, the alarm fires to SNS. The rotation Lambda is subscribed and automatically triggers single-node recovery.
+## Key Rotation (New OPRF Secret)
 
-```bash
-./deploy.sh cloudwatch
-```
+To rotate to a completely new OPRF key:
 
-### Success notifications
+1. Run new key ceremony (admin shares → node shares)
+2. Clear sealed blobs from S3 buckets
+3. `./deploy.sh init-seal` (inject new shares)
+4. `./deploy.sh start` (restart nodes)
+5. `./deploy.sh e2e` (verify)
+6. `./deploy.sh sync-state` (update SSM)
 
-The rotation Lambda publishes to an SNS topic after each successful rotation. Subscribe via:
+**Warning:** all existing `appSpecificId` values become invalid.
 
-```bash
-aws sns subscribe \
-  --topic-arn <RotationResultsTopicArn from stack outputs> \
-  --protocol email \
-  --notification-endpoint your@email.com
-```
+## Security
 
----
-
-## Share Recovery Protocol
-
-When a node needs to be replaced, the remaining quorum produces a new share without reconstructing the secret. The new share lies on the same polynomial — no full reshare or new key generation required.
-
-1. New node boots in init-reshare mode: generates ephemeral X25519 keypair, gets attestation report
-2. Orchestrator sends `/reshare` to each donor node with the new node's attestation
-3. Each donor independently verifies attestation, then computes `L_i(new_node_id) * k_i` and ECIES-encrypts it
-4. New node collects, decrypts, verifies each sub-share against verification shares, combines to obtain new share
-5. New node seals and uploads
-
-**Security**: donor is the trust anchor — each independently verifies attestation before releasing sub-shares. Compromised orchestrator cannot extract shares for an unattested target.
-
----
-
-## Public Verifiability
-
-Each node generates an AMD SEV-SNP attestation report at boot, binding its verification share to the hardware measurement via `REPORT_DATA[0..32] = SHA256(verification_share_bytes)`.
-
-Third-party auditors can verify:
-1. Each node's attestation report is signed by AMD and matches the expected binary measurement
-2. The verification shares combine to the published group public key
-3. The mobile app verifies DLEQ proofs against the committed group public key
-
----
-
-## Security Properties
-
-- **No single point of compromise** — key shares split across N nodes, each below the T-of-N threshold
-- **Hardware-bound sealing** — sealed blobs encrypted with SEV-SNP `MSG_KEY_REQ`-derived keys; AWS cannot decrypt
-- **TEE attestation** — key injection and share recovery verified against hardware attestation reports with AMD certificate chain validation, VMPL == 0 enforcement, and guest policy debug-bit rejection
-- **ARK fingerprint pinning** — AMD root certificate fingerprint is mandatory
-- **DLEQ proofs** — every partial evaluation includes a DLEQ proof proving the node used its correct key share
-- **Attestation-bound recovery** — donor nodes independently verify the target's attestation before releasing sub-shares
-- **Per-node IAM isolation** — each node's IAM role is scoped to only its own S3 bucket
-- **Network isolation** — nodes only reachable via AWS PrivateLink; traffic never crosses the public internet
-- **Device attestation** — Apple App Attest and Google Play Integrity validation via API Gateway
+- **T-of-N threshold** — no single node holds enough shares
+- **Hardware sealing** — SEV-SNP `MSG_KEY_REQ` derived keys; AWS cannot decrypt
+- **Attestation** — AMD certificate chain, VMPL=0 enforcement, debug-bit rejection, ARK fingerprint pinning
+- **DLEQ proofs** — every partial evaluation proves correct key share usage
+- **Attestation-bound recovery** — donors verify target attestation before releasing sub-shares
+- **Per-node IAM** — each node scoped to its own S3 bucket
+- **Network isolation** — PrivateLink only, no public exposure
+- **Device attestation** — Apple App Attest / Google Play Integrity
 
 ## CI
 
-GitHub Actions runs on push/PR to `main`:
-
-1. **Format & Lint** — `cargo fmt --check` + `cargo clippy` (warnings are errors)
-2. **Unit Tests** — `cargo test --release`
-3. **Build** — `cargo build --release`
-4. **Integration Tests** — Full E2E with 3 nodes
-5. **Docker Image** — Build and push to ghcr.io (main branch only)
+GitHub Actions on push/PR to `main`: format, lint, test, build, integration tests, Docker image push (main only).
 
 ## Troubleshooting
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| S3 upload denied during seal | Missing IAM permissions | Add `s3:PutObject` to the instance profile role |
-| Container exits on init-seal | Crash during attestation | `ssh <node> "sudo docker logs toprf-init-seal"` |
-| Coordinator can't reach peer | PrivateLink endpoint not available | Check `privatelink-state.env` for endpoint IDs |
-| NLB targets unhealthy | Node not running or wrong port | SSH to node, check `docker ps` and `docker logs toprf-node` |
-| SEV-SNP measurement mismatch | AMI updated by AWS | Re-run `./deploy.sh measure` and rebuild/re-seal |
-| VLEK cert not found | AWS uses VLEK instead of VCEK | System handles both — check AMD KDS fetch in logs |
+| Problem | Fix |
+|---------|-----|
+| S3 denied during seal | Add `s3:PutObject` to node IAM role |
+| Container exits on init-seal | Check `docker logs toprf-init-seal` |
+| Peer unreachable | Check PrivateLink endpoint state |
+| NLB unhealthy | Check `docker ps` and `docker logs toprf-node` |
+| Measurement mismatch | Re-run `./deploy.sh measure`, rebuild |
 
 ## License
 
