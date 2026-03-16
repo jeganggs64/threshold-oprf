@@ -1225,14 +1225,15 @@ step_e2e() {
         fail=$((fail + 1))
     fi
 
-    # 3. Domain endpoint (if API Gateway is configured)
+    # 3. OPRF domain endpoint (oprf.ruonlabs.com)
+    local oprf_domain="${OPRF_DOMAIN:-oprf.ruonlabs.com}"
     echo ""
-    echo "  [3/3] Domain endpoint (https://${domain})"
+    echo "  [3/3] Domain endpoint (https://${oprf_domain})"
     total=$((total + 1))
 
     local domain_resp
     domain_resp=$(curl -s --connect-timeout 10 \
-        -X POST "https://${domain}/evaluate" \
+        -X POST "https://${oprf_domain}/evaluate" \
         -H "Content-Type: application/json" \
         -d "{\"blinded_point\":\"${test_point}\"}" 2>&1) || true
 
