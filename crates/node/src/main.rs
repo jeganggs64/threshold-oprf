@@ -474,8 +474,13 @@ async fn run_init_reshare(
             while attestation_bytes.len() < toprf_seal::snp_report::REPORT_BODY_SIZE {
                 attestation_bytes.push(0);
             }
+            // R component in 72-byte field (48 bytes value + 24 bytes zero padding)
             attestation_bytes.extend_from_slice(&report.signature_r);
+            attestation_bytes.extend_from_slice(&[0u8; 24]);
+            // S component in 72-byte field (48 bytes value + 24 bytes zero padding)
             attestation_bytes.extend_from_slice(&report.signature_s);
+            attestation_bytes.extend_from_slice(&[0u8; 24]);
+            // Remaining reserved bytes
             while attestation_bytes.len() < toprf_seal::snp_report::REPORT_TOTAL_SIZE {
                 attestation_bytes.push(0);
             }
