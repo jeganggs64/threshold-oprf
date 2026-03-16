@@ -193,9 +193,9 @@ If anything fails, the old node is still running. Zero-downtime.
 - EventBridge schedule (monthly)
 - Manual invocation
 
-## Key Rotation (New OPRF Secret)
+## Full Key Replacement
 
-To rotate to a completely new OPRF key:
+If the OPRF secret is compromised and needs to be replaced entirely (not routine — node rotation preserves the existing key):
 
 1. Run new key ceremony (admin shares → node shares)
 2. Clear sealed blobs from S3 buckets
