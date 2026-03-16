@@ -176,6 +176,14 @@ Runs an OPRF evaluation through the coordinator to verify the full system works.
 
 ### Step 7: Deploy Lambda Functions
 
+Before deploying Lambdas, you need an API Gateway and custom domain set up:
+
+1. Create an HTTP API Gateway in the AWS console or via CLI
+2. Request an ACM certificate for `oprf.ruonlabs.com` (DNS validation)
+3. Create a custom domain mapping in API Gateway pointing to the cert
+4. Add a Route 53 CNAME record: `oprf.ruonlabs.com` → API Gateway domain
+5. Create a Lambda execution IAM role with DynamoDB, S3, VPC, and CloudWatch permissions
+
 The three Lambda functions handle the API Gateway layer:
 
 | Function | Route | Description |
@@ -187,13 +195,14 @@ The three Lambda functions handle the API Gateway layer:
 #### 7a. Generate Lambda config
 
 ```bash
+# From deploy/ directory
 ./deploy.sh lambda-config
 ```
 
 This auto-populates `lambda/config.env` from deployment state (account ID, region, VPC subnets, NLB URL). You'll need to manually set:
-- `API_ID` — the OPRF API Gateway ID (`oprf.ruonlabs.com`)
+- `API_ID` — the OPRF API Gateway ID (for `oprf.ruonlabs.com`)
 - `ROLE_ARN` — Lambda execution role ARN
-- `APPLE_APP_ID` — Apple App Attest app ID
+- `APPLE_APP_ID` — Apple App Attest app ID (e.g. `TEAMID.com.yourapp`)
 - `APPLE_TEAM_ID` — Apple Developer Team ID
 
 #### 7b. Deploy Lambdas
@@ -203,11 +212,14 @@ cd lambda
 ./deploy.sh
 ```
 
-This builds the Lambda handlers, creates/updates the Lambda functions, and grants API Gateway invoke permissions.
+This builds the Lambda handlers, creates/updates the Lambda functions, wires API Gateway routes, and grants invoke permissions.
+
+After deploying, return to the `deploy/` directory for the remaining steps.
 
 ### Step 8: Set Up Monitoring
 
 ```bash
+# From deploy/ directory
 ./deploy.sh cloudwatch
 ```
 
@@ -216,6 +228,7 @@ Creates CloudWatch alarms for each node's NLB target health. Unhealthy nodes tri
 ### Step 9: Sync State for Rotation Lambda
 
 ```bash
+# From deploy/ directory
 ./deploy.sh sync-state
 ```
 
@@ -228,9 +241,12 @@ cd lambda/rotation
 sam build && sam deploy --guided
 ```
 
+After deploying, return to the `deploy/` directory for the final step.
+
 ### Step 11: Lock Nodes (production)
 
 ```bash
+# From deploy/ directory
 ./deploy.sh lock
 ```
 
