@@ -673,6 +673,7 @@ def rotate_node(config, node_id):
                 f"--group-public-key {group_public_key}",
                 f"--min-contributions {threshold}",
             ],
+            env={"AMD_ARK_FINGERPRINT": ark_fingerprint},
         )
         run_ssm_command(
             region, staging_id, [init_cmd],
