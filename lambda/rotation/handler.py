@@ -979,46 +979,58 @@ def handler(event, context):
         )
         return {"statusCode": 200, "body": f"rotated node {node_id}"}
 
-    # EventBridge scheduled trigger (monthly rotation)
+    # EventBridge scheduled trigger (monthly rotation — oldest node only)
     if (
         event.get("source") == "aws.events"
         or event.get("detail-type") == "Scheduled Event"
     ):
-        threshold = config["threshold"]
-        logger.info("Scheduled rotation: rotating all nodes")
-        rotated = []
+        # Find the oldest node by EC2 LaunchTime
+        oldest_node_id = None
+        oldest_launch = None
         for node in config["nodes"]:
-            # Re-read config each iteration (rotate_node updates it)
-            config = get_config()
-            # Quorum check
-            healthy = sum(
-                1 for n in config["nodes"] if n.get("instance_id")
-            )
-            if healthy < threshold:
-                logger.error(
-                    f"Only {healthy} healthy nodes, need {threshold} "
-                    "— aborting rotation"
-                )
-                return {
-                    "statusCode": 500,
-                    "body": f"quorum lost: {healthy} < {threshold}",
-                }
+            instance_id = node.get("instance_id")
+            if not instance_id:
+                continue
             try:
-                result = rotate_node(config, node["id"])
-                rotated.append(result)
+                ec2 = boto3.client("ec2", region_name=node["region"])
+                resp = ec2.describe_instances(InstanceIds=[instance_id])
+                launch_time = resp["Reservations"][0]["Instances"][0]["LaunchTime"]
+                logger.info(
+                    f"  Node {node['id']} ({instance_id}): launched {launch_time}"
+                )
+                if oldest_launch is None or launch_time < oldest_launch:
+                    oldest_launch = launch_time
+                    oldest_node_id = node["id"]
             except Exception as e:
-                logger.error(f"Failed to rotate node {node['id']}: {e}")
-                # Stop — don't risk further reducing the quorum
-                return {
-                    "statusCode": 500,
-                    "body": f"rotation failed at node {node['id']}: {e}",
-                }
+                logger.warning(
+                    f"  Could not get launch time for node {node['id']}: {e}"
+                )
+
+        if oldest_node_id is None:
+            logger.error("No nodes with valid instance IDs — aborting")
+            return {"statusCode": 500, "body": "no valid nodes to rotate"}
+
+        logger.info(
+            f"Scheduled rotation: rotating oldest node {oldest_node_id} "
+            f"(launched {oldest_launch})"
+        )
+        try:
+            result = rotate_node(config, oldest_node_id)
+        except Exception as e:
+            logger.error(f"Failed to rotate node {oldest_node_id}: {e}")
+            return {
+                "statusCode": 500,
+                "body": f"rotation failed at node {oldest_node_id}: {e}",
+            }
         notify_success(
             "scheduled",
-            f"Monthly rotation complete ({len(rotated)} nodes)",
-            details=rotated,
+            f"Monthly rotation: node {oldest_node_id} replaced (oldest)",
+            details=result,
         )
-        return {"statusCode": 200, "body": "scheduled rotation complete"}
+        return {
+            "statusCode": 200,
+            "body": f"rotated oldest node {oldest_node_id}",
+        }
 
     # Manual invocation (single node)
     node_id = event.get("node_id")
