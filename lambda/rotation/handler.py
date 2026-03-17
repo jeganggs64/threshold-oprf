@@ -309,7 +309,7 @@ def retag_instance(region, instance_id, new_name):
 
 def wait_for_s3_object(bucket, key, region, timeout):
     """Poll S3 until an object appears or timeout."""
-    s3 = boto3.client("s3", region_name=region)
+    s3 = _s3_client_for_bucket()
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -323,23 +323,34 @@ def wait_for_s3_object(bucket, key, region, timeout):
     return False
 
 
+def _s3_client_for_bucket():
+    """Return an S3 client routed through the VPC Gateway endpoint.
+
+    The Lambda runs in a VPC with an S3 Gateway endpoint in eu-west-1.
+    S3 buckets are globally addressable, so we always use the eu-west-1
+    regional endpoint regardless of the bucket's region. This avoids
+    ConnectTimeoutErrors when accessing cross-region buckets (e.g.
+    us-east-2) that would otherwise bypass the Gateway endpoint."""
+    return boto3.client("s3", region_name="eu-west-1")
+
+
 def download_s3_object(bucket, key, region):
     """Download an S3 object and return its bytes."""
-    s3 = boto3.client("s3", region_name=region)
+    s3 = _s3_client_for_bucket()
     response = s3.get_object(Bucket=bucket, Key=key)
     return response["Body"].read()
 
 
 def upload_s3_object(bucket, key, data, region):
     """Upload bytes to S3."""
-    s3 = boto3.client("s3", region_name=region)
+    s3 = _s3_client_for_bucket()
     s3.put_object(Bucket=bucket, Key=key, Body=data)
     logger.info(f"Uploaded s3://{bucket}/{key}")
 
 
 def cleanup_reshare_artifacts(bucket, region):
     """Remove temporary reshare artifacts from S3."""
-    s3 = boto3.client("s3", region_name=region)
+    s3 = _s3_client_for_bucket()
     response = s3.list_objects_v2(Bucket=bucket, Prefix="reshare/")
     for obj in response.get("Contents", []):
         s3.delete_object(Bucket=bucket, Key=obj["Key"])
@@ -448,6 +459,7 @@ def check_staging_health_via_ssm(region, instance_id, timeout=HEALTH_TIMEOUT):
 def send_reshare_request(donor_node, reshare_payload):
     """Send POST /reshare to a donor node via its NLB endpoint."""
     import urllib.request
+    import urllib.error
 
     endpoint = donor_node["nlb_endpoint"]
     url = f"{endpoint}/reshare"
@@ -467,6 +479,13 @@ def send_reshare_request(donor_node, reshare_payload):
             body = json.loads(resp.read().decode())
             logger.info(f"Received contribution from node {donor_node['id']}")
             return body
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        logger.error(
+            f"Failed to get contribution from node {donor_node['id']}: "
+            f"HTTP {e.code} — {error_body}"
+        )
+        raise
     except Exception as e:
         logger.error(
             f"Failed to get contribution from node {donor_node['id']}: {e}"
@@ -625,7 +644,7 @@ def rotate_node(config, node_id):
     # ── Step 2: Clean up stale artifacts ──
     logger.info("Step 2: Cleaning stale artifacts")
     cleanup_reshare_artifacts(bucket, region)
-    s3 = boto3.client("s3", region_name=region)
+    s3 = _s3_client_for_bucket()
     try:
         s3.delete_object(Bucket=bucket, Key=staging_sealed_key)
     except Exception:
