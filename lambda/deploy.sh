@@ -33,7 +33,8 @@ ENV_VARS="{
     \"DEVICE_KEYS_REGION\": \"${REGION}\",
     \"NONCES_TABLE\": \"${NONCES_TABLE}\",
     \"DEVICE_KEYS_TABLE\": \"${DEVICE_KEYS_TABLE}\",
-    \"NLB_URL\": \"${NLB_URL}\"
+    \"NLB_URL\": \"${NLB_URL}\",
+    \"PLAY_INTEGRITY_API_KEY\": \"${PLAY_INTEGRITY_API_KEY}\"
   }
 }"
 

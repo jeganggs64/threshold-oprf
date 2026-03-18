@@ -1,21 +1,50 @@
-import { getProvider } from "../shared/attestation";
+import { getProvider, getPlayProvider } from "../shared/attestation";
 import { consumeNonce } from "../shared/dynamo-nonces";
 import { ok, error } from "../shared/response";
 
-/** POST /attest — one-time Apple App Attest device key registration. */
+/**
+ * POST /attest — device registration.
+ *
+ * iOS:     One-time Apple App Attest key registration (attestationObject + keyId + nonce).
+ * Android: No-op registration. Android uses stateless Play Integrity tokens per-request,
+ *          so this endpoint just validates the token and returns a deviceId.
+ */
 export async function handler(event: any) {
   try {
     const body = JSON.parse(event.body || "{}");
-    const { attestationObject, keyId, nonce } = body;
+    const { nonce } = body;
+
+    if (!nonce || typeof nonce !== "string") {
+      return error(400, "Missing or invalid nonce");
+    }
+
+    // Detect platform from request body
+    if (body.integrityToken) {
+      // ── Android: verify Play Integrity token ──
+      const deviceId = await getPlayProvider().verify(
+        Buffer.from(JSON.stringify({
+          integrityToken: body.integrityToken,
+          deviceUUID: body.deviceUUID || "",
+        })).toString("base64"),
+        nonce,
+      );
+
+      const valid = await consumeNonce(nonce);
+      if (!valid) {
+        return error(403, "Invalid or expired nonce");
+      }
+
+      return ok({ deviceId });
+    }
+
+    // ── iOS: Apple App Attest one-time key registration ──
+    const { attestationObject, keyId } = body;
 
     if (!attestationObject || typeof attestationObject !== "string") {
       return error(400, "Missing or invalid attestationObject");
     }
     if (!keyId || typeof keyId !== "string") {
       return error(400, "Missing or invalid keyId");
-    }
-    if (!nonce || typeof nonce !== "string") {
-      return error(400, "Missing or invalid nonce");
     }
 
     // Verify attestation BEFORE consuming nonce — if attestation fails,

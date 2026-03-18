@@ -64,6 +64,7 @@ Resources:
             - Effect: Allow
               Action:
                 - ec2:RunInstances
+                - ec2:CreateTags
               Resource:
                 - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
                 - !Sub arn:aws:ec2:*:${AWS::AccountId}:volume/*
@@ -74,7 +75,6 @@ Resources:
             - Effect: Allow
               Action:
                 - ec2:TerminateInstances
-                - ec2:CreateTags
               Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
               Condition:
                 StringEquals:
