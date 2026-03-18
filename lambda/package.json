@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@peculiar/x509": "^1.14.3",
-    "cbor": "^9.0.2"
+    "cbor": "^9.0.2",
+    "google-auth-library": "^10.6.2"
   },
   "devDependencies": {
     "@aws-sdk/client-dynamodb": "^3.1009.0",

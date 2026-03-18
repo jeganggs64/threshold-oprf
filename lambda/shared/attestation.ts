@@ -38,13 +38,13 @@ export { getProvider, getKeyStore, getPlayProvider };
 
 /**
  * Detect platform from the attestation token.
- * Android tokens contain { integrityToken, deviceUUID }.
+ * Android tokens contain { deviceUUID } (registered via /attest with Play Integrity).
  * iOS tokens contain { keyId, assertion }.
  */
 function detectPlatform(tokenB64: string): "ios" | "android" {
   try {
     const parsed = JSON.parse(Buffer.from(tokenB64, "base64").toString("utf8"));
-    if (parsed.integrityToken) return "android";
+    if (parsed.deviceUUID && !parsed.keyId) return "android";
   } catch {}
   return "ios";
 }
@@ -69,9 +69,26 @@ export async function verifyAttestation(body: {
 
   // Verify assertion — route to the correct provider based on token format
   const platform = detectPlatform(attestationToken);
-  const deviceId = platform === "android"
-    ? await getPlayProvider().verify(attestationToken, nonce)
-    : await getProvider().verify(attestationToken, nonce);
+
+  let deviceId: string;
+  if (platform === "android") {
+    // Android uses a two-phase model (mirroring iOS):
+    //   1. /attest registers the device via Play Integrity (non-VPC, can reach Google)
+    //   2. /evaluate checks the stored device record (VPC, no external calls)
+    const parsed = JSON.parse(Buffer.from(attestationToken, "base64").toString("utf8"));
+    const uuid = parsed.deviceUUID;
+    if (!uuid) throw new Error("Missing deviceUUID in attestation token");
+
+    deviceId = `android:${uuid}`;
+
+    // Verify device was registered via /attest
+    const entry = await getKeyStore().getKey(deviceId);
+    if (!entry) {
+      throw new Error("Device not registered. Call /attest first.");
+    }
+  } else {
+    deviceId = await getProvider().verify(attestationToken, nonce);
+  }
 
   // Per-device rate limiting
   await checkDeviceRateLimit(deviceId);

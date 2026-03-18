@@ -1,4 +1,4 @@
-import { getProvider, getPlayProvider } from "../shared/attestation";
+import { getProvider, getPlayProvider, getKeyStore } from "../shared/attestation";
 import { consumeNonce } from "../shared/dynamo-nonces";
 import { ok, error } from "../shared/response";
 
@@ -6,8 +6,9 @@ import { ok, error } from "../shared/response";
  * POST /attest — device registration.
  *
  * iOS:     One-time Apple App Attest key registration (attestationObject + keyId + nonce).
- * Android: No-op registration. Android uses stateless Play Integrity tokens per-request,
- *          so this endpoint just validates the token and returns a deviceId.
+ * Android: Verify Play Integrity token via Google's API, then store a device
+ *          record in DynamoDB. Subsequent /evaluate calls check this record
+ *          instead of calling Google (since evaluate is VPC-attached).
  */
 export async function handler(event: any) {
   try {
@@ -33,6 +34,9 @@ export async function handler(event: any) {
       if (!valid) {
         return error(403, "Invalid or expired nonce");
       }
+
+      // Store device record so /evaluate can verify without calling Google
+      await getKeyStore().saveKey(deviceId, "play-integrity-verified", 0);
 
       return ok({ deviceId });
     }
