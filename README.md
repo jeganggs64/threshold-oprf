@@ -69,7 +69,7 @@ scripts/      Dev utilities (integration-test.sh, gen-certs.sh)
 | `sns` | Interface | Rotation notifications | Rotation Lambda |
 | `dynamodb` | Gateway | Nonces, device keys | API Lambdas |
 
-**Important:** The `ssm` endpoint is for Parameter Store API only (key-value config reads). The `ssmmessages` and `ec2messages` endpoints are NOT needed — SSM Run Command is not used. The endpoint security group must allow **port 443** inbound from the VPC CIDR.
+**Important:** The `ssm` endpoint is for Parameter Store API only (key-value config reads). The endpoint security group must allow **port 443** inbound from the VPC CIDR.
 
 ## Deployment
 
@@ -257,19 +257,6 @@ toprf-keygen simulate \
     -a admin-shares/admin-1.json -a admin-shares/admin-2.json \
     --nationality "Singapore" --national-id "S1234567A"
 ```
-
-## Full Key Replacement
-
-If the OPRF secret is compromised and needs to be replaced entirely (not routine — node rotation preserves the existing key):
-
-1. Run new key ceremony (admin shares → node shares)
-2. Clear sealed blobs from S3 buckets
-3. `./deploy.sh init-seal` (inject new shares)
-4. `./deploy.sh start` (restart nodes)
-5. `./deploy.sh e2e` (verify)
-6. `./deploy.sh sync-state` (update SSM)
-
-**Warning:** all existing `ruonId` values become invalid.
 
 ## Security
 
