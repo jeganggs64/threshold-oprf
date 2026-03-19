@@ -103,25 +103,6 @@ Resources:
                 - elasticloadbalancing:DeregisterTargets
                 - elasticloadbalancing:DescribeTargetHealth
               Resource: '*'
-            # SSM Run Command — send commands to toprf-tagged instances
-            - Effect: Allow
-              Action:
-                - ssm:SendCommand
-              Resource:
-                - !Sub arn:aws:ssm:*::document/AWS-RunShellScript
-            - Effect: Allow
-              Action:
-                - ssm:SendCommand
-              Resource:
-                - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
-              Condition:
-                StringEquals:
-                  ssm:resourceTag/Project: toprf
-            - Effect: Allow
-              Action:
-                - ssm:GetCommandInvocation
-                - ssm:DescribeInstanceInformation
-              Resource: '*'
             # S3 CopyObject (for sealed blob rename)
             - Effect: Allow
               Action:
