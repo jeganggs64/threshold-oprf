@@ -101,7 +101,9 @@ fn print_usage() {
     eprintln!("  node-shares   Repeatable — reconstruct from admin shares, produce node shares");
     eprintln!("  verify        Cross-verify admin and node shares reconstruct the same key");
     eprintln!("  evaluate      Reconstruct key from admin shares and evaluate a blinded point");
-    eprintln!("  simulate      Full OPRF simulation: hash → blind → evaluate → unblind → derive ruonId");
+    eprintln!(
+        "  simulate      Full OPRF simulation: hash → blind → evaluate → unblind → derive ruonId"
+    );
     eprintln!();
     eprintln!("Run `toprf-keygen <COMMAND> --help` for details.");
 }
@@ -464,11 +466,17 @@ fn cmd_verify(args: &[String]) {
             "--help" | "-h" => {
                 eprintln!("Usage: toprf-keygen verify [OPTIONS]");
                 eprintln!();
-                eprintln!("Cross-verify that admin shares and node shares reconstruct the same key.");
+                eprintln!(
+                    "Cross-verify that admin shares and node shares reconstruct the same key."
+                );
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)");
-                eprintln!("  -n, --node-share <F>   Path to a node share JSON (repeat for threshold)");
+                eprintln!(
+                    "  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)"
+                );
+                eprintln!(
+                    "  -n, --node-share <F>   Path to a node share JSON (repeat for threshold)"
+                );
                 eprintln!("  -h, --help             Show this help");
                 return;
             }
@@ -585,8 +593,12 @@ fn cmd_evaluate(args: &[String]) {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -a, --admin-share <F>      Path to an admin share JSON (repeat for threshold)");
-                eprintln!("  -b, --blinded-point <HEX>  Blinded point to evaluate (compressed SEC1 hex)");
-                eprintln!("  -e, --expected <HEX>       Expected evaluation result (exits 1 on mismatch)");
+                eprintln!(
+                    "  -b, --blinded-point <HEX>  Blinded point to evaluate (compressed SEC1 hex)"
+                );
+                eprintln!(
+                    "  -e, --expected <HEX>       Expected evaluation result (exits 1 on mismatch)"
+                );
                 eprintln!("  -h, --help                 Show this help");
                 return;
             }
@@ -764,12 +776,11 @@ fn cmd_simulate(args: &[String]) {
     // Step 1: hash_to_curve(nationality, nationalId) → H
     eprintln!();
     eprintln!("[*] Step 1: hash_to_curve(\"{nationality}\", \"{national_id}\")");
-    let h = toprf_core::hash_to_curve::hash_to_curve(&nationality, &national_id).unwrap_or_else(
-        |e| {
+    let h =
+        toprf_core::hash_to_curve::hash_to_curve(&nationality, &national_id).unwrap_or_else(|e| {
             eprintln!("Error: hash_to_curve failed: {e}");
             std::process::exit(1);
-        },
-    );
+        });
     eprintln!("[*]   H = {}", point_to_hex(&h));
 
     // Step 2: blind — B = r * H
