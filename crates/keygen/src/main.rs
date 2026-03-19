@@ -657,7 +657,7 @@ fn cmd_evaluate(args: &[String]) {
     });
 
     // Evaluate: E = k * B
-    let evaluation = blinded_point * &*secret;
+    let evaluation = blinded_point * *secret;
     let eval_hex = point_to_hex(&evaluation);
 
     // Output to stdout (for scripting)
@@ -786,23 +786,23 @@ fn cmd_simulate(args: &[String]) {
     // Step 2: blind — B = r * H
     eprintln!("[*] Step 2: blind (B = r * H)");
     let r = Zeroizing::new(Scalar::random(&mut OsRng));
-    let blinded = h * &*r;
+    let blinded = h * *r;
     eprintln!("[*]   B = {}", point_to_hex(&blinded));
 
     // Step 3: evaluate — E = k * B
     eprintln!("[*] Step 3: evaluate (E = k * B)");
-    let evaluation = blinded * &*secret;
+    let evaluation = blinded * *secret;
     eprintln!("[*]   E = {}", point_to_hex(&evaluation));
 
     // Step 4: unblind — U = r^{-1} * E
     eprintln!("[*] Step 4: unblind (U = r^{{-1}} * E)");
     let r_inv = Zeroizing::new(r.invert().unwrap());
-    let unblinded = evaluation * &*r_inv;
+    let unblinded = evaluation * *r_inv;
     let unblinded_hex = point_to_hex(&unblinded);
     eprintln!("[*]   U = {unblinded_hex}");
 
     // Consistency check: U should equal k * H (direct computation)
-    let direct = h * &*secret;
+    let direct = h * *secret;
     assert_eq!(
         unblinded_hex,
         point_to_hex(&direct),
