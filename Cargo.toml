@@ -33,3 +33,4 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 zeroize = { version = "1", features = ["derive"] }
 crypto-bigint = "0.5"
+sha3 = "0.10"

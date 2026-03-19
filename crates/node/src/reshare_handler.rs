@@ -30,6 +30,17 @@ use toprf_core::reshare::{generate_recovery_contribution, SerializableReshareCon
 
 use crate::NodeState;
 
+/// Expected SEV-SNP measurement for reshare targets.
+///
+/// This is the SHA-384 hash of the VM firmware (AMI) computed by the AMD CPU
+/// at boot. Update this value when the AMI changes:
+///   1. Provision a test node with the new AMI
+///   2. Run `deploy.sh measure` to capture the new measurement
+///   3. Update this constant, rebuild, and push to ghcr.io
+///   4. Rotate all nodes (6 rotations: 3 to update image, 3 to update AMI)
+const EXPECTED_PEER_MEASUREMENT: &str =
+    "507e82d27ea5b951dd765a3eb31ba5f582673b301d6983ded482d3feb066cb68979f1f11fede97687374d3a25002a15f";
+
 /// Request body for POST /reshare.
 #[derive(Deserialize)]
 pub struct ReshareRequest {
@@ -115,14 +126,8 @@ pub async fn reshare_handler(
     let mut pubkey_arr = [0u8; 32];
     pubkey_arr.copy_from_slice(&pubkey_bytes);
 
-    // 6. Attestation verification (always required — measurement from node-local config)
-    let expected_measurement = std::env::var("EXPECTED_PEER_MEASUREMENT").map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "EXPECTED_PEER_MEASUREMENT env var not set — cannot verify reshare target".to_string(),
-        )
-            .into_response()
-    })?;
+    // 6. Attestation verification (always required — measurement compiled into binary)
+    let expected_measurement = EXPECTED_PEER_MEASUREMENT;
 
     // Decode attestation report and cert chain
     use base64::Engine;

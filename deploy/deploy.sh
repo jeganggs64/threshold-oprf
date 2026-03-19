@@ -113,6 +113,16 @@ info()  { echo "==> $*"; }
 warn()  { echo "  WARN: $*"; }
 die()   { echo "  ERROR: $*" >&2; exit 1; }
 
+# Write a key=value to a state file, replacing if the key already exists.
+set_state() {
+    local file="$1" key="$2" value="$3"
+    if grep -q "^${key}=" "$file" 2>/dev/null; then
+        sed -i.bak "s|^${key}=.*|${key}=${value}|" "$file" && rm -f "${file}.bak"
+    else
+        echo "${key}=${value}" >> "$file"
+    fi
+}
+
 # ─── Node lookup helpers (read from nodes.json) ─────────────────────────────
 
 _node_field() {
@@ -338,7 +348,7 @@ step_privatelink() {
                 --scheme internal \
                 --subnets "$subnet_id" "$second_subnet" \
                 --query 'LoadBalancers[0].LoadBalancerArn' --output text)
-            echo "${nlb_var}=${nlb_arn}" >> "$pl_state"
+            set_state "$pl_state" "$nlb_var" "$nlb_arn"
             aws elbv2 add-tags --region "$region" --resource-arns "$nlb_arn" \
                 --tags $(project_tags) 2>/dev/null || true
             echo "    NLB: $nlb_arn"
@@ -366,7 +376,7 @@ step_privatelink() {
             nlb_dns=$(aws elbv2 describe-load-balancers --region "$region" \
                 --load-balancer-arns "$nlb_arn" \
                 --query 'LoadBalancers[0].DNSName' --output text)
-            echo "${nlb_dns_var}=${nlb_dns}" >> "$pl_state"
+            set_state "$pl_state" "$nlb_dns_var" "$nlb_dns"
             eval "${nlb_dns_var}=${nlb_dns}"
             echo "    NLB DNS: $nlb_dns"
         else
@@ -408,7 +418,7 @@ step_privatelink() {
                 --healthy-threshold-count 2 \
                 --unhealthy-threshold-count 2 \
                 --query 'TargetGroups[0].TargetGroupArn' --output text)
-            echo "${tg_var}=${tg_arn}" >> "$pl_state"
+            set_state "$pl_state" "$tg_var" "$tg_arn"
             aws elbv2 add-tags --region "$region" --resource-arns "$tg_arn" \
                 --tags $(project_tags) 2>/dev/null || true
             echo "    TG: $tg_arn"
@@ -453,7 +463,7 @@ step_privatelink() {
                 --protocol TCP --port 3001 \
                 --default-actions "Type=forward,TargetGroupArn=${tg_arn}" \
                 --query 'Listeners[0].ListenerArn' --output text)
-            echo "${listener_var}=${listener_arn}" >> "$pl_state"
+            set_state "$pl_state" "$listener_var" "$listener_arn"
             echo "    Listener: $listener_arn"
         else
             echo "    Listener: exists"
@@ -470,7 +480,7 @@ step_privatelink() {
                 --output text 2>/dev/null)
             if [[ -n "$svc_id" && "$svc_id" != "None" ]]; then
                 echo "  Reusing existing VPC Endpoint Service: $svc_id"
-                echo "${svc_var}=${svc_id}" >> "$pl_state"
+                set_state "$pl_state" "$svc_var" "$svc_id"
             fi
         fi
         if [[ -z "$svc_id" || "$svc_id" == "None" ]]; then
@@ -480,7 +490,7 @@ step_privatelink() {
                 --network-load-balancer-arns "$nlb_arn" \
                 --no-acceptance-required \
                 --query 'ServiceConfiguration.ServiceId' --output text)
-            echo "${svc_var}=${svc_id}" >> "$pl_state"
+            set_state "$pl_state" "$svc_var" "$svc_id"
             aws ec2 create-tags --region "$region" --resources "$svc_id" \
                 --tags $(project_tags) 2>/dev/null || true
             echo "    Endpoint Service: $svc_id"
@@ -537,7 +547,7 @@ step_privatelink() {
                 --region "$region" \
                 --service-ids "$svc_id" \
                 --query 'ServiceConfigurations[0].ServiceName' --output text)
-            echo "${svc_name_var}=${svc_name}" >> "$pl_state"
+            set_state "$pl_state" "$svc_name_var" "$svc_name"
             eval "${svc_name_var}='${svc_name}'"
         fi
         echo "    Service name: $svc_name"
@@ -602,7 +612,7 @@ step_privatelink() {
                     --protocol tcp --port 3001 \
                     --cidr "$vpc_cidr" 2>/dev/null || true
             fi
-            echo "${sg_var}=${sg_id}" >> "$pl_state"
+            set_state "$pl_state" "$sg_var" "$sg_id"
             eval "${sg_var}=${sg_id}"
             aws ec2 create-tags --region "$my_region" --resources "$sg_id" \
                 --tags $(project_tags) 2>/dev/null || true
@@ -654,7 +664,7 @@ step_privatelink() {
                     --query "VpcEndpoints[?State!='deleted'] | [0].VpcEndpointId" --output text 2>/dev/null)
                 if [[ -n "$vpce_id" && "$vpce_id" != "None" ]]; then
                     echo "  Reusing existing VPCE for node $j in $my_vpc: $vpce_id"
-                    echo "${vpce_id_var}=${vpce_id}" >> "$pl_state"
+                    set_state "$pl_state" "$vpce_id_var" "$vpce_id"
                     eval "${vpce_id_var}=${vpce_id}"
                 else
                 echo "  Creating VPCE for node $j in $my_vpc ($my_region)..."
@@ -700,7 +710,7 @@ step_privatelink() {
                 vpce_id=$(aws ec2 create-vpc-endpoint \
                     "${vpce_args[@]}" \
                     --query 'VpcEndpoint.VpcEndpointId' --output text)
-                echo "${vpce_id_var}=${vpce_id}" >> "$pl_state"
+                set_state "$pl_state" "$vpce_id_var" "$vpce_id"
                 eval "${vpce_id_var}=${vpce_id}"
                 aws ec2 create-tags --region "$my_region" --resources "$vpce_id" \
                     --tags $(project_tags) 2>/dev/null || true
@@ -722,7 +732,7 @@ step_privatelink() {
                         --vpc-endpoint-ids "$vpce_id" \
                         --query 'VpcEndpoints[0].DnsEntries[0].DnsName' --output text 2>/dev/null)
                     if [[ -n "$vpce_dns" && "$vpce_dns" != "None" && "$vpce_dns" != "null" ]]; then
-                        echo "${vpce_dns_var}=${vpce_dns}" >> "$pl_state"
+                        set_state "$pl_state" "$vpce_dns_var" "$vpce_dns"
                         eval "${vpce_dns_var}='${vpce_dns}'"
                         break
                     fi
@@ -1021,13 +1031,9 @@ step_start() {
             echo "    Coordinator config uploaded"
         fi
 
-        # EXPECTED_PEER_MEASUREMENT: used by /reshare to verify target attestation
-        local peer_measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
-
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
             -e EXPECTED_VERIFICATION_SHARE=${vs} \
-            -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
             -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
             ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
@@ -1716,8 +1722,6 @@ step_rotate() {
 
     local vs
     vs=$(node_vs "$target_node")
-    local peer_measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
-
     # Regenerate coordinator configs for ALL nodes (uses updated nodes.json)
     step_coordinator_config
 
@@ -1736,7 +1740,6 @@ step_rotate() {
     _ssh_staging "sudo docker run -d --name toprf-node --restart=unless-stopped \
         -e SEALED_KEY_URL='${staging_sealed_url}' \
         -e EXPECTED_VERIFICATION_SHARE=${vs} \
-        -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
         -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
@@ -1858,7 +1861,6 @@ step_rotate() {
     _ssh_staging "sudo docker run -d --name toprf-node --restart=unless-stopped \
         -e SEALED_KEY_URL='${canonical_s3}' \
         -e EXPECTED_VERIFICATION_SHARE=${vs} \
-        -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
         -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
         ${coord_args} \
         --device /dev/sev-guest:/dev/sev-guest \
@@ -1897,7 +1899,6 @@ step_rotate() {
             ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
                 -e SEALED_KEY_URL='${other_url}' \
                 -e EXPECTED_VERIFICATION_SHARE=${other_vs} \
-                -e EXPECTED_PEER_MEASUREMENT='${peer_measurement}' \
                 -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
                 ${other_coord_args} \
                 --device /dev/sev-guest:/dev/sev-guest \
@@ -1985,7 +1986,7 @@ step_frontend_nlb() {
             --scheme internal \
             --subnets "$coord_subnet" "$second_subnet" \
             --query 'LoadBalancers[0].LoadBalancerArn' --output text)
-        echo "FRONTEND_NLB_ARN=${nlb_arn}" >> "$pl_state"
+        set_state "$pl_state" "FRONTEND_NLB_ARN" "$nlb_arn"
         aws elbv2 add-tags --region "$coord_region" --resource-arns "$nlb_arn" \
             --tags $(project_tags) 2>/dev/null || true
         echo "    NLB: $nlb_arn"
@@ -2011,7 +2012,7 @@ step_frontend_nlb() {
         nlb_dns=$(aws elbv2 describe-load-balancers --region "$coord_region" \
             --load-balancer-arns "$nlb_arn" \
             --query 'LoadBalancers[0].DNSName' --output text)
-        echo "FRONTEND_NLB_DNS=${nlb_dns}" >> "$pl_state"
+        set_state "$pl_state" "FRONTEND_NLB_DNS" "$nlb_dns"
         echo "    DNS: $nlb_dns"
     else
         echo "    DNS: $nlb_dns (exists)"
@@ -2033,7 +2034,7 @@ step_frontend_nlb() {
             --healthy-threshold-count 2 \
             --unhealthy-threshold-count 2 \
             --query 'TargetGroups[0].TargetGroupArn' --output text)
-        echo "FRONTEND_TG_ARN=${tg_arn}" >> "$pl_state"
+        set_state "$pl_state" "FRONTEND_TG_ARN" "$tg_arn"
         aws elbv2 add-tags --region "$coord_region" --resource-arns "$tg_arn" \
             --tags $(project_tags) 2>/dev/null || true
         echo "    TG: $tg_arn"
@@ -2100,7 +2101,7 @@ step_frontend_nlb() {
             --protocol TCP --port 3001 \
             --default-actions "Type=forward,TargetGroupArn=${tg_arn}" \
             --query 'Listeners[0].ListenerArn' --output text)
-        echo "FRONTEND_NLB_LISTENER=${listener_arn}" >> "$pl_state"
+        set_state "$pl_state" "FRONTEND_NLB_LISTENER" "$listener_arn"
         echo "    Listener: $listener_arn"
     else
         echo "    Listener: exists"
@@ -2295,19 +2296,6 @@ step_sync_state() {
         --overwrite \
         --region "$coord_region" > /dev/null
     echo "    Done."
-
-    # Push measurement
-    local measurement="${EXPECTED_PEER_MEASUREMENT:-${EXPECTED_MEASUREMENT:-}}"
-    if [[ -n "$measurement" ]]; then
-        echo "  Pushing measurement to ${ssm_prefix}/measurement..."
-        aws ssm put-parameter \
-            --name "${ssm_prefix}/measurement" \
-            --value "$measurement" \
-            --type String \
-            --overwrite \
-            --region "$coord_region" > /dev/null
-        echo "    Done."
-    fi
 
     # Push ARK fingerprint
     if [[ -n "${AMD_ARK_FINGERPRINT:-}" ]]; then

@@ -52,7 +52,7 @@ use zeroize::Zeroizing;
 
 use toprf_core::combine::lagrange_coefficient;
 use toprf_core::shamir::{share_to_scalar, split_key};
-use toprf_core::{point_to_hex, NodeKeyShare};
+use toprf_core::{hex_to_point, point_to_hex, NodeKeyShare};
 
 /// Write a file containing secret key material with restrictive permissions (0600).
 /// This ensures key shares and admin keys are not world-readable.
@@ -81,6 +81,9 @@ fn main() {
     match args[1].as_str() {
         "init" => cmd_init(&args[2..]),
         "node-shares" => cmd_node_shares(&args[2..]),
+        "verify" => cmd_verify(&args[2..]),
+        "evaluate" => cmd_evaluate(&args[2..]),
+        "simulate" => cmd_simulate(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             eprintln!();
@@ -96,6 +99,9 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  init          One-time — generate OPRF key + admin shares");
     eprintln!("  node-shares   Repeatable — reconstruct from admin shares, produce node shares");
+    eprintln!("  verify        Cross-verify admin and node shares reconstruct the same key");
+    eprintln!("  evaluate      Reconstruct key from admin shares and evaluate a blinded point");
+    eprintln!("  simulate      Full OPRF simulation: hash → blind → evaluate → unblind → derive ruonId");
     eprintln!();
     eprintln!("Run `toprf-keygen <COMMAND> --help` for details.");
 }
@@ -406,4 +412,430 @@ fn cmd_node_shares(args: &[String]) {
     eprintln!("[*] Load these shares into TEEs over attested TLS, then destroy the files.");
     eprintln!();
     eprintln!("[!] DESTROY THIS MACHINE. The secret key existed in memory during this process.");
+}
+
+/// Reconstruct the secret key from a set of key shares via Lagrange interpolation.
+fn reconstruct_key(shares: &[NodeKeyShare]) -> Zeroizing<Scalar> {
+    let node_ids: Vec<u16> = shares.iter().map(|s| s.node_id).collect();
+    let mut secret = Zeroizing::new(Scalar::ZERO);
+    for share in shares {
+        let scalar = Zeroizing::new(
+            share_to_scalar(share)
+                .unwrap_or_else(|e| panic!("invalid share for node {}: {e}", share.node_id)),
+        );
+        let lambda = lagrange_coefficient(share.node_id, &node_ids).unwrap_or_else(|e| {
+            panic!("lagrange coefficient error for node {}: {e}", share.node_id)
+        });
+        *secret += lambda * *scalar;
+    }
+    secret
+}
+
+/// Load share files from disk.
+fn load_shares(paths: &[String]) -> Vec<NodeKeyShare> {
+    let mut shares = Vec::new();
+    for path in paths {
+        let json =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+        let share: NodeKeyShare =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("failed to parse {path}: {e}"));
+        eprintln!("[*] Loaded share {} (node_id={})", path, share.node_id);
+        shares.push(share);
+    }
+    shares
+}
+
+/// Cross-verify that admin shares and node shares reconstruct the same key.
+fn cmd_verify(args: &[String]) {
+    let mut admin_share_files: Vec<String> = Vec::new();
+    let mut node_share_files: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--admin-share" | "-a" => {
+                i += 1;
+                admin_share_files.push(args[i].to_string());
+            }
+            "--node-share" | "-n" => {
+                i += 1;
+                node_share_files.push(args[i].to_string());
+            }
+            "--help" | "-h" => {
+                eprintln!("Usage: toprf-keygen verify [OPTIONS]");
+                eprintln!();
+                eprintln!("Cross-verify that admin shares and node shares reconstruct the same key.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)");
+                eprintln!("  -n, --node-share <F>   Path to a node share JSON (repeat for threshold)");
+                eprintln!("  -h, --help             Show this help");
+                return;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if admin_share_files.is_empty() || node_share_files.is_empty() {
+        eprintln!("Error: need at least --admin-share and --node-share arguments");
+        std::process::exit(1);
+    }
+
+    eprintln!("[*] Loading admin shares...");
+    let admin_shares = load_shares(&admin_share_files);
+    let admin_threshold = admin_shares[0].threshold;
+
+    if admin_shares.len() < admin_threshold as usize {
+        eprintln!(
+            "Error: need at least {} admin shares (got {})",
+            admin_threshold,
+            admin_shares.len()
+        );
+        std::process::exit(1);
+    }
+
+    eprintln!("[*] Loading node shares...");
+    let node_shares = load_shares(&node_share_files);
+    let node_threshold = node_shares[0].threshold;
+
+    if node_shares.len() < node_threshold as usize {
+        eprintln!(
+            "Error: need at least {} node shares (got {})",
+            node_threshold,
+            node_shares.len()
+        );
+        std::process::exit(1);
+    }
+
+    // Reconstruct from admin shares
+    eprintln!(
+        "[*] Reconstructing from {} admin shares (threshold={})...",
+        admin_shares.len(),
+        admin_threshold
+    );
+    let admin_secret = reconstruct_key(&admin_shares);
+    let admin_pk = ProjectivePoint::mul_by_generator(&*admin_secret);
+    let admin_pk_hex = point_to_hex(&admin_pk);
+    eprintln!("[*] Admin reconstruction → group public key: {admin_pk_hex}");
+
+    // Verify against share metadata
+    if admin_pk_hex != admin_shares[0].group_public_key {
+        eprintln!("FATAL: admin reconstruction does not match share metadata!");
+        eprintln!("  Metadata:       {}", admin_shares[0].group_public_key);
+        eprintln!("  Reconstructed:  {admin_pk_hex}");
+        std::process::exit(1);
+    }
+
+    // Reconstruct from node shares
+    eprintln!(
+        "[*] Reconstructing from {} node shares (threshold={})...",
+        node_shares.len(),
+        node_threshold
+    );
+    let node_secret = reconstruct_key(&node_shares);
+    let node_pk = ProjectivePoint::mul_by_generator(&*node_secret);
+    let node_pk_hex = point_to_hex(&node_pk);
+    eprintln!("[*] Node reconstruction → group public key: {node_pk_hex}");
+
+    // Compare
+    use k256::elliptic_curve::subtle::ConstantTimeEq;
+    if !bool::from(admin_secret.ct_eq(&*node_secret)) {
+        eprintln!();
+        eprintln!("FATAL: admin shares and node shares reconstruct DIFFERENT keys!");
+        eprintln!("  Admin group public key: {admin_pk_hex}");
+        eprintln!("  Node group public key:  {node_pk_hex}");
+        std::process::exit(1);
+    }
+
+    eprintln!();
+    eprintln!("[*] PASS: both share sets reconstruct the same key");
+    eprintln!("[*] Group public key: {admin_pk_hex}");
+}
+
+/// Reconstruct the key from admin shares and evaluate a blinded point.
+fn cmd_evaluate(args: &[String]) {
+    let mut admin_share_files: Vec<String> = Vec::new();
+    let mut blinded_point_hex: Option<String> = None;
+    let mut expected_hex: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--admin-share" | "-a" => {
+                i += 1;
+                admin_share_files.push(args[i].to_string());
+            }
+            "--blinded-point" | "-b" => {
+                i += 1;
+                blinded_point_hex = Some(args[i].to_string());
+            }
+            "--expected" | "-e" => {
+                i += 1;
+                expected_hex = Some(args[i].to_string());
+            }
+            "--help" | "-h" => {
+                eprintln!("Usage: toprf-keygen evaluate [OPTIONS]");
+                eprintln!();
+                eprintln!("Reconstruct the key from admin shares and evaluate a blinded point.");
+                eprintln!("Outputs the evaluation point (hex) to stdout.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -a, --admin-share <F>      Path to an admin share JSON (repeat for threshold)");
+                eprintln!("  -b, --blinded-point <HEX>  Blinded point to evaluate (compressed SEC1 hex)");
+                eprintln!("  -e, --expected <HEX>       Expected evaluation result (exits 1 on mismatch)");
+                eprintln!("  -h, --help                 Show this help");
+                return;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if admin_share_files.is_empty() {
+        eprintln!("Error: at least one --admin-share is required");
+        std::process::exit(1);
+    }
+    let blinded_hex = blinded_point_hex.unwrap_or_else(|| {
+        eprintln!("Error: --blinded-point is required");
+        std::process::exit(1);
+    });
+
+    // Load admin shares
+    eprintln!("[*] Loading admin shares...");
+    let admin_shares = load_shares(&admin_share_files);
+    let admin_threshold = admin_shares[0].threshold;
+
+    if admin_shares.len() < admin_threshold as usize {
+        eprintln!(
+            "Error: need at least {} admin shares (got {})",
+            admin_threshold,
+            admin_shares.len()
+        );
+        std::process::exit(1);
+    }
+
+    // Reconstruct key
+    eprintln!(
+        "[*] Reconstructing key from {} admin shares (threshold={})...",
+        admin_shares.len(),
+        admin_threshold
+    );
+    let secret = reconstruct_key(&admin_shares);
+    let pk = ProjectivePoint::mul_by_generator(&*secret);
+    let pk_hex = point_to_hex(&pk);
+    eprintln!("[*] Group public key: {pk_hex}");
+
+    // Verify reconstruction
+    if pk_hex != admin_shares[0].group_public_key {
+        eprintln!("FATAL: reconstructed key does not match share metadata!");
+        std::process::exit(1);
+    }
+
+    // Parse blinded point
+    let blinded_point = hex_to_point(&blinded_hex).unwrap_or_else(|e| {
+        eprintln!("Error: invalid blinded point: {e}");
+        std::process::exit(1);
+    });
+
+    // Evaluate: E = k * B
+    let evaluation = blinded_point * &*secret;
+    let eval_hex = point_to_hex(&evaluation);
+
+    // Output to stdout (for scripting)
+    println!("{eval_hex}");
+    eprintln!("[*] Evaluation: {eval_hex}");
+
+    // Compare with expected if provided
+    if let Some(expected) = expected_hex {
+        let expected = expected.trim().to_lowercase();
+        if eval_hex == expected {
+            eprintln!("[*] PASS: matches expected evaluation");
+        } else {
+            eprintln!();
+            eprintln!("FATAL: evaluation does not match expected!");
+            eprintln!("  Expected: {expected}");
+            eprintln!("  Got:      {eval_hex}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Simulate the full mobile app OPRF flow:
+///   hash_to_curve(nationality, nationalId) → H
+///   blind: B = r * H
+///   evaluate: E = k * B
+///   unblind: U = r^{-1} * E = k * H
+///   derive: ruonId = keccak256(U.x || U.y)
+fn cmd_simulate(args: &[String]) {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use sha3::Digest as _;
+
+    let mut admin_share_files: Vec<String> = Vec::new();
+    let mut nationality: Option<String> = None;
+    let mut national_id: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--admin-share" | "-a" => {
+                i += 1;
+                admin_share_files.push(args[i].to_string());
+            }
+            "--nationality" => {
+                i += 1;
+                nationality = Some(args[i].to_string());
+            }
+            "--national-id" => {
+                i += 1;
+                national_id = Some(args[i].to_string());
+            }
+            "--help" | "-h" => {
+                eprintln!("Usage: toprf-keygen simulate [OPTIONS]");
+                eprintln!();
+                eprintln!("Simulate the full mobile app OPRF flow locally.");
+                eprintln!("hash_to_curve → blind → evaluate → unblind → derive ruonId");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!(
+                    "  -a, --admin-share <F>    Path to an admin share JSON (repeat for threshold)"
+                );
+                eprintln!("  --nationality <STR>      Nationality (as passed to hashToCurve, e.g. \"Singapore\")");
+                eprintln!("  --national-id <STR>      National ID number (e.g. \"S1234567A\")");
+                eprintln!("  -h, --help               Show this help");
+                return;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if admin_share_files.is_empty() {
+        eprintln!("Error: at least one --admin-share is required");
+        std::process::exit(1);
+    }
+    let nationality = nationality.unwrap_or_else(|| {
+        eprintln!("Error: --nationality is required");
+        std::process::exit(1);
+    });
+    let national_id = national_id.unwrap_or_else(|| {
+        eprintln!("Error: --national-id is required");
+        std::process::exit(1);
+    });
+
+    // Load admin shares and reconstruct key
+    eprintln!("[*] Loading admin shares...");
+    let admin_shares = load_shares(&admin_share_files);
+    let admin_threshold = admin_shares[0].threshold;
+
+    if admin_shares.len() < admin_threshold as usize {
+        eprintln!(
+            "Error: need at least {} admin shares (got {})",
+            admin_threshold,
+            admin_shares.len()
+        );
+        std::process::exit(1);
+    }
+
+    eprintln!(
+        "[*] Reconstructing key from {} admin shares (threshold={})...",
+        admin_shares.len(),
+        admin_threshold
+    );
+    let secret = reconstruct_key(&admin_shares);
+    let pk = ProjectivePoint::mul_by_generator(&*secret);
+    let pk_hex = point_to_hex(&pk);
+    eprintln!("[*] Group public key: {pk_hex}");
+
+    if pk_hex != admin_shares[0].group_public_key {
+        eprintln!("FATAL: reconstructed key does not match share metadata!");
+        std::process::exit(1);
+    }
+
+    // Step 1: hash_to_curve(nationality, nationalId) → H
+    eprintln!();
+    eprintln!("[*] Step 1: hash_to_curve(\"{nationality}\", \"{national_id}\")");
+    let h = toprf_core::hash_to_curve::hash_to_curve(&nationality, &national_id).unwrap_or_else(
+        |e| {
+            eprintln!("Error: hash_to_curve failed: {e}");
+            std::process::exit(1);
+        },
+    );
+    eprintln!("[*]   H = {}", point_to_hex(&h));
+
+    // Step 2: blind — B = r * H
+    eprintln!("[*] Step 2: blind (B = r * H)");
+    let r = Zeroizing::new(Scalar::random(&mut OsRng));
+    let blinded = h * &*r;
+    eprintln!("[*]   B = {}", point_to_hex(&blinded));
+
+    // Step 3: evaluate — E = k * B
+    eprintln!("[*] Step 3: evaluate (E = k * B)");
+    let evaluation = blinded * &*secret;
+    eprintln!("[*]   E = {}", point_to_hex(&evaluation));
+
+    // Step 4: unblind — U = r^{-1} * E
+    eprintln!("[*] Step 4: unblind (U = r^{{-1}} * E)");
+    let r_inv = Zeroizing::new(r.invert().unwrap());
+    let unblinded = evaluation * &*r_inv;
+    let unblinded_hex = point_to_hex(&unblinded);
+    eprintln!("[*]   U = {unblinded_hex}");
+
+    // Consistency check: U should equal k * H (direct computation)
+    let direct = h * &*secret;
+    assert_eq!(
+        unblinded_hex,
+        point_to_hex(&direct),
+        "blind/unblind consistency check failed"
+    );
+    eprintln!("[*]   Consistency check: PASS (U == k * H)");
+
+    // Step 5: derive ruonId and identitySalt (matches app's deriveFromUnblinded)
+    eprintln!("[*] Step 5: derive ruonId = keccak256(U.x || U.y)");
+
+    let affine = unblinded.to_affine();
+    let encoded = affine.to_encoded_point(false); // uncompressed: 04 || x(32) || y(32)
+    let x_bytes = encoded.x().unwrap();
+    let y_bytes = encoded.y().unwrap();
+
+    // ruonId = keccak256(x || y)
+    let mut hasher = sha3::Keccak256::new();
+    hasher.update(x_bytes);
+    hasher.update(y_bytes);
+    let ruon_id_bytes = hasher.finalize();
+    let ruon_id = format!("0x{}", hex::encode(ruon_id_bytes));
+
+    // identitySalt = BigInt(keccak256("salt" || x || y))
+    let mut salt_hasher = sha3::Keccak256::new();
+    salt_hasher.update(b"salt");
+    salt_hasher.update(x_bytes);
+    salt_hasher.update(y_bytes);
+    let salt_bytes = salt_hasher.finalize();
+    let identity_salt = format!("0x{}", hex::encode(salt_bytes));
+
+    eprintln!();
+    eprintln!("╔═══════════════════════════════════════════════════════════════╗");
+    eprintln!("║  OPRF RESULT                                                 ║");
+    eprintln!("╠═══════════════════════════════════════════════════════════════╣");
+    eprintln!("║  Unblinded point:                                            ║");
+    eprintln!("║    {unblinded_hex}  ║");
+    eprintln!("║                                                              ║");
+    eprintln!("║  ruonId:                                                     ║");
+    eprintln!("║    {ruon_id}  ║");
+    eprintln!("║                                                              ║");
+    eprintln!("║  identitySalt:                                               ║");
+    eprintln!("║    {identity_salt}  ║");
+    eprintln!("╚═══════════════════════════════════════════════════════════════╝");
+
+    // Output ruonId to stdout for scripting
+    println!("{ruon_id}");
 }

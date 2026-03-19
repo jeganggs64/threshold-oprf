@@ -1,10 +1,9 @@
 """
 Rotation Lambda — automated single-node replacement via share recovery.
 
-Uses SSM Run Command for VM operations (Docker install, image pull, container
-management) instead of EC2 user data, giving step-by-step observability and
-error handling. Follows a staging-based approach: a new instance runs alongside
-the old node until verified healthy, then the swap happens atomically.
+Uses EC2 user data (cloud-init) for VM bootstrapping instead of SSM Run
+Command, eliminating the SSM agent attack surface. The node's only external
+interface is port 3001 (authenticated TOPRF API).
 
 Triggers:
   1. SNS notification from CloudWatch alarm (unhealthy node detected)
@@ -13,7 +12,6 @@ Triggers:
 
 Configuration is stored in SSM Parameter Store under /toprf/:
   /toprf/config          — JSON with node configs, threshold, image, etc.
-  /toprf/measurement     — expected binary measurement (hex)
   /toprf/coordinator-config/<node_id> — coordinator config JSON per node
 
 Environment variables:
@@ -39,18 +37,17 @@ SNS_RESULTS_TOPIC = os.environ.get("SNS_RESULTS_TOPIC", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 # Timeouts (seconds)
-SSM_AGENT_TIMEOUT = 300     # 5 min for SSM agent to come online
-DOCKER_SETUP_TIMEOUT = 300  # 5 min for Docker install + image pull
-ATTESTATION_TIMEOUT = 180   # 3 min for attestation to appear in S3
-RESHARE_TIMEOUT = 120       # 2 min for /reshare response from donor
-SEALED_TIMEOUT = 300        # 5 min for new node to combine + seal
-HEALTH_TIMEOUT = 120        # 2 min for new node to become healthy
-NLB_HEALTH_TIMEOUT = 120    # 2 min for NLB target to become healthy
-POLL_INTERVAL = 5           # seconds between polls
+BOOT_TIMEOUT = 420         # 7 min for instance boot + Docker setup + image pull
+ATTESTATION_TIMEOUT = 180  # 3 min for attestation to appear in S3
+RESHARE_TIMEOUT = 120      # 2 min for /reshare response from donor
+SEALED_TIMEOUT = 300       # 5 min for new node to combine + seal
+HEALTH_TIMEOUT = 120       # 2 min for new node to become healthy
+NLB_HEALTH_TIMEOUT = 120   # 2 min for NLB target to become healthy
+POLL_INTERVAL = 5          # seconds between polls
 
 
 # ---------------------------------------------------------------------------
-# Configuration (SSM Parameter Store)
+# Configuration (SSM Parameter Store — read-only, no agent needed)
 # ---------------------------------------------------------------------------
 
 def get_config():
@@ -58,13 +55,6 @@ def get_config():
     ssm = boto3.client("ssm")
     param = ssm.get_parameter(Name=f"{SSM_PREFIX}/config", WithDecryption=True)
     return json.loads(param["Parameter"]["Value"])
-
-
-def get_measurement():
-    """Load expected measurement from SSM."""
-    ssm = boto3.client("ssm")
-    param = ssm.get_parameter(Name=f"{SSM_PREFIX}/measurement")
-    return param["Parameter"]["Value"]
 
 
 def get_ark_fingerprint():
@@ -123,84 +113,86 @@ def _validate_shell_safe(value, name):
 
 
 # ---------------------------------------------------------------------------
-# SSM Run Command
+# EC2 User Data
 # ---------------------------------------------------------------------------
 
-def wait_for_ssm_agent(region, instance_id):
-    """Wait for the SSM agent on an instance to become online."""
-    ssm = boto3.client("ssm", region_name=region)
-    deadline = time.time() + SSM_AGENT_TIMEOUT
-    logger.info(f"Waiting for SSM agent on {instance_id}...")
+def build_user_data(
+    image, bucket, sealed_url, node_id, threshold, total,
+    group_public_key, ark_fingerprint, coordinator_config, vs,
+):
+    """Build a cloud-init user data script for the staging instance.
 
-    while time.time() < deadline:
-        try:
-            resp = ssm.describe_instance_information(
-                Filters=[{"Key": "InstanceIds", "Values": [instance_id]}]
-            )
-            if resp["InstanceInformationList"]:
-                if resp["InstanceInformationList"][0].get("PingStatus") == "Online":
-                    logger.info(f"SSM agent online: {instance_id}")
-                    return
-        except Exception:
-            pass
-        time.sleep(POLL_INTERVAL)
-
-    raise TimeoutError(
-        f"SSM agent not online on {instance_id} within {SSM_AGENT_TIMEOUT}s"
-    )
-
-
-def run_ssm_command(region, instance_id, commands, comment="", timeout=300):
-    """Execute shell commands on an instance via SSM Run Command.
-
-    Returns stdout on success, raises on failure or timeout.
+    The script runs at boot and handles the full lifecycle:
+      1. Install Docker
+      2. Pull node image
+      3. Start init-reshare (blocks until contributions arrive + seal completes)
+      4. Write coordinator config
+      5. Start normal mode container
     """
-    ssm = boto3.client("ssm", region_name=region)
-    if isinstance(commands, str):
-        commands = [commands]
+    # Escape single quotes in coordinator config for heredoc safety
+    coord_escaped = coordinator_config.replace("'", "'\\''")
 
-    if DRY_RUN:
-        logger.info(f"DRY_RUN: would run on {instance_id}: {commands[0][:80]}")
-        return ""
+    script = f"""#!/bin/bash
+set -euo pipefail
+exec > /var/log/toprf-init.log 2>&1
 
-    resp = ssm.send_command(
-        InstanceIds=[instance_id],
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": commands},
-        Comment=(comment or "toprf-rotation")[:100],
-        TimeoutSeconds=timeout,
-    )
-    command_id = resp["Command"]["CommandId"]
-    logger.info(f"SSM command {command_id}: {comment or commands[0][:50]}")
+echo "[$(date)] Installing Docker..."
+yum install -y docker
+systemctl enable --now docker
 
-    deadline = time.time() + timeout + 30  # extra buffer for API
-    while time.time() < deadline:
-        try:
-            result = ssm.get_command_invocation(
-                CommandId=command_id,
-                InstanceId=instance_id,
-            )
-            status = result["Status"]
-            if status == "Success":
-                return result.get("StandardOutputContent", "")
-            elif status in ("Failed", "TimedOut", "Cancelled"):
-                stderr = result.get("StandardErrorContent", "")
-                raise RuntimeError(
-                    f"SSM command failed ({status}): {stderr[:500]}"
-                )
-        except ssm.exceptions.InvocationDoesNotExist:
-            pass  # Not ready yet
-        time.sleep(POLL_INTERVAL)
+echo "[$(date)] Pulling image: {image}"
+docker pull {image}
 
-    raise TimeoutError(f"SSM command {command_id} timed out")
+echo "[$(date)] Starting init-reshare..."
+docker run --name toprf-init-reshare \
+    --device /dev/sev-guest:/dev/sev-guest \
+    --user root \
+    -e AMD_ARK_FINGERPRINT='{ark_fingerprint}' \
+    {image} \
+    --init-reshare \
+    --s3-bucket '{bucket}' \
+    --upload-url '{sealed_url}' \
+    --new-node-id {node_id} \
+    --new-threshold {threshold} \
+    --new-total-shares {total} \
+    --group-public-key '{group_public_key}' \
+    --min-contributions {threshold}
+
+EXIT_CODE=$?
+echo "[$(date)] init-reshare exited with code $EXIT_CODE"
+docker rm -f toprf-init-reshare 2>/dev/null || true
+
+if [ "$EXIT_CODE" -ne 0 ]; then
+    echo "[$(date)] FATAL: init-reshare failed"
+    exit 1
+fi
+
+echo "[$(date)] Writing coordinator config..."
+mkdir -p /etc/toprf
+cat > /etc/toprf/coordinator.json << 'COORD_EOF'
+{coordinator_config}
+COORD_EOF
+
+echo "[$(date)] Starting node in normal mode..."
+docker run -d --name toprf-node --restart=unless-stopped \
+    --device /dev/sev-guest:/dev/sev-guest \
+    --user root \
+    -p 3001:3001 \
+    -e SEALED_KEY_URL='{sealed_url}' \
+    -e EXPECTED_VERIFICATION_SHARE='{vs}' \
+    -e AMD_ARK_FINGERPRINT='{ark_fingerprint}' \
+    -v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro \
+    {image} \
+    --port 3001 \
+    --coordinator-config /etc/toprf/coordinator.json
+
+echo "[$(date)] Node started. Startup complete."
+"""
+    return script
 
 
-# ---------------------------------------------------------------------------
-# EC2 Operations
-# ---------------------------------------------------------------------------
-
-def launch_staging_instance(config, node):
-    """Launch a staging EC2 instance for rotation (no user data — SSM used)."""
+def launch_staging_instance(config, node, user_data):
+    """Launch a staging EC2 instance with user data (no SSM agent needed)."""
     region = node["region"]
     ec2 = boto3.client("ec2", region_name=region)
     node_id = node["id"]
@@ -208,8 +200,6 @@ def launch_staging_instance(config, node):
     instance_type = config.get("instance_type", "c6a.large")
     iam_profile = f"toprf-node-{node_id}-profile"
 
-    # Use pinned AMI from node config (set at provision time).
-    # Keeps the SEV-SNP measurement stable across rotations.
     ami_id = node.get("ami_id")
     if not ami_id:
         raise ValueError(
@@ -233,6 +223,9 @@ def launch_staging_instance(config, node):
         logger.info("DRY_RUN: skipping instance launch")
         return "i-dry-run-placeholder"
 
+    # Encode user data as base64
+    user_data_b64 = base64.b64encode(user_data.encode()).decode()
+
     response = ec2.run_instances(
         ImageId=ami_id,
         InstanceType=instance_type,
@@ -243,6 +236,7 @@ def launch_staging_instance(config, node):
         IamInstanceProfile={"Name": iam_profile},
         CpuOptions={"AmdSevSnp": "enabled"},
         MetadataOptions={"HttpPutResponseHopLimit": 2},
+        UserData=user_data_b64,
         BlockDeviceMappings=[{
             "DeviceName": "/dev/xvda",
             "Ebs": {"VolumeSize": 50, "VolumeType": "gp3"},
@@ -430,26 +424,31 @@ def check_donor_health(donor_node):
     return False
 
 
-def check_staging_health_via_ssm(region, instance_id, timeout=HEALTH_TIMEOUT):
-    """Health-check a staging node via SSM (runs curl loop on instance).
+def check_staging_health(staging_ip, timeout=HEALTH_TIMEOUT):
+    """Health-check a staging node via direct HTTP to its private IP."""
+    import urllib.request
 
-    Efficient: one SSM call with internal polling instead of repeated SSM calls.
-    """
-    attempts = timeout // 2
-    try:
-        result = run_ssm_command(region, instance_id, [
-            f"for i in $(seq 1 {attempts}); do "
-            f"  if curl -sf http://localhost:3001/health 2>/dev/null "
-            f"    | grep -q ready; then "
-            f"    echo HEALTHY; exit 0; "
-            f"  fi; "
-            f"  sleep 2; "
-            f"done; "
-            f"echo NOT_HEALTHY; exit 1",
-        ], comment="Health check loop", timeout=timeout + 30)
-        return "HEALTHY" in result
-    except RuntimeError:
-        return False
+    url = f"http://{staging_ip}:3001/health"
+    deadline = time.time() + timeout
+    logger.info(f"Waiting for staging node at {url}...")
+
+    if DRY_RUN:
+        return True
+
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = json.loads(resp.read().decode())
+                if body.get("status") == "ready":
+                    logger.info(f"Staging node healthy at {staging_ip}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(POLL_INTERVAL)
+
+    logger.warning(f"Staging node not healthy after {timeout}s")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -521,9 +520,9 @@ def orchestrate_reshare(config, node_id, bucket, region):
     pubkey = download_s3_object(bucket, "reshare/pubkey.bin", region)
     certs = download_s3_object(bucket, "reshare/certs.bin", region)
 
-    # expected_measurement is not sent — each donor reads it from its own
-    # EXPECTED_PEER_MEASUREMENT env var, so a compromised orchestrator
-    # cannot substitute a rogue measurement.
+    # expected_measurement is not sent — each donor checks against its own
+    # compiled-in measurement, so a compromised orchestrator cannot
+    # substitute a rogue measurement.
     reshare_payload = {
         "target_pubkey": pubkey.hex(),
         "attestation_report": base64.b64encode(attestation).decode(),
@@ -552,34 +551,7 @@ def orchestrate_reshare(config, node_id, bucket, region):
 
 
 # ---------------------------------------------------------------------------
-# Docker Command Builders
-# ---------------------------------------------------------------------------
-
-def _build_docker_run_cmd(
-    name, image, args, env=None, volumes=None, detach=True, port=None,
-):
-    """Build a docker run command string with security options."""
-    parts = ["docker run"]
-    if detach:
-        parts.append("-d")
-    parts.extend(["--name", name, "--restart=unless-stopped"])
-    parts.extend([
-        "--device /dev/sev-guest:/dev/sev-guest",
-        "--user root",
-    ])
-    if port:
-        parts.append(f"-p {port}:{port}")
-    for k, v in (env or {}).items():
-        parts.append(f"-e {k}='{v}'")
-    for v in (volumes or []):
-        parts.append(f"-v {v}")
-    parts.append(image)
-    parts.extend(args)
-    return " ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# Single-Node Rotation (Staging-Based)
+# Single-Node Rotation (Staging-Based, SSM-Free)
 # ---------------------------------------------------------------------------
 
 def rotate_node(config, node_id):
@@ -589,17 +561,19 @@ def rotate_node(config, node_id):
     Old node continues serving traffic throughout. If anything fails,
     the staging instance is terminated and the old node is unaffected.
 
+    All VM bootstrapping is done via EC2 user data (cloud-init) — no SSM
+    Run Command, no SSH. The node's only interface is port 3001 (TOPRF API).
+
     Steps:
       1. Pre-flight: verify donor nodes are healthy
       2. Clean up stale reshare/staging artifacts
-      3. Launch staging instance (no user data — SSM used)
-      4. Setup staging VM: install Docker, pull image (via SSM)
-      5. Start init-reshare on staging (via SSM)
-      6. Orchestrate reshare: attestation -> /reshare to donors -> contributions
-      7. Wait for staging node to seal
-      8. Start normal mode on staging, health-check (via SSM)
-      9. Swap NLB targets (per-node + frontend)
-      10. Terminate old, retag staging, rename S3 blob, update config
+      3. Launch staging instance with user data
+      4. Wait for attestation artifacts in S3
+      5. Orchestrate reshare: /reshare to donors, upload contributions
+      6. Wait for sealed blob in S3 (init-reshare done)
+      7. Health-check staging node via direct HTTP
+      8. Swap NLB targets (per-node + frontend)
+      9. Terminate old, retag staging, update config
     """
     node = next(n for n in config["nodes"] if n["id"] == node_id)
     bucket = node["s3_bucket"]
@@ -612,7 +586,6 @@ def rotate_node(config, node_id):
         config.get("node_image", "ghcr.io/jeganggs64/toprf-node:latest"),
         "node_image",
     )
-    measurement = _validate_shell_safe(get_measurement(), "measurement")
     ark_fingerprint = _validate_shell_safe(get_ark_fingerprint(), "ark_fingerprint")
     threshold = int(config["threshold"])
     total = len(config["nodes"])
@@ -620,10 +593,8 @@ def rotate_node(config, node_id):
         config["group_public_key"], "gpk"
     )
 
-    staging_sealed_key = f"node-{node_id}-staging-sealed.bin"
-    staging_sealed_url = f"s3://{bucket}/{staging_sealed_key}"
-    canonical_sealed_key = f"node-{node_id}-sealed.bin"
-    canonical_sealed_url = f"s3://{bucket}/{canonical_sealed_key}"
+    sealed_key = f"node-{node_id}-sealed.bin"
+    sealed_url = f"s3://{bucket}/{sealed_key}"
 
     vs = node.get("verification_share", "")
     if vs:
@@ -644,143 +615,70 @@ def rotate_node(config, node_id):
     # ── Step 2: Clean up stale artifacts ──
     logger.info("Step 2: Cleaning stale artifacts")
     cleanup_reshare_artifacts(bucket, region)
-    s3 = _s3_client_for_bucket()
-    try:
-        s3.delete_object(Bucket=bucket, Key=staging_sealed_key)
-    except Exception:
-        pass
 
-    # ── Step 3: Launch staging instance ──
+    # ── Step 3: Launch staging instance with user data ──
     logger.info("Step 3: Launching staging instance")
-    staging_id = launch_staging_instance(config, node)
+
+    coord_config = get_coordinator_config(node_id)
+    user_data = build_user_data(
+        image=image,
+        bucket=bucket,
+        sealed_url=sealed_url,
+        node_id=node_id,
+        threshold=threshold,
+        total=total,
+        group_public_key=group_public_key,
+        ark_fingerprint=ark_fingerprint,
+        coordinator_config=coord_config,
+        vs=vs,
+    )
+
+    staging_id = launch_staging_instance(config, node, user_data)
     staging_ip = wait_for_instance(region, staging_id)
 
     try:
-        # ── Step 4: Setup staging VM via SSM ──
-        logger.info("Step 4: Setting up staging VM via SSM")
-        wait_for_ssm_agent(region, staging_id)
+        # ── Step 4: Wait for attestation artifacts ──
+        logger.info("Step 4: Waiting for attestation artifacts in S3")
 
-        run_ssm_command(
-            region, staging_id,
-            ["yum install -y docker && systemctl enable --now docker"],
-            comment=f"Install Docker on node-{node_id}-staging",
-            timeout=DOCKER_SETUP_TIMEOUT,
-        )
-        logger.info("  Docker installed")
+        # User data installs Docker + pulls image first (~2-4 min),
+        # then starts init-reshare which uploads attestation to S3.
+        # Use a longer timeout to account for boot + Docker setup.
+        for key in [
+            "reshare/attestation.bin",
+            "reshare/pubkey.bin",
+            "reshare/certs.bin",
+        ]:
+            if not wait_for_s3_object(bucket, key, region, BOOT_TIMEOUT):
+                raise TimeoutError(
+                    f"Timed out waiting for {key} in s3://{bucket} "
+                    f"(includes boot + Docker setup time)"
+                )
 
-        run_ssm_command(
-            region, staging_id,
-            [f"docker pull {image}"],
-            comment=f"Pull image on node-{node_id}-staging",
-            timeout=DOCKER_SETUP_TIMEOUT,
-        )
-        logger.info(f"  Image pulled: {image}")
-
-        # ── Step 5: Start init-reshare ──
-        logger.info("Step 5: Starting init-reshare on staging")
-        _validate_shell_safe(bucket, "bucket")
-
-        init_cmd = _build_docker_run_cmd(
-            "toprf-init-reshare", image,
-            args=[
-                "--init-reshare",
-                f"--s3-bucket {bucket}",
-                f"--upload-url {staging_sealed_url}",
-                f"--new-node-id {node_id}",
-                f"--new-threshold {threshold}",
-                f"--new-total-shares {total}",
-                f"--group-public-key {group_public_key}",
-                f"--min-contributions {threshold}",
-            ],
-            env={"AMD_ARK_FINGERPRINT": ark_fingerprint},
-        )
-        run_ssm_command(
-            region, staging_id, [init_cmd],
-            comment=f"Init-reshare on node-{node_id}-staging",
-        )
-
-        # ── Step 6: Orchestrate reshare ──
-        logger.info("Step 6: Orchestrating reshare")
+        # ── Step 5: Orchestrate reshare ──
+        logger.info("Step 5: Orchestrating reshare")
         orchestrate_reshare(config, node_id, bucket, region)
 
-        # ── Step 7: Wait for seal ──
-        logger.info("Step 7: Waiting for init-reshare to complete")
-        try:
-            exit_code = run_ssm_command(
-                region, staging_id,
-                ["docker wait toprf-init-reshare"],
-                comment=f"Wait init-reshare node-{node_id}",
-                timeout=SEALED_TIMEOUT,
-            )
-            exit_code = exit_code.strip()
-            if exit_code != "0":
-                logs = run_ssm_command(
-                    region, staging_id,
-                    ["docker logs --tail 30 toprf-init-reshare 2>&1"],
-                    comment="Get init-reshare logs",
-                )
-                raise RuntimeError(
-                    f"Init-reshare exited {exit_code}: {logs[:500]}"
-                )
-        except TimeoutError:
-            raise TimeoutError("Init-reshare timed out waiting for seal")
-
-        if not wait_for_s3_object(bucket, staging_sealed_key, region, 30):
+        # ── Step 6: Wait for sealed blob ──
+        logger.info("Step 6: Waiting for sealed blob in S3")
+        if not wait_for_s3_object(bucket, sealed_key, region, SEALED_TIMEOUT):
             raise TimeoutError(
-                "Sealed blob not found after init-reshare completed"
+                "Sealed blob not found — init-reshare may have failed. "
+                "Check /var/log/toprf-init.log on the instance."
             )
         logger.info("  Sealed blob uploaded")
 
-        run_ssm_command(
-            region, staging_id,
-            ["docker rm -f toprf-init-reshare 2>/dev/null || true"],
-            comment="Cleanup init-reshare container",
-        )
+        # ── Step 7: Health check via HTTP ──
+        logger.info("Step 7: Health-checking staging node via HTTP")
 
-        # ── Step 8: Start normal mode ──
-        logger.info("Step 8: Starting staging node in normal mode")
-
-        # Reuse the existing coordinator config (same VPC, same PrivateLink
-        # endpoints — only the instance behind the NLB changed)
-        coord_config = get_coordinator_config(node_id)
-
-        # Write coordinator config + start node via SSM
-        node_cmd = _build_docker_run_cmd(
-            "toprf-node", image,
-            args=[
-                "--port 3001",
-                "--coordinator-config /etc/toprf/coordinator.json",
-            ],
-            env={
-                "SEALED_KEY_URL": staging_sealed_url,
-                "EXPECTED_VERIFICATION_SHARE": vs,
-                "EXPECTED_PEER_MEASUREMENT": measurement,
-                "AMD_ARK_FINGERPRINT": ark_fingerprint,
-            },
-            volumes=[
-                "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
-            ],
-            port=3001,
-        )
-        run_ssm_command(
-            region, staging_id,
-            [
-                "mkdir -p /etc/toprf",
-                f"cat > /etc/toprf/coordinator.json << 'COORD_EOF'\n"
-                f"{coord_config}\nCOORD_EOF",
-                node_cmd,
-            ],
-            comment=f"Start node-{node_id} normal mode",
-        )
-
-        # Health check via SSM
-        if not check_staging_health_via_ssm(region, staging_id):
+        # After init-reshare completes, the user data script starts the
+        # normal mode container. Give it a moment to boot.
+        if not check_staging_health(staging_ip):
             raise TimeoutError(
                 "Staging node not healthy after starting normal mode"
             )
 
-        # ── Step 9: Swap NLB targets ──
-        logger.info("Step 9: Swapping NLB targets")
+        # ── Step 8: Swap NLB targets ──
+        logger.info("Step 8: Swapping NLB targets")
 
         # Per-node NLB
         if tg_arn:
@@ -803,8 +701,8 @@ def rotate_node(config, node_id):
                 f"frontend NLB (node {node_id})",
             )
 
-        # ── Step 10: Finalize ──
-        logger.info("Step 10: Finalizing")
+        # ── Step 9: Finalize ──
+        logger.info("Step 9: Finalizing")
 
         # Terminate old instance
         if old_instance:
@@ -813,65 +711,13 @@ def rotate_node(config, node_id):
         # Retag staging -> permanent
         retag_instance(region, staging_id, f"toprf-node-{node_id}")
 
-        # Copy sealed blob: staging -> canonical, then delete staging
-        s3.copy_object(
-            Bucket=bucket,
-            Key=canonical_sealed_key,
-            CopySource={"Bucket": bucket, "Key": staging_sealed_key},
-        )
-        try:
-            s3.head_object(Bucket=bucket, Key=canonical_sealed_key)
-            s3.delete_object(Bucket=bucket, Key=staging_sealed_key)
-            logger.info(
-                f"Sealed blob renamed: "
-                f"{staging_sealed_key} -> {canonical_sealed_key}"
-            )
-        except ClientError:
-            logger.warning(
-                "Could not verify sealed blob copy — "
-                "keeping staging blob as backup"
-            )
-
-        # Restart container with canonical sealed URL
-        node_cmd_canonical = _build_docker_run_cmd(
-            "toprf-node", image,
-            args=[
-                "--port 3001",
-                "--coordinator-config /etc/toprf/coordinator.json",
-            ],
-            env={
-                "SEALED_KEY_URL": canonical_sealed_url,
-                "EXPECTED_VERIFICATION_SHARE": vs,
-                "EXPECTED_PEER_MEASUREMENT": measurement,
-                "AMD_ARK_FINGERPRINT": ark_fingerprint,
-            },
-            volumes=[
-                "/etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro",
-            ],
-            port=3001,
-        )
-        run_ssm_command(
-            region, staging_id,
-            [
-                "docker rm -f toprf-node 2>/dev/null || true",
-                node_cmd_canonical,
-            ],
-            comment=f"Restart node-{node_id} with canonical sealed URL",
-        )
-
-        # Verify health after restart
-        if not check_staging_health_via_ssm(region, staging_id):
-            logger.warning(
-                "Node not healthy after restart — may need manual check"
-            )
-
         # Update SSM config with new instance info
         update_node_config(config, node_id, {
             "instance_id": staging_id,
             "private_ip": staging_ip,
         })
 
-        # Clean up
+        # Clean up reshare artifacts
         cleanup_reshare_artifacts(bucket, region)
 
         logger.info(f"=== Node {node_id} rotation complete ===")
