@@ -29,7 +29,7 @@ lambda/
   handlers/   API Lambda functions (challenge, attest, evaluate)
   rotation/   Automated rotation Lambda (SAM template)
 deploy/       Deployment scripts (provision.sh, deploy.sh)
-scripts/      Dev utilities (integration-test.sh, gen-certs.sh)
+scripts/      Dev utilities (integration-test.sh)
 ```
 
 ## Prerequisites
