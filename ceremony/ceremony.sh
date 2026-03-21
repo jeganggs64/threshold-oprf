@@ -241,80 +241,12 @@ if [[ $FROM_STEP -le 3 ]]; then
     info "Verification passed. Group public key: $GROUP_PK"
 fi
 
-# ─── Step 4: Print admin shares ────────────────────────────────────────────
+# ─── Step 4: Connect to network ────────────────────────────────────────────
 
 if [[ $FROM_STEP -le 4 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 4: Print admin shares"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    GROUP_PK=$(jq -r '.group_public_key' "$NODE_DIR/public-config.json")
-    CEREMONY_DATE=$(date -u +%Y-%m-%d)
-
-    for i in $(seq 1 "$ADMIN_SHARES"); do
-        SHARE_FILE="$ADMIN_DIR/admin-${i}.json"
-        echo "  Printing admin share $i of $ADMIN_SHARES..."
-
-        # Generate QR code
-        qrencode -t PNG -o "/tmp/ceremony-qr-${i}.png" -8 -s 6 < "$SHARE_FILE"
-
-        # Render header as image
-        HEADER="════════════════════════════════════════
-  TOPRF ADMIN KEY SHARE ${i} of ${ADMIN_SHARES}
-  Threshold: ${ADMIN_THRESHOLD}-of-${ADMIN_SHARES}
-  Group Public Key:
-  ${GROUP_PK}
-  Date: ${CEREMONY_DATE}
-════════════════════════════════════════"
-
-        convert -size 535x -font Courier -pointsize 13 \
-            -background white -fill black \
-            caption:"$HEADER" \
-            /tmp/ceremony-header-${i}.png
-
-        # Render plain text share as image
-        SHARE_TEXT="--- PLAIN TEXT ---
-
-$(cat "$SHARE_FILE")
-
-════════════════════════════════════════
-  END OF SHARE ${i}
-════════════════════════════════════════"
-
-        convert -size 535x -font Courier -pointsize 10 \
-            -background white -fill black \
-            caption:"$SHARE_TEXT" \
-            /tmp/ceremony-text-${i}.png
-
-        # Compose single page: header + QR + plain text (stacked vertically)
-        convert \
-            /tmp/ceremony-header-${i}.png \
-            \( /tmp/ceremony-qr-${i}.png -gravity center \) \
-            /tmp/ceremony-text-${i}.png \
-            -gravity center -append \
-            -bordercolor white -border 30x30 \
-            /tmp/ceremony-page-${i}.pdf
-
-        lp_cmd /tmp/ceremony-page-${i}.pdf
-
-        # Cleanup temp files
-        rm -f /tmp/ceremony-qr-${i}.png /tmp/ceremony-header-${i}.png \
-              /tmp/ceremony-text-${i}.png /tmp/ceremony-page-${i}.pdf
-    done
-
-    echo ""
-    info "All $ADMIN_SHARES admin shares printed."
-    echo "  Verify all pages printed correctly before continuing."
-    confirm "Have all shares printed correctly?"
-fi
-
-# ─── Step 5: Connect to network ────────────────────────────────────────────
-
-if [[ $FROM_STEP -le 5 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 5: Connect to network"
+    info "STEP 4: Connect to network"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     echo "  Connect the Raspberry Pi to the network now."
@@ -327,12 +259,12 @@ if [[ $FROM_STEP -le 5 ]]; then
     echo "  Network connectivity verified."
 fi
 
-# ─── Step 6: Configure AWS ─────────────────────────────────────────────────
+# ─── Step 5: Configure AWS ─────────────────────────────────────────────────
 
-if [[ $FROM_STEP -le 6 ]]; then
+if [[ $FROM_STEP -le 5 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 6: Configure AWS credentials"
+    info "STEP 5: Configure AWS credentials"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     source "$CEREMONY_ENV"
@@ -344,12 +276,12 @@ if [[ $FROM_STEP -le 6 ]]; then
     info "AWS credentials configured."
 fi
 
-# ─── Step 7: Init-seal + start nodes ───────────────────────────────────────
+# ─── Step 6: Init-seal + start nodes ───────────────────────────────────────
 
-if [[ $FROM_STEP -le 7 ]]; then
+if [[ $FROM_STEP -le 6 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 7: Deploy key shares to nodes (init-seal + start)"
+    info "STEP 6: Deploy key shares to nodes (init-seal + start)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # Load ceremony.env and config.env if not already loaded
@@ -403,7 +335,7 @@ if [[ $FROM_STEP -le 7 ]]; then
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
-            -e EXPECTED_VERIFICATION_SHARE=${vs} \
+            -e EXPECTED_VERIFICATION_SHARE='${vs}' \
             --device /dev/sev-guest:/dev/sev-guest \
             --user root \
             ${NODE_IMAGE} \
@@ -521,7 +453,7 @@ if [[ $FROM_STEP -le 7 ]]; then
 
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
             -e SEALED_KEY_URL='${url}' \
-            -e EXPECTED_VERIFICATION_SHARE=${vs} \
+            -e EXPECTED_VERIFICATION_SHARE='${vs}' \
             -e AMD_ARK_FINGERPRINT='${AMD_ARK_FINGERPRINT:-}' \
             ${coord_args} \
             --device /dev/sev-guest:/dev/sev-guest \
@@ -562,12 +494,12 @@ if [[ $FROM_STEP -le 7 ]]; then
     fi
 fi
 
-# ─── Step 8: Verify nodes serve correct key ─────────────────────────────────
+# ─── Step 7: Verify nodes serve correct key ─────────────────────────────────
 
-if [[ $FROM_STEP -le 8 ]]; then
+if [[ $FROM_STEP -le 7 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 8: Verify nodes serve correct group public key"
+    info "STEP 7: Verify nodes serve correct group public key"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && source "$CEREMONY_ENV" && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
@@ -628,12 +560,12 @@ if [[ $FROM_STEP -le 8 ]]; then
     fi
 fi
 
-# ─── Step 9: Shred node shares ─────────────────────────────────────────────
+# ─── Step 8: Shred node shares ─────────────────────────────────────────────
 
-if [[ $FROM_STEP -le 9 ]]; then
+if [[ $FROM_STEP -le 8 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 9: Shred node shares from disk"
+    info "STEP 8: Shred node shares from disk"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ -d "$NODE_DIR" ]]; then
@@ -652,12 +584,12 @@ if [[ $FROM_STEP -le 9 ]]; then
     fi
 fi
 
-# ─── Step 10: Disconnect from network ──────────────────────────────────────
+# ─── Step 9: Disconnect from network ──────────────────────────────────────
 
-if [[ $FROM_STEP -le 10 ]]; then
+if [[ $FROM_STEP -le 9 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 10: Disconnect from network"
+    info "STEP 9: Disconnect from network"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     echo "  Disconnect the Raspberry Pi from the network now."
@@ -665,12 +597,12 @@ if [[ $FROM_STEP -le 10 ]]; then
     confirm "Is the network disconnected?"
 fi
 
-# ─── Step 11: Local OPRF verification ──────────────────────────────────────
+# ─── Step 10: Local OPRF verification ──────────────────────────────────────
 
-if [[ $FROM_STEP -le 11 ]]; then
+if [[ $FROM_STEP -le 10 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 11: Local OPRF simulation"
+    info "STEP 10: Local OPRF simulation"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     source "$CEREMONY_ENV"
@@ -699,6 +631,74 @@ if [[ $FROM_STEP -le 11 ]]; then
     echo "  Now onboard with the same identity on your mobile device."
     echo "  The app's ruonId should match the result above."
     confirm "Does the ruonId match?"
+fi
+
+# ─── Step 11: Print admin shares ──────────────────────────────────────────
+
+if [[ $FROM_STEP -le 11 ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "STEP 11: Print admin shares"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    GROUP_PK=$(jq -r '.group_public_key' "$NODE_DIR/public-config.json")
+    CEREMONY_DATE=$(date -u +%Y-%m-%d)
+
+    for i in $(seq 1 "$ADMIN_SHARES"); do
+        SHARE_FILE="$ADMIN_DIR/admin-${i}.json"
+        echo "  Printing admin share $i of $ADMIN_SHARES..."
+
+        # Generate QR code
+        qrencode -t PNG -o "/tmp/ceremony-qr-${i}.png" -8 -s 6 < "$SHARE_FILE"
+
+        # Render header as image
+        HEADER="════════════════════════════════════════
+  TOPRF ADMIN KEY SHARE ${i} of ${ADMIN_SHARES}
+  Threshold: ${ADMIN_THRESHOLD}-of-${ADMIN_SHARES}
+  Group Public Key:
+  ${GROUP_PK}
+  Date: ${CEREMONY_DATE}
+════════════════════════════════════════"
+
+        convert -size 535x -font Courier -pointsize 13 \
+            -background white -fill black \
+            caption:"$HEADER" \
+            /tmp/ceremony-header-${i}.png
+
+        # Render plain text share as image
+        SHARE_TEXT="--- PLAIN TEXT ---
+
+$(cat "$SHARE_FILE")
+
+════════════════════════════════════════
+  END OF SHARE ${i}
+════════════════════════════════════════"
+
+        convert -size 535x -font Courier -pointsize 10 \
+            -background white -fill black \
+            caption:"$SHARE_TEXT" \
+            /tmp/ceremony-text-${i}.png
+
+        # Compose single page: header + QR + plain text (stacked vertically)
+        convert \
+            /tmp/ceremony-header-${i}.png \
+            \( /tmp/ceremony-qr-${i}.png -gravity center \) \
+            /tmp/ceremony-text-${i}.png \
+            -gravity center -append \
+            -bordercolor white -border 30x30 \
+            /tmp/ceremony-page-${i}.pdf
+
+        lp_cmd /tmp/ceremony-page-${i}.pdf
+
+        # Cleanup temp files
+        rm -f /tmp/ceremony-qr-${i}.png /tmp/ceremony-header-${i}.png \
+              /tmp/ceremony-text-${i}.png /tmp/ceremony-page-${i}.pdf
+    done
+
+    echo ""
+    info "All $ADMIN_SHARES admin shares printed."
+    echo "  Verify all pages printed correctly before continuing."
+    confirm "Have all shares printed correctly?"
 fi
 
 # ─── Step 12: Shred admin shares ───────────────────────────────────────────

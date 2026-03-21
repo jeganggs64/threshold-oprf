@@ -33,3 +33,6 @@ docker/coordinator-node-*.json
 # Private keys
 *.key
 *.pem
+
+# SSH keys
+deploy/*.pem

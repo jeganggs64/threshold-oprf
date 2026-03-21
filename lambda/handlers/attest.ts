@@ -22,10 +22,15 @@ export async function handler(event: any) {
     // Detect platform from request body
     if (body.integrityToken) {
       // ── Android: verify Play Integrity token ──
+      const deviceUUID = body.deviceUUID || "";
+      if (deviceUUID && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(deviceUUID)) {
+        return error(400, "Invalid deviceUUID format");
+      }
+
       const deviceId = await getPlayProvider().verify(
         Buffer.from(JSON.stringify({
           integrityToken: body.integrityToken,
-          deviceUUID: body.deviceUUID || "",
+          deviceUUID: deviceUUID,
         })).toString("base64"),
         nonce,
       );

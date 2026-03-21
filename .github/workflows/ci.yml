@@ -71,6 +71,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v5
       - uses: docker/login-action@v3
@@ -86,3 +87,9 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/toprf-node:latest
             ghcr.io/${{ github.repository_owner }}/toprf-node:${{ github.sha }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign container image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes ghcr.io/${{ github.repository_owner }}/toprf-node:${{ github.sha }}

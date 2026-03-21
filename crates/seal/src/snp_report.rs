@@ -49,18 +49,26 @@ pub struct SnpReport {
 }
 
 /// Read a little-endian u32 from a byte slice at the given offset.
-fn read_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+fn read_u32(data: &[u8], offset: usize) -> Result<u32, SealError> {
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| SealError::InvalidReport("report too short".into()))
 }
 
 /// Read a little-endian u64 from a byte slice at the given offset.
-fn read_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+fn read_u64(data: &[u8], offset: usize) -> Result<u64, SealError> {
+    data.get(offset..offset + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| SealError::InvalidReport("report too short".into()))
 }
 
 /// Copy a fixed-size array from a byte slice at the given offset.
-fn read_array<const N: usize>(data: &[u8], offset: usize) -> [u8; N] {
-    data[offset..offset + N].try_into().unwrap()
+fn read_array<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], SealError> {
+    data.get(offset..offset + N)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| SealError::InvalidReport("report too short".into()))
 }
 
 impl SnpReport {
@@ -79,14 +87,14 @@ impl SnpReport {
             )));
         }
 
-        let version = read_u32(data, 0x000);
+        let version = read_u32(data, 0x000)?;
         if version < 2 {
             return Err(SealError::InvalidReport(format!(
                 "unsupported report version: {version} (expected >= 2)"
             )));
         }
 
-        let signature_algo = read_u32(data, 0x034);
+        let signature_algo = read_u32(data, 0x034)?;
         if signature_algo != SIGNATURE_ALGO_ECDSA_P384 {
             return Err(SealError::InvalidReport(format!(
                 "unsupported signature algorithm: {signature_algo} (expected {SIGNATURE_ALGO_ECDSA_P384})"
@@ -97,36 +105,36 @@ impl SnpReport {
         // Per AMD SEV-SNP ABI spec (Table 22), each signature component occupies
         // 72 bytes (0x48). Only the first 48 bytes contain the P-384 scalar
         // (little-endian); the remaining 24 bytes are zero padding.
-        let signature_r: [u8; 48] = read_array(data, 0x2A0);
-        let signature_s: [u8; 48] = read_array(data, 0x2A0 + 0x48);
+        let signature_r: [u8; 48] = read_array(data, 0x2A0)?;
+        let signature_s: [u8; 48] = read_array(data, 0x2A0 + 0x48)?;
 
         Ok(Self {
             version,
-            guest_svn: read_u32(data, 0x004),
-            policy: read_u64(data, 0x008),
-            family_id: read_array(data, 0x010),
-            image_id: read_array(data, 0x020),
-            vmpl: read_u32(data, 0x030),
+            guest_svn: read_u32(data, 0x004)?,
+            policy: read_u64(data, 0x008)?,
+            family_id: read_array(data, 0x010)?,
+            image_id: read_array(data, 0x020)?,
+            vmpl: read_u32(data, 0x030)?,
             signature_algo,
-            current_tcb: read_u64(data, 0x038),
-            platform_info: read_u64(data, 0x040),
-            flags: read_u32(data, 0x048),
-            report_data: read_array(data, 0x050),
-            measurement: read_array(data, 0x090),
-            host_data: read_array(data, 0x0C0),
-            id_key_digest: read_array(data, 0x0E0),
-            author_key_digest: read_array(data, 0x110),
-            report_id: read_array(data, 0x140),
-            report_id_ma: read_array(data, 0x160),
-            reported_tcb: read_u64(data, 0x180),
+            current_tcb: read_u64(data, 0x038)?,
+            platform_info: read_u64(data, 0x040)?,
+            flags: read_u32(data, 0x048)?,
+            report_data: read_array(data, 0x050)?,
+            measurement: read_array(data, 0x090)?,
+            host_data: read_array(data, 0x0C0)?,
+            id_key_digest: read_array(data, 0x0E0)?,
+            author_key_digest: read_array(data, 0x110)?,
+            report_id: read_array(data, 0x140)?,
+            report_id_ma: read_array(data, 0x160)?,
+            reported_tcb: read_u64(data, 0x180)?,
             // chip_id at 0x1A0: after reported_tcb (0x180, 8 bytes) + 24 bytes reserved.
             // Per AMD SEV-SNP ABI spec Table 21 (ATTESTATION_REPORT structure).
-            chip_id: read_array(data, 0x1A0),
-            committed_tcb: read_u64(data, 0x1E0),
+            chip_id: read_array(data, 0x1A0)?,
+            committed_tcb: read_u64(data, 0x1E0)?,
             current_build: data[0x1E8],
             current_minor: data[0x1E9],
             current_major: data[0x1EA],
-            launch_tcb: read_u64(data, 0x1F0),
+            launch_tcb: read_u64(data, 0x1F0)?,
             body_bytes,
             signature_r,
             signature_s,

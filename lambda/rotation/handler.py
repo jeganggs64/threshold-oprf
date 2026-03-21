@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import base64
 
@@ -129,8 +130,13 @@ def build_user_data(
       4. Write coordinator config
       5. Start normal mode container
     """
-    # Escape single quotes in coordinator config for heredoc safety
-    coord_escaped = coordinator_config.replace("'", "'\\''")
+    # Shell-quote all string values to prevent injection
+    q_image = shlex.quote(image)
+    q_bucket = shlex.quote(bucket)
+    q_sealed_url = shlex.quote(sealed_url)
+    q_group_public_key = shlex.quote(group_public_key)
+    q_ark_fingerprint = shlex.quote(ark_fingerprint)
+    q_vs = shlex.quote(vs)
 
     script = f"""#!/bin/bash
 set -euo pipefail
@@ -140,22 +146,22 @@ echo "[$(date)] Installing Docker..."
 yum install -y docker
 systemctl enable --now docker
 
-echo "[$(date)] Pulling image: {image}"
-docker pull {image}
+echo "[$(date)] Pulling image: {q_image}"
+docker pull {q_image}
 
 echo "[$(date)] Starting init-reshare..."
 docker run --name toprf-init-reshare \
     --device /dev/sev-guest:/dev/sev-guest \
     --user root \
-    -e AMD_ARK_FINGERPRINT='{ark_fingerprint}' \
-    {image} \
+    -e AMD_ARK_FINGERPRINT={q_ark_fingerprint} \
+    {q_image} \
     --init-reshare \
-    --s3-bucket '{bucket}' \
-    --upload-url '{sealed_url}' \
+    --s3-bucket {q_bucket} \
+    --upload-url {q_sealed_url} \
     --new-node-id {node_id} \
     --new-threshold {threshold} \
     --new-total-shares {total} \
-    --group-public-key '{group_public_key}' \
+    --group-public-key {q_group_public_key} \
     --min-contributions {threshold}
 
 EXIT_CODE=$?
@@ -178,11 +184,11 @@ docker run -d --name toprf-node --restart=unless-stopped \
     --device /dev/sev-guest:/dev/sev-guest \
     --user root \
     -p 3001:3001 \
-    -e SEALED_KEY_URL='{sealed_url}' \
-    -e EXPECTED_VERIFICATION_SHARE='{vs}' \
-    -e AMD_ARK_FINGERPRINT='{ark_fingerprint}' \
+    -e SEALED_KEY_URL={q_sealed_url} \
+    -e EXPECTED_VERIFICATION_SHARE={q_vs} \
+    -e AMD_ARK_FINGERPRINT={q_ark_fingerprint} \
     -v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro \
-    {image} \
+    {q_image} \
     --port 3001 \
     --coordinator-config /etc/toprf/coordinator.json
 
@@ -356,9 +362,9 @@ def cleanup_reshare_artifacts(bucket, region):
 # ---------------------------------------------------------------------------
 
 def wait_target_healthy(region, tg_arn, ip, label, timeout=NLB_HEALTH_TIMEOUT):
-    """Wait for a target to become healthy in a target group."""
+    """Wait for a target to become healthy in a target group. Returns True if healthy."""
     if DRY_RUN:
-        return
+        return True
 
     elbv2 = boto3.client("elbv2", region_name=region)
     deadline = time.time() + timeout
@@ -370,10 +376,11 @@ def wait_target_healthy(region, tg_arn, ip, label, timeout=NLB_HEALTH_TIMEOUT):
         state = resp["TargetHealthDescriptions"][0]["TargetHealth"]["State"]
         if state == "healthy":
             logger.info(f"{ip} healthy in {label}")
-            return
+            return True
         time.sleep(POLL_INTERVAL)
 
     logger.warning(f"{ip} not healthy in {label} after {timeout}s — continuing")
+    return False
 
 
 def swap_nlb_target(region, tg_arn, old_ip, new_ip, label="NLB"):
@@ -392,7 +399,10 @@ def swap_nlb_target(region, tg_arn, old_ip, new_ip, label="NLB"):
     logger.info(f"Registered {new_ip} in {label}")
 
     # Wait for healthy before removing old
-    wait_target_healthy(region, tg_arn, new_ip, label)
+    healthy = wait_target_healthy(region, tg_arn, new_ip, label)
+    if not healthy:
+        logger.error(f"New target {new_ip} not healthy — aborting swap for {label}")
+        raise RuntimeError(f"New target {new_ip} not healthy in {label}")
 
     # Deregister old target
     if old_ip:
@@ -497,6 +507,11 @@ def orchestrate_reshare(config, node_id, bucket, region):
     Orchestrate the reshare: download attestation from staging node's S3,
     send /reshare to each donor, upload contributions to staging node's S3.
     """
+    # Validate node_id to prevent S3 key path traversal
+    node_id_str = str(node_id)
+    if not re.match(r'^\d+$', node_id_str):
+        raise ValueError(f"Invalid node ID: {node_id_str!r}")
+
     group_public_key = config["group_public_key"]
     donor_nodes = [n for n in config["nodes"] if n["id"] != node_id]
     donor_ids = [n["id"] for n in donor_nodes]
@@ -541,7 +556,10 @@ def orchestrate_reshare(config, node_id, bucket, region):
         contribution = send_reshare_request(donor, reshare_payload)
 
         # Upload contribution to staging node's S3 for it to pick up
-        contrib_key = f"reshare/contribution-from-{donor['id']}.json"
+        donor_id = str(donor['id'])
+        if not re.match(r'^\d+$', donor_id):
+            raise ValueError(f"Invalid donor node ID: {donor_id!r}")
+        contrib_key = f"reshare/contribution-from-{donor_id}.json"
         upload_s3_object(
             bucket,
             contrib_key,

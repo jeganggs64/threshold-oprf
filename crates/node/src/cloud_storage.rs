@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -540,8 +541,9 @@ fn sigv4_headers(
     );
 
     // Derive signing key
+    let signing_key_prefix = Zeroizing::new(format!("AWS4{}", creds.secret_access_key));
     let k_date = hmac_sha256(
-        format!("AWS4{}", creds.secret_access_key).as_bytes(),
+        signing_key_prefix.as_bytes(),
         date_stamp.as_bytes(),
     );
     let k_region = hmac_sha256(&k_date, region.as_bytes());

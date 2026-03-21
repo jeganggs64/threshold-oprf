@@ -6,13 +6,13 @@ A distributed threshold Oblivious Pseudorandom Function (OPRF) system using T-of
 
 ```
 Client → API Gateway (oprf.ruonlabs.com) → Lambda → Frontend NLB → Coordinator Node
-                                                                          ↓ PrivateLink
+                                                                          ↓ Per-node NLB
                                                                   (threshold-1) Peer Nodes
 ```
 
-- **Coordinator**: receives blinded point, computes own partial evaluation, forwards to peers via PrivateLink, verifies DLEQ proofs, combines via Lagrange interpolation
+- **Coordinator**: receives blinded point, computes own partial evaluation, forwards to peers via per-node NLBs, verifies DLEQ proofs, combines via Lagrange interpolation
 - **Frontend NLB**: health-checked load balancer across same-region nodes — automatic failover
-- **PrivateLink**: node-to-node traffic stays on AWS's private backbone, no public exposure
+- **Per-node NLBs**: internal load balancers for node-to-node traffic, no public exposure
 - **SEV-SNP**: key shares sealed to hardware, stored encrypted in S3 — AWS cannot read them
 - **No SSM Run Command**: nodes have no remote execution interface. VM bootstrapping uses EC2 user data only. Even with full AWS account access, no code can be executed inside the SEV-SNP guest.
 
@@ -54,7 +54,6 @@ scripts/      Dev utilities (integration-test.sh)
 - Per-node IAM roles, instance profiles, ED25519 key pairs
 - S3 buckets for sealed key blobs (`toprf-sealed-<account>-node-<id>`)
 - NLBs (per-node + frontend)
-- PrivateLink (endpoint services, VPC endpoints, security groups)
 - CloudWatch alarms + SNS topics
 - SSM Parameter Store entries (config, coordinator configs)
 
@@ -112,7 +111,7 @@ cd ..
 cd deploy
 ./deploy.sh pre-seal                # Docker setup, image pull, S3 buckets, measure
 NODE_SHARES_DIR=../ceremony/node-shares ./deploy.sh init-seal
-./deploy.sh post-seal               # PrivateLink, coordinator configs, start, verify
+./deploy.sh post-seal               # Coordinator configs, start, verify
 ./deploy.sh e2e                     # End-to-end test
 ```
 
@@ -205,7 +204,7 @@ For rotation to work, these must all be in place:
 
 2. **VPC endpoints** — The rotation Lambda runs in the VPC. It needs the `ssm` interface endpoint (port 443) to read config from Parameter Store, plus `ec2`, `sts`, `elasticloadbalancing`, `sns` endpoints, and the `s3` gateway endpoint.
 
-3. **Security group** — The VPC endpoint security group must allow **TCP 443 inbound** from the VPC CIDR (e.g., `172.31.0.0/16`) for Parameter Store/API access, and **TCP 3001** for node-to-node PrivateLink traffic.
+3. **Security group** — The VPC endpoint security group must allow **TCP 443 inbound** from the VPC CIDR (e.g., `172.31.0.0/16`) for Parameter Store/API access, and **TCP 3001** for node-to-node NLB traffic.
 
 4. **IAM** — The rotation Lambda role needs: `ssm:GetParameter`, `ssm:PutParameter`, `ec2:RunInstances`, `ec2:TerminateInstances`, `ec2:DescribeInstances`, `ec2:CreateTags`, `iam:PassRole`, `s3:*Object`, `elasticloadbalancing:*Targets`, `sns:Publish`.
 
@@ -268,7 +267,7 @@ toprf-keygen simulate \
 - **DLEQ proofs** — every partial evaluation proves correct key share usage
 - **Attestation-bound recovery** — donors independently verify target attestation before releasing sub-shares
 - **Per-node IAM** — each node scoped to its own S3 bucket
-- **Network isolation** — PrivateLink only, no public key exposure
+- **Network isolation** — internal NLBs only, no public key exposure
 - **Device attestation** — Apple App Attest / Google Play Integrity
 - **Replay protection** — reshare requests tracked by attestation report digest with TTL-based eviction
 
@@ -296,7 +295,7 @@ GitHub Actions on push/PR to `main`: format (rustfmt), lint (clippy), security a
 | SSM ConnectTimeoutError | VPC endpoint SG must allow TCP 443 from VPC CIDR |
 | S3 denied during seal | Add `s3:PutObject` to node IAM role |
 | Container exits on init-seal | Check `docker logs toprf-init-seal` |
-| Peer unreachable | Check PrivateLink endpoint state, coordinator configs |
+| Peer unreachable | Check NLB target health, coordinator configs |
 | NLB unhealthy | Check `docker ps` and `docker logs toprf-node` |
 | Measurement mismatch | Update `EXPECTED_PEER_MEASUREMENT` in `reshare_handler.rs`, rebuild image |
 | Rotation donor rejection | Ensure donors have the latest Docker image (rotate with old AMI first) |

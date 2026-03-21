@@ -101,6 +101,10 @@ Resources:
               Action:
                 - elasticloadbalancing:RegisterTargets
                 - elasticloadbalancing:DeregisterTargets
+              Resource:
+                - !Sub arn:aws:elasticloadbalancing:*:${AWS::AccountId}:targetgroup/toprf-*
+            - Effect: Allow
+              Action:
                 - elasticloadbalancing:DescribeTargetHealth
               Resource: '*'
             # S3 CopyObject (for sealed blob rename)

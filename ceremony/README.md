@@ -69,14 +69,14 @@ Resume from a specific step if something fails:
 | 1 | Generate 2-of-4 admin shares | Offline |
 | 2 | Generate 2-of-3 node shares | Offline |
 | 3 | Cross-verify both share sets reconstruct the same key | Offline |
-| 4 | Print admin shares (QR + plain text, one page each) | Offline |
-| 5 | Connect to network | Manual |
-| 6 | Configure AWS credentials | Online |
-| 7 | Stop old nodes, init-seal with new key, start nodes | Online |
-| 8 | Verify nodes healthy + correct group public key + e2e evaluate | Online |
-| 9 | Shred node shares from disk | Online |
-| 10 | Disconnect from network | Manual |
-| 11 | Local OPRF simulation (hash_to_curve -> blind -> eval -> unblind -> ruonId) | Offline |
+| 4 | Connect to network | Manual |
+| 5 | Configure AWS credentials | Online |
+| 6 | Stop old nodes, init-seal with new key, start nodes | Online |
+| 7 | Verify nodes healthy + correct group public key + e2e evaluate | Online |
+| 8 | Shred node shares from disk | Online |
+| 9 | Disconnect from network | Manual |
+| 10 | Local OPRF simulation (hash_to_curve -> blind -> eval -> unblind -> ruonId) | Offline |
+| 11 | Print admin shares (QR + plain text, one page each) | Offline |
 | 12 | Shred admin shares from disk | Offline |
 | 13 | Shred ceremony.env (AWS creds + national ID) | Offline |
 
