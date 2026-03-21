@@ -542,10 +542,13 @@ fn sigv4_headers(
 
     // Derive signing key
     let signing_key_prefix = Zeroizing::new(format!("AWS4{}", creds.secret_access_key));
-    let k_date = hmac_sha256(signing_key_prefix.as_bytes(), date_stamp.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, b"s3");
-    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let k_date = Zeroizing::new(hmac_sha256(
+        signing_key_prefix.as_bytes(),
+        date_stamp.as_bytes(),
+    ));
+    let k_region = Zeroizing::new(hmac_sha256(&k_date, region.as_bytes()));
+    let k_service = Zeroizing::new(hmac_sha256(&k_region, b"s3"));
+    let k_signing = Zeroizing::new(hmac_sha256(&k_service, b"aws4_request"));
 
     let signature = hex::encode(hmac_sha256(&k_signing, string_to_sign.as_bytes()));
 
