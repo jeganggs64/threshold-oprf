@@ -36,6 +36,7 @@ logger.setLevel(logging.INFO)
 SSM_PREFIX = os.environ.get("SSM_PREFIX", "/toprf")
 SNS_RESULTS_TOPIC = os.environ.get("SNS_RESULTS_TOPIC", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+LOCK_TABLE = os.environ.get("LOCK_TABLE", "toprf-rotation-lock")
 
 # Timeouts (seconds)
 BOOT_TIMEOUT = 420         # 7 min for instance boot + Docker setup + image pull
@@ -45,6 +46,45 @@ SEALED_TIMEOUT = 300       # 5 min for new node to combine + seal
 HEALTH_TIMEOUT = 120       # 2 min for new node to become healthy
 NLB_HEALTH_TIMEOUT = 120   # 2 min for NLB target to become healthy
 POLL_INTERVAL = 5          # seconds between polls
+LOCK_TTL = 900             # 15 min — matches Lambda max timeout
+
+
+# ---------------------------------------------------------------------------
+# Rotation Lock (prevents concurrent rotations)
+# ---------------------------------------------------------------------------
+
+def acquire_lock(node_id):
+    """Try to acquire a DynamoDB lock for rotation. Returns True if acquired."""
+    if DRY_RUN:
+        return True
+    dynamodb = boto3.resource("dynamodb", region_name="eu-west-1")
+    table = dynamodb.Table(LOCK_TABLE)
+    ttl = int(time.time()) + LOCK_TTL
+    try:
+        table.put_item(
+            Item={"lockId": f"rotation-node-{node_id}", "ttl": ttl},
+            ConditionExpression="attribute_not_exists(lockId)",
+        )
+        logger.info(f"Acquired rotation lock for node {node_id}")
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            logger.warning(f"Rotation already in progress for node {node_id} — skipping")
+            return False
+        raise
+
+
+def release_lock(node_id):
+    """Release the rotation lock."""
+    if DRY_RUN:
+        return
+    try:
+        dynamodb = boto3.resource("dynamodb", region_name="eu-west-1")
+        table = dynamodb.Table(LOCK_TABLE)
+        table.delete_item(Key={"lockId": f"rotation-node-{node_id}"})
+        logger.info(f"Released rotation lock for node {node_id}")
+    except Exception as e:
+        logger.warning(f"Failed to release lock for node {node_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +623,7 @@ def rotate_node(config, node_id):
     Run Command, no SSH. The node's only interface is port 3001 (TOPRF API).
 
     Steps:
+      0. Acquire rotation lock (prevents concurrent rotations)
       1. Pre-flight: verify donor nodes are healthy
       2. Clean up stale reshare/staging artifacts
       3. Launch staging instance with user data
@@ -593,6 +634,8 @@ def rotate_node(config, node_id):
       8. Swap NLB targets (per-node + frontend)
       9. Terminate old, retag staging, update config
     """
+    if not acquire_lock(node_id):
+        return {"status": "skipped", "reason": "rotation already in progress"}
     node = next(n for n in config["nodes"] if n["id"] == node_id)
     bucket = node["s3_bucket"]
     region = node["region"]
@@ -739,6 +782,7 @@ def rotate_node(config, node_id):
         cleanup_reshare_artifacts(bucket, region)
 
         logger.info(f"=== Node {node_id} rotation complete ===")
+        release_lock(node_id)
         return {
             "node_id": node_id,
             "region": region,
@@ -753,6 +797,7 @@ def rotate_node(config, node_id):
         )
         terminate_instance(region, staging_id)
         cleanup_reshare_artifacts(bucket, region)
+        release_lock(node_id)
         raise
 
 

@@ -41,6 +41,7 @@ Resources:
         Variables:
           SSM_PREFIX: !Ref SSMPrefix
           SNS_RESULTS_TOPIC: !Ref RotationResultsTopic
+          LOCK_TABLE: toprf-rotation-lock
       VpcConfig:
         SubnetIds: !Ref VpcSubnetIds
         SecurityGroupIds: !Ref VpcSecurityGroupIds
@@ -113,6 +114,14 @@ Resources:
                 - s3:CopyObject
               Resource:
                 - arn:aws:s3:::toprf-sealed-*/*
+            # DynamoDB — rotation lock
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:DeleteItem
+                - dynamodb:GetItem
+              Resource:
+                - !Sub arn:aws:dynamodb:*:${AWS::AccountId}:table/toprf-rotation-lock
             # SNS — publish rotation success notifications
             - Effect: Allow
               Action:
