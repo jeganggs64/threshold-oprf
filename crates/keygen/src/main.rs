@@ -875,8 +875,12 @@ fn cmd_reconstruct(args: &[String]) {
                 eprintln!("Reconstruct the master key from admin shares and write hex to a file.");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)");
-                eprintln!("  -o, --output <F>       Output file for hex key (default: master-key.hex)");
+                eprintln!(
+                    "  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)"
+                );
+                eprintln!(
+                    "  -o, --output <F>       Output file for hex key (default: master-key.hex)"
+                );
                 eprintln!("  -h, --help             Show this help");
                 return;
             }
@@ -906,7 +910,10 @@ fn cmd_reconstruct(args: &[String]) {
         std::process::exit(1);
     }
 
-    eprintln!("[*] Reconstructing key from {} admin shares...", admin_shares.len());
+    eprintln!(
+        "[*] Reconstructing key from {} admin shares...",
+        admin_shares.len()
+    );
     let secret = reconstruct_key(&admin_shares);
 
     // Verify reconstruction
