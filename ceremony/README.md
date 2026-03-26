@@ -1,6 +1,6 @@
 # Key Ceremony (Raspberry Pi)
 
-Generates a new OPRF master key, prints admin shares, deploys node shares to TEE nodes, and verifies with a local OPRF simulation.
+Generates a new OPRF master key, deploys node shares to TEE nodes, verifies with local + mobile OPRF evaluation, and encrypts the master key with `age`.
 
 ## Prepare the SD card
 
@@ -35,10 +35,8 @@ Binaries are in `target/aarch64-unknown-linux-gnu/release/`.
 ## Install dependencies on the Pi
 
 ```bash
-sudo apt install qrencode imagemagick jq awscli shred cups
+sudo apt install jq awscli age shred
 ```
-
-Set up CUPS with the USB printer.
 
 ## Fill in ceremony.env
 
@@ -69,20 +67,26 @@ Resume from a specific step if something fails:
 | 1 | Generate 2-of-4 admin shares | Offline |
 | 2 | Generate 2-of-3 node shares | Offline |
 | 3 | Cross-verify both share sets reconstruct the same key | Offline |
-| 4 | Connect to network | Manual |
-| 5 | Configure AWS credentials | Online |
-| 6 | Stop old nodes, init-seal with new key, start nodes | Online |
-| 7 | Verify nodes healthy + correct group public key + e2e evaluate | Online |
-| 8 | Shred node shares from disk | Online |
-| 9 | Disconnect from network | Manual |
-| 10 | Local OPRF simulation (hash_to_curve -> blind -> eval -> unblind -> ruonId) | Offline |
-| 11 | Print admin shares (QR + plain text, one page each) | Offline |
-| 12 | Shred admin shares from disk | Offline |
-| 13 | Shred ceremony.env (AWS creds + national ID) | Offline |
+| 4 | Connect to network + configure AWS | Manual → Online |
+| 5 | Deploy key shares to nodes (init-seal + start) | Online |
+| 6 | Verify nodes healthy + correct group public key + e2e evaluate | Online |
+| 7 | Shred node shares from disk | Online |
+| 8 | Disconnect from network | Manual |
+| 9 | Local OPRF simulation + mobile app verification | Offline |
+| 10 | Encrypt admin shares with `age` passphrase → `key.age`, shred all plaintext | Offline |
 
 ## After the ceremony
 
-1. Laminate the printed admin shares
-2. Store in separate bank safe deposit boxes
-3. Revoke/delete the IAM user used for the ceremony
-4. Optionally run `deploy.sh lock` to remove SSH access (irreversible)
+1. Power off the Pi
+2. Plug SD card into your Mac
+3. Copy `key.age` to iCloud / secure backup
+4. Securely wipe the SD card: `sudo dd if=/dev/zero of=/dev/mmcblk0 bs=4M status=progress`
+5. Revoke/delete the IAM user used for the ceremony
+
+## Decrypting the key (if needed)
+
+```bash
+age -d key.age > admin-shares.json
+```
+
+Enter the 6-word diceware passphrase you chose during the ceremony.
