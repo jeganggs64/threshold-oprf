@@ -156,7 +156,7 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║             TOPRF KEY CEREMONY                               ║"
 echo "║                                                              ║"
-echo "║  Admin shares:  ${ADMIN_THRESHOLD}-of-${ADMIN_SHARES}                                     ║"
+echo "║  Admin shares:  ${ADMIN_THRESHOLD}-of-${ADMIN_SHARES} (reconstructed + age-encrypted)      ║"
 echo "║  Node shares:   ${NODE_THRESHOLD}-of-${NODE_SHARES}                                     ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
@@ -552,94 +552,25 @@ fi
 if [[ $FROM_STEP -le 8 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 8: Disconnect from network"
+    info "STEP 8: Reconstruct master key and shred admin shares"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    echo "  Disconnect the Raspberry Pi from the network now."
-    echo "  (Unplug Ethernet / disable WiFi)"
-    confirm "Is the network disconnected?"
-fi
-
-# ─── Step 9: Local OPRF verification + mobile verification ────────────────
-
-if [[ $FROM_STEP -le 9 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 9: Local OPRF simulation + mobile verification"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    source "$CEREMONY_ENV"
-    NATIONAL_ID="${NATIONAL_ID:?NATIONAL_ID not set in ceremony.env}"
-    NATIONALITY="${NATIONALITY:-Singapore}"
+    echo "  Reconstructing master key from admin shares..."
 
     ADMIN_ARGS=()
     for i in $(seq 1 "$ADMIN_THRESHOLD"); do
         ADMIN_ARGS+=(--admin-share "$ADMIN_DIR/admin-${i}.json")
     done
 
+    MASTER_KEY_FILE="$SCRIPT_DIR/master-key.hex"
+    "$KEYGEN" reconstruct "${ADMIN_ARGS[@]}" --output "$MASTER_KEY_FILE"
+
+    [[ -f "$MASTER_KEY_FILE" ]] || die "Master key reconstruction failed"
+    info "Master key reconstructed."
+
+    # Shred original admin shares
     echo ""
-    echo "  Simulating full mobile app OPRF flow locally:"
-    echo "    Nationality:  $NATIONALITY"
-    echo "    National ID:  ${NATIONAL_ID:0:3}****${NATIONAL_ID: -1}"
-    echo ""
-    echo "    hash_to_curve → blind → evaluate → unblind → derive ruonId"
-    echo ""
-
-    "$KEYGEN" simulate \
-        "${ADMIN_ARGS[@]}" \
-        --nationality "$NATIONALITY" \
-        --national-id "$NATIONAL_ID"
-
-    echo ""
-    echo "  Now onboard with the same identity on your mobile device."
-    echo "  The app's ruonId should match the result above."
-    confirm "Does the ruonId match?"
-fi
-
-# ─── Step 10: Encrypt master key with age + shred all artifacts ────────────
-
-if [[ $FROM_STEP -le 10 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 10: Encrypt master key and clean up"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    echo ""
-    echo "  You will now encrypt the admin shares with a passphrase."
-    echo "  Use 6 random diceware words separated by spaces."
-    echo "  REMEMBER THIS PASSPHRASE — there is no recovery."
-    echo ""
-
-    # Bundle all admin shares into a single JSON for encryption
-    BUNDLE="$SCRIPT_DIR/admin-shares-bundle.json"
-    echo "{" > "$BUNDLE"
-    first=true
-    for i in $(seq 1 "$ADMIN_SHARES"); do
-        SHARE_FILE="$ADMIN_DIR/admin-${i}.json"
-        if [[ -f "$SHARE_FILE" ]]; then
-            if ! $first; then echo "," >> "$BUNDLE"; fi
-            echo "\"admin-${i}\": $(cat "$SHARE_FILE")" >> "$BUNDLE"
-            first=false
-        fi
-    done
-    echo "}" >> "$BUNDLE"
-
-    # Encrypt with age (passphrase-based)
-    age -p -o "$KEY_AGE_OUTPUT" "$BUNDLE"
-
-    if [[ -f "$KEY_AGE_OUTPUT" ]]; then
-        echo ""
-        info "Encrypted key saved to: $KEY_AGE_OUTPUT"
-        echo "  File size: $(wc -c < "$KEY_AGE_OUTPUT") bytes"
-    else
-        die "age encryption failed — key.age not created"
-    fi
-
-    # Shred all plaintext artifacts
-    echo ""
-    info "Shredding plaintext artifacts..."
-
-    # Admin shares
+    info "Shredding original admin shares..."
     if [[ -d "$ADMIN_DIR" ]]; then
         for f in "$ADMIN_DIR"/admin-*.json; do
             if [[ -f "$f" ]]; then
@@ -650,11 +581,108 @@ if [[ $FROM_STEP -le 10 ]]; then
         done
         rmdir "$ADMIN_DIR" 2>/dev/null || true
     fi
+    info "Original admin shares destroyed."
 
-    # Bundle file
-    if [[ -f "$BUNDLE" ]]; then
-        shred -fz -n 3 "$BUNDLE"
-        rm -f "$BUNDLE"
+    # Re-split from master key to verify it works
+    echo ""
+    info "Re-splitting master key into fresh shares for verification..."
+    VERIFY_DIR="$SCRIPT_DIR/verify-shares"
+    "$KEYGEN" init \
+        --admin-threshold "$ADMIN_THRESHOLD" \
+        --admin-shares "$ADMIN_SHARES" \
+        --existing-key-file "$MASTER_KEY_FILE" \
+        --output-dir "$VERIFY_DIR"
+
+    info "Fresh shares generated. Running simulation..."
+fi
+
+# ─── Step 9: Disconnect + local OPRF verification + mobile check ──────────
+
+if [[ $FROM_STEP -le 9 ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "STEP 9: Disconnect + OPRF verification"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    echo "  Disconnect the Raspberry Pi from the network now."
+    echo "  (Unplug Ethernet / disable WiFi)"
+    confirm "Is the network disconnected?"
+
+    source "$CEREMONY_ENV"
+    NATIONAL_ID="${NATIONAL_ID:?NATIONAL_ID not set in ceremony.env}"
+    NATIONALITY="${NATIONALITY:-Singapore}"
+
+    VERIFY_DIR="$SCRIPT_DIR/verify-shares"
+    VERIFY_ARGS=()
+    for i in $(seq 1 "$ADMIN_THRESHOLD"); do
+        VERIFY_ARGS+=(--admin-share "$VERIFY_DIR/admin-${i}.json")
+    done
+
+    echo ""
+    echo "  Simulating full mobile app OPRF flow with re-split shares:"
+    echo "    Nationality:  $NATIONALITY"
+    echo "    National ID:  ${NATIONAL_ID:0:3}****${NATIONAL_ID: -1}"
+    echo ""
+
+    "$KEYGEN" simulate \
+        "${VERIFY_ARGS[@]}" \
+        --nationality "$NATIONALITY" \
+        --national-id "$NATIONAL_ID"
+
+    echo ""
+    echo "  Now onboard with the same identity on your mobile device."
+    echo "  The app's ruonId should match the result above."
+    confirm "Does the ruonId match?"
+
+    # Shred verification shares
+    echo ""
+    info "Shredding verification shares..."
+    for f in "$VERIFY_DIR"/admin-*.json; do
+        if [[ -f "$f" ]]; then
+            shred -fz -n 3 "$f"
+            rm -f "$f"
+        fi
+    done
+    rm -rf "$VERIFY_DIR"
+fi
+
+# ─── Step 10: Encrypt master key with age + shred remaining artifacts ─────
+
+if [[ $FROM_STEP -le 10 ]]; then
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "STEP 10: Encrypt master key and clean up"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    MASTER_KEY_FILE="$SCRIPT_DIR/master-key.hex"
+    [[ -f "$MASTER_KEY_FILE" ]] || die "Master key not found: $MASTER_KEY_FILE"
+
+    echo ""
+    echo "  You will now encrypt the master key with a passphrase."
+    echo "  Use 6 random diceware words separated by spaces."
+    echo "  REMEMBER THIS PASSPHRASE — there is no recovery."
+    echo ""
+
+    # Encrypt with age (passphrase-based)
+    age -p -o "$KEY_AGE_OUTPUT" "$MASTER_KEY_FILE"
+
+    if [[ -f "$KEY_AGE_OUTPUT" ]]; then
+        echo ""
+        info "Encrypted key saved to: $KEY_AGE_OUTPUT"
+        echo "  File size: $(wc -c < "$KEY_AGE_OUTPUT") bytes"
+    else
+        die "age encryption failed — key.age not created"
+    fi
+
+    # Shred remaining plaintext artifacts
+    echo ""
+    info "Shredding plaintext artifacts..."
+
+    # Master key hex file
+    if [[ -f "$MASTER_KEY_FILE" ]]; then
+        echo "  Shredding master-key.hex..."
+        shred -fz -n 3 "$MASTER_KEY_FILE"
+        rm -f "$MASTER_KEY_FILE"
     fi
 
     # ceremony.env (AWS creds + national ID)

@@ -84,6 +84,7 @@ fn main() {
         "verify" => cmd_verify(&args[2..]),
         "evaluate" => cmd_evaluate(&args[2..]),
         "simulate" => cmd_simulate(&args[2..]),
+        "reconstruct" => cmd_reconstruct(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             eprintln!();
@@ -104,6 +105,7 @@ fn print_usage() {
     eprintln!(
         "  simulate      Full OPRF simulation: hash → blind → evaluate → unblind → derive ruonId"
     );
+    eprintln!("  reconstruct   Reconstruct master key from admin shares → output hex to file");
     eprintln!();
     eprintln!("Run `toprf-keygen <COMMAND> --help` for details.");
 }
@@ -849,4 +851,83 @@ fn cmd_simulate(args: &[String]) {
 
     // Output ruonId to stdout for scripting
     println!("{ruon_id}");
+}
+
+/// Reconstruct master key from admin shares and write hex to a file.
+fn cmd_reconstruct(args: &[String]) {
+    let mut admin_share_files: Vec<String> = Vec::new();
+    let mut output_file = String::from("master-key.hex");
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--admin-share" | "-a" => {
+                i += 1;
+                admin_share_files.push(args[i].to_string());
+            }
+            "--output" | "-o" => {
+                i += 1;
+                output_file = args[i].to_string();
+            }
+            "--help" | "-h" => {
+                eprintln!("Usage: toprf-keygen reconstruct [OPTIONS]");
+                eprintln!();
+                eprintln!("Reconstruct the master key from admin shares and write hex to a file.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  -a, --admin-share <F>  Path to an admin share JSON (repeat for threshold)");
+                eprintln!("  -o, --output <F>       Output file for hex key (default: master-key.hex)");
+                eprintln!("  -h, --help             Show this help");
+                return;
+            }
+            other => {
+                eprintln!("Unknown argument: {other}");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if admin_share_files.is_empty() {
+        eprintln!("Error: at least one --admin-share is required");
+        std::process::exit(1);
+    }
+
+    eprintln!("[*] Loading admin shares...");
+    let admin_shares = load_shares(&admin_share_files);
+    let admin_threshold = admin_shares[0].threshold;
+
+    if admin_shares.len() < admin_threshold as usize {
+        eprintln!(
+            "Error: need at least {} admin shares (got {})",
+            admin_threshold,
+            admin_shares.len()
+        );
+        std::process::exit(1);
+    }
+
+    eprintln!("[*] Reconstructing key from {} admin shares...", admin_shares.len());
+    let secret = reconstruct_key(&admin_shares);
+
+    // Verify reconstruction
+    let group_pk = ProjectivePoint::mul_by_generator(&*secret);
+    let group_pk_hex = point_to_hex(&group_pk);
+    let expected_gpk = &admin_shares[0].group_public_key;
+
+    if group_pk_hex != *expected_gpk {
+        eprintln!("FATAL: reconstructed key does not match share metadata!");
+        eprintln!("  Expected: {expected_gpk}");
+        eprintln!("  Got:      {group_pk_hex}");
+        std::process::exit(1);
+    }
+
+    // Write hex key to file
+    let scalar_bytes: k256::FieldBytes = (*secret).into();
+    let key_hex = hex::encode(scalar_bytes);
+
+    let out_path = Path::new(&output_file);
+    write_secret_file(out_path, &key_hex).expect("failed to write key file");
+
+    eprintln!("[*] Master key written to: {output_file}");
+    eprintln!("[*] Group public key: {group_pk_hex}");
 }
