@@ -2,20 +2,19 @@
 # =============================================================================
 # ceremony.sh — TOPRF Key Ceremony for Raspberry Pi
 #
-# Generates a new OPRF master key, splits it into admin and node shares,
-# prints admin shares, deploys node shares to TEE nodes via init-seal,
-# and verifies the deployment with a local OPRF evaluation.
+# Generates a new OPRF master key, deploys node shares to TEE nodes,
+# verifies with local + mobile evaluation, encrypts the master key
+# with age, and shreds all plaintext artifacts.
 #
 # Prerequisites on the Raspberry Pi:
 #   - toprf-keygen       (aarch64 binary, in same directory)
 #   - toprf-init-encrypt (aarch64 binary, in same directory)
-#   - ceremony.env       (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION)
+#   - ceremony.env       (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.)
 #   - config.env         (copied from deploy/)
 #   - nodes.json         (copied from deploy/)
 #   - ssh-keys/          (SSH .pem files, named by key_name from nodes.json)
 #   - coordinator-configs/ (copied from deploy/coordinator-configs/)
-#   - aws cli, jq, qrencode, imagemagick, shred
-#   - CUPS configured with USB printer
+#   - aws cli, jq, age, shred
 #
 # Usage:
 #   ./ceremony.sh              Run all steps
@@ -42,8 +41,7 @@ CEREMONY_ENV="$SCRIPT_DIR/ceremony.env"
 CONFIG_ENV="$SCRIPT_DIR/config.env"
 NODES_JSON="$SCRIPT_DIR/nodes.json"
 
-# Printer name (empty = default printer)
-PRINTER="${CEREMONY_PRINTER:-}"
+KEY_AGE_OUTPUT="$SCRIPT_DIR/key.age"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -64,8 +62,7 @@ preflight() {
     [[ -f "$NODES_JSON" ]]   || { echo "  MISSING: nodes.json"; ok=false; }
     command -v jq >/dev/null  || { echo "  MISSING: jq"; ok=false; }
     command -v aws >/dev/null || { echo "  MISSING: aws cli"; ok=false; }
-    command -v qrencode >/dev/null || { echo "  MISSING: qrencode (apt install qrencode)"; ok=false; }
-    command -v convert >/dev/null  || { echo "  MISSING: imagemagick (apt install imagemagick)"; ok=false; }
+    command -v age >/dev/null || { echo "  MISSING: age (apt install age)"; ok=false; }
     command -v shred >/dev/null    || { echo "  MISSING: shred"; ok=false; }
     command -v ssh >/dev/null      || { echo "  MISSING: ssh"; ok=false; }
 
@@ -131,14 +128,6 @@ node_vs() {
     jq -r --argjson id "$1" '.verification_shares[] | select(.node_id == $id) | .verification_share' "$config"
 }
 
-lp_cmd() {
-    if [[ -n "$PRINTER" ]]; then
-        lp -d "$PRINTER" "$@"
-    else
-        lp "$@"
-    fi
-}
-
 # ─── Parse args ─────────────────────────────────────────────────────────────
 
 FROM_STEP=1
@@ -150,7 +139,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --help|-h)
             echo "Usage: ceremony.sh [--from <step>]"
-            echo "  --from <N>  Resume from step N (1-13)"
+            echo "  --from <N>  Resume from step N (1-10)"
             exit 0
             ;;
         *)
@@ -200,7 +189,6 @@ if [[ $FROM_STEP -le 2 ]]; then
     info "STEP 2: Generate node shares from admin shares"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Use the first ADMIN_THRESHOLD admin shares for reconstruction
     ADMIN_ARGS=()
     for i in $(seq 1 "$ADMIN_THRESHOLD"); do
         ADMIN_ARGS+=(--admin-share "$ADMIN_DIR/admin-${i}.json")
@@ -241,7 +229,7 @@ if [[ $FROM_STEP -le 3 ]]; then
     info "Verification passed. Group public key: $GROUP_PK"
 fi
 
-# ─── Step 4: Connect to network ────────────────────────────────────────────
+# ─── Step 4: Connect to network and configure AWS ─────────────────────────
 
 if [[ $FROM_STEP -le 4 ]]; then
     echo ""
@@ -252,20 +240,10 @@ if [[ $FROM_STEP -le 4 ]]; then
     echo "  Connect the Raspberry Pi to the network now."
     confirm "Is the network connected?"
 
-    # Verify connectivity
     if ! ping -c 1 -W 5 8.8.8.8 > /dev/null 2>&1; then
-        die "No network connectivity. Check connection and re-run with --from 5"
+        die "No network connectivity. Check connection and re-run with --from 4"
     fi
     echo "  Network connectivity verified."
-fi
-
-# ─── Step 5: Configure AWS ─────────────────────────────────────────────────
-
-if [[ $FROM_STEP -le 5 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 5: Configure AWS credentials"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     source "$CEREMONY_ENV"
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
@@ -276,41 +254,40 @@ if [[ $FROM_STEP -le 5 ]]; then
     info "AWS credentials configured."
 fi
 
-# ─── Step 6: Init-seal + start nodes ───────────────────────────────────────
+# ─── Step 5: Init-seal + start nodes ───────────────────────────────────────
 
-if [[ $FROM_STEP -le 6 ]]; then
+if [[ $FROM_STEP -le 5 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 6: Deploy key shares to nodes (init-seal + start)"
+    info "STEP 5: Deploy key shares to nodes (init-seal + start)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    # Load ceremony.env and config.env if not already loaded
     [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && source "$CEREMONY_ENV" && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
     source "$CONFIG_ENV"
 
     GROUP_PK=$(jq -r '.group_public_key' "$NODE_DIR/public-config.json")
 
-    # 7a. Stop running nodes
+    # Stop running nodes
     echo ""
-    info "7a. Stopping running nodes..."
+    info "Stopping running nodes..."
     for i in $(all_node_ids); do
         local_ip=$(node_ip "$i")
         echo "  Node $i ($local_ip): stopping..."
         ssh_node "$i" "sudo docker rm -f toprf-node 2>/dev/null || true" < /dev/null || true
     done
 
-    # 7b. Clean S3 init/ prefix
+    # Clean S3 init/ prefix
     echo ""
-    info "7b. Cleaning S3 init/ artifacts..."
+    info "Cleaning S3 init/ artifacts..."
     for i in $(all_node_ids); do
         bucket=$(node_s3_bucket "$i")
         echo "  Node $i: cleaning s3://${bucket}/init/..."
         aws s3 rm "s3://${bucket}/init/" --recursive --quiet 2>/dev/null || true
     done
 
-    # 7c. Init-seal for each node
+    # Init-seal for each node
     echo ""
-    info "7c. Init-seal (attested key injection)..."
+    info "Init-seal (attested key injection)..."
     echo ""
 
     local expected_measurement="${EXPECTED_MEASUREMENT:-}"
@@ -331,7 +308,6 @@ if [[ $FROM_STEP -le 6 ]]; then
         echo "    S3 bucket: $bucket"
         echo "    Starting init-seal container..."
 
-        # Clean up previous init-seal container
         ssh_node "$i" "sudo docker rm -f toprf-init-seal 2>/dev/null || true" < /dev/null
 
         ssh_node "$i" "sudo docker run -d --name toprf-init-seal \
@@ -345,7 +321,6 @@ if [[ $FROM_STEP -le 6 ]]; then
 
         echo "    Waiting for attestation artifacts in S3..."
 
-        # Poll for attestation.bin in S3
         s3_attestation="s3://${bucket}/init/attestation.bin"
         s3_pubkey="s3://${bucket}/init/pubkey.bin"
         s3_certs="s3://${bucket}/init/certs.bin"
@@ -373,7 +348,6 @@ if [[ $FROM_STEP -le 6 ]]; then
         aws s3 cp "$s3_certs" "$tmpdir/certs.bin" --quiet
         echo "    Attestation artifacts downloaded."
 
-        # Verify attestation and encrypt key share
         echo "    Verifying attestation and encrypting key share..."
         AMD_ARK_FINGERPRINT="${AMD_ARK_FINGERPRINT:-}" \
             "$INIT_ENCRYPT" \
@@ -384,13 +358,10 @@ if [[ $FROM_STEP -le 6 ]]; then
             --share-file "$share" \
             --expected-measurement "$expected_measurement" 2>&1 | sed 's/^/    /'
 
-        # Upload encrypted share
         echo "    Uploading encrypted share to S3..."
         aws s3 cp "$tmpdir/encrypted-share.bin" "$s3_encrypted" --quiet
 
         echo "    Waiting for node to seal..."
-
-        # Wait for container to finish
         seal_waited=0
         while true; do
             running=$(ssh_node "$i" "sudo docker inspect -f '{{.State.Running}}' toprf-init-seal 2>/dev/null || echo false" < /dev/null)
@@ -405,7 +376,6 @@ if [[ $FROM_STEP -le 6 ]]; then
             fi
         done
 
-        # Check exit code
         exit_code=$(ssh_node "$i" "sudo docker inspect -f '{{.State.ExitCode}}' toprf-init-seal 2>/dev/null || echo 1" < /dev/null)
         if [[ "$exit_code" == "0" ]]; then
             echo "    Node $i sealed successfully."
@@ -421,9 +391,9 @@ if [[ $FROM_STEP -le 6 ]]; then
 
     info "Init-seal complete for all nodes."
 
-    # 7d. Upload coordinator configs and start nodes
+    # Start nodes in auto-unseal mode
     echo ""
-    info "7d. Starting nodes in auto-unseal mode..."
+    info "Starting nodes in auto-unseal mode..."
 
     for i in $(all_node_ids); do
         ip=$(node_ip "$i")
@@ -433,7 +403,6 @@ if [[ $FROM_STEP -le 6 ]]; then
 
         echo "  Node $i ($ip)..."
 
-        # Upload coordinator config if available locally
         coord_config="$SCRIPT_DIR/coordinator-configs/coordinator-node-${i}.json"
         coord_args=""
         if [[ -f "$coord_config" ]]; then
@@ -441,14 +410,11 @@ if [[ $FROM_STEP -le 6 ]]; then
             ssh_node "$i" "sudo mkdir -p /etc/toprf && sudo mv /tmp/coordinator-node-${i}.json /etc/toprf/coordinator.json" < /dev/null
             coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
             echo "    Coordinator config uploaded"
+        elif ssh_node "$i" "test -f /etc/toprf/coordinator.json" < /dev/null 2>/dev/null; then
+            coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
+            echo "    Using existing coordinator config on node"
         else
-            # Check if config exists on node from test deployment
-            if ssh_node "$i" "test -f /etc/toprf/coordinator.json" < /dev/null 2>/dev/null; then
-                coord_args="-v /etc/toprf/coordinator.json:/etc/toprf/coordinator.json:ro"
-                echo "    Using existing coordinator config on node"
-            else
-                warn "No coordinator config for node $i"
-            fi
+            warn "No coordinator config for node $i"
         fi
 
         ssh_node "$i" "sudo docker run -d --name toprf-node --restart=unless-stopped \
@@ -494,12 +460,12 @@ if [[ $FROM_STEP -le 6 ]]; then
     fi
 fi
 
-# ─── Step 7: Verify nodes serve correct key ─────────────────────────────────
+# ─── Step 6: Verify nodes serve correct key ─────────────────────────────────
 
-if [[ $FROM_STEP -le 7 ]]; then
+if [[ $FROM_STEP -le 6 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 7: Verify nodes serve correct group public key"
+    info "STEP 6: Verify nodes serve correct group public key"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && source "$CEREMONY_ENV" && export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION
@@ -544,8 +510,6 @@ if [[ $FROM_STEP -le 7 ]]; then
         eval_point=$(echo "$eval_resp" | jq -r '.evaluation')
         partials_count=$(echo "$eval_resp" | jq '.partials | length')
         echo "    PASS (partials=$partials_count, evaluation=${eval_point:0:20}...)"
-
-        echo "    Server evaluation verified."
     else
         echo "    FAIL: $eval_resp"
         all_ok=false
@@ -560,16 +524,15 @@ if [[ $FROM_STEP -le 7 ]]; then
     fi
 fi
 
-# ─── Step 8: Shred node shares ─────────────────────────────────────────────
+# ─── Step 7: Shred node shares ─────────────────────────────────────────────
 
-if [[ $FROM_STEP -le 8 ]]; then
+if [[ $FROM_STEP -le 7 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 8: Shred node shares from disk"
+    info "STEP 7: Shred node shares from disk"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     if [[ -d "$NODE_DIR" ]]; then
-        # Shred secret share files, keep public-config.json
         for f in "$NODE_DIR"/node-*-share.json; do
             if [[ -f "$f" ]]; then
                 echo "  Shredding $f..."
@@ -584,12 +547,12 @@ if [[ $FROM_STEP -le 8 ]]; then
     fi
 fi
 
-# ─── Step 9: Disconnect from network ──────────────────────────────────────
+# ─── Step 8: Disconnect from network ──────────────────────────────────────
 
-if [[ $FROM_STEP -le 9 ]]; then
+if [[ $FROM_STEP -le 8 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 9: Disconnect from network"
+    info "STEP 8: Disconnect from network"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     echo "  Disconnect the Raspberry Pi from the network now."
@@ -597,12 +560,12 @@ if [[ $FROM_STEP -le 9 ]]; then
     confirm "Is the network disconnected?"
 fi
 
-# ─── Step 10: Local OPRF verification ──────────────────────────────────────
+# ─── Step 9: Local OPRF verification + mobile verification ────────────────
 
-if [[ $FROM_STEP -le 10 ]]; then
+if [[ $FROM_STEP -le 9 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 10: Local OPRF simulation"
+    info "STEP 9: Local OPRF simulation + mobile verification"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     source "$CEREMONY_ENV"
@@ -633,84 +596,50 @@ if [[ $FROM_STEP -le 10 ]]; then
     confirm "Does the ruonId match?"
 fi
 
-# ─── Step 11: Print admin shares ──────────────────────────────────────────
+# ─── Step 10: Encrypt master key with age + shred all artifacts ────────────
 
-if [[ $FROM_STEP -le 11 ]]; then
+if [[ $FROM_STEP -le 10 ]]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 11: Print admin shares"
+    info "STEP 10: Encrypt master key and clean up"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    GROUP_PK=$(jq -r '.group_public_key' "$NODE_DIR/public-config.json")
-    CEREMONY_DATE=$(date -u +%Y-%m-%d)
+    echo ""
+    echo "  You will now encrypt the admin shares with a passphrase."
+    echo "  Use 6 random diceware words separated by spaces."
+    echo "  REMEMBER THIS PASSPHRASE — there is no recovery."
+    echo ""
 
+    # Bundle all admin shares into a single JSON for encryption
+    BUNDLE="$SCRIPT_DIR/admin-shares-bundle.json"
+    echo "{" > "$BUNDLE"
+    first=true
     for i in $(seq 1 "$ADMIN_SHARES"); do
         SHARE_FILE="$ADMIN_DIR/admin-${i}.json"
-        echo "  Printing admin share $i of $ADMIN_SHARES..."
-
-        # Generate QR code
-        qrencode -t PNG -o "/tmp/ceremony-qr-${i}.png" -8 -s 6 < "$SHARE_FILE"
-
-        # Render header as image
-        HEADER="════════════════════════════════════════
-  TOPRF ADMIN KEY SHARE ${i} of ${ADMIN_SHARES}
-  Threshold: ${ADMIN_THRESHOLD}-of-${ADMIN_SHARES}
-  Group Public Key:
-  ${GROUP_PK}
-  Date: ${CEREMONY_DATE}
-════════════════════════════════════════"
-
-        convert -size 535x -font Courier -pointsize 13 \
-            -background white -fill black \
-            caption:"$HEADER" \
-            /tmp/ceremony-header-${i}.png
-
-        # Render plain text share as image
-        SHARE_TEXT="--- PLAIN TEXT ---
-
-$(cat "$SHARE_FILE")
-
-════════════════════════════════════════
-  END OF SHARE ${i}
-════════════════════════════════════════"
-
-        convert -size 535x -font Courier -pointsize 10 \
-            -background white -fill black \
-            caption:"$SHARE_TEXT" \
-            /tmp/ceremony-text-${i}.png
-
-        # Compose single page: header + QR + plain text (stacked vertically)
-        convert \
-            /tmp/ceremony-header-${i}.png \
-            \( /tmp/ceremony-qr-${i}.png -gravity center \) \
-            /tmp/ceremony-text-${i}.png \
-            -gravity center -append \
-            -bordercolor white -border 30x30 \
-            /tmp/ceremony-page-${i}.pdf
-
-        lp_cmd /tmp/ceremony-page-${i}.pdf
-
-        # Cleanup temp files
-        rm -f /tmp/ceremony-qr-${i}.png /tmp/ceremony-header-${i}.png \
-              /tmp/ceremony-text-${i}.png /tmp/ceremony-page-${i}.pdf
+        if [[ -f "$SHARE_FILE" ]]; then
+            if ! $first; then echo "," >> "$BUNDLE"; fi
+            echo "\"admin-${i}\": $(cat "$SHARE_FILE")" >> "$BUNDLE"
+            first=false
+        fi
     done
+    echo "}" >> "$BUNDLE"
 
+    # Encrypt with age (passphrase-based)
+    age -p -o "$KEY_AGE_OUTPUT" "$BUNDLE"
+
+    if [[ -f "$KEY_AGE_OUTPUT" ]]; then
+        echo ""
+        info "Encrypted key saved to: $KEY_AGE_OUTPUT"
+        echo "  File size: $(wc -c < "$KEY_AGE_OUTPUT") bytes"
+    else
+        die "age encryption failed — key.age not created"
+    fi
+
+    # Shred all plaintext artifacts
     echo ""
-    info "All $ADMIN_SHARES admin shares printed."
-    echo "  Verify all pages printed correctly before continuing."
-    confirm "Have all shares printed correctly?"
-fi
+    info "Shredding plaintext artifacts..."
 
-# ─── Step 12: Shred admin shares ───────────────────────────────────────────
-
-if [[ $FROM_STEP -le 12 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 12: Shred admin shares from disk"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    confirm "This will permanently destroy admin shares from disk. The only copies will be the printed pages. Continue?"
-
+    # Admin shares
     if [[ -d "$ADMIN_DIR" ]]; then
         for f in "$ADMIN_DIR"/admin-*.json; do
             if [[ -f "$f" ]]; then
@@ -720,29 +649,22 @@ if [[ $FROM_STEP -le 12 ]]; then
             fi
         done
         rmdir "$ADMIN_DIR" 2>/dev/null || true
-        echo ""
-        info "Admin shares destroyed."
-    else
-        echo "  Admin shares directory not found (already cleaned?)."
     fi
 
-    # Clean up ceremony artifacts
-fi
+    # Bundle file
+    if [[ -f "$BUNDLE" ]]; then
+        shred -fz -n 3 "$BUNDLE"
+        rm -f "$BUNDLE"
+    fi
 
-# ─── Step 13: Shred ceremony.env ────────────────────────────────────────────
-
-if [[ $FROM_STEP -le 13 ]]; then
-    echo ""
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "STEP 13: Clean up AWS credentials"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
+    # ceremony.env (AWS creds + national ID)
     if [[ -f "$CEREMONY_ENV" ]]; then
         echo "  Shredding ceremony.env..."
         shred -fz -n 3 "$CEREMONY_ENV"
         rm -f "$CEREMONY_ENV"
-        info "AWS credentials destroyed."
     fi
+
+    info "All plaintext artifacts destroyed."
 fi
 
 # ─── Done ───────────────────────────────────────────────────────────────────
@@ -751,11 +673,14 @@ echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  CEREMONY COMPLETE                                           ║"
 echo "║                                                              ║"
+echo "║  key.age is on the SD card.                                  ║"
+echo "║                                                              ║"
 echo "║  Next steps:                                                 ║"
-echo "║    1. Laminate the printed admin shares                      ║"
-echo "║    2. Store in separate bank safe deposit boxes              ║"
-echo "║    3. Securely wipe the SD card:                             ║"
+echo "║    1. Power off the Pi                                       ║"
+echo "║    2. Plug SD card into your Mac                             ║"
+echo "║    3. Copy key.age to iCloud / secure backup                 ║"
+echo "║    4. Securely wipe the SD card:                             ║"
 echo "║       sudo dd if=/dev/zero of=/dev/mmcblk0 bs=4M status=progress ║"
-echo "║    4. Revoke/delete the IAM user used for this ceremony      ║"
+echo "║    5. Revoke/delete the IAM user used for this ceremony      ║"
 echo "║                                                              ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
