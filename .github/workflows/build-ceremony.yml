@@ -1,0 +1,19 @@
+name: Build Ceremony Binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p toprf-keygen
+      - run: cargo build --release -p toprf-seal --bin toprf-init-encrypt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceremony-binaries-aarch64
+          path: |
+            target/release/toprf-keygen
+            target/release/toprf-init-encrypt
