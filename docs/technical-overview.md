@@ -32,7 +32,7 @@ Same passport → same `ruonId` every time (sybil resistance). Different apps re
 | Layer | Guarantee |
 |-------|-----------|
 | **Key custody** | Master key is split via Shamir (2-of-3). Each share is sealed to AMD SEV-SNP hardware via `MSG_KEY_REQ`. No human — including the operator — can extract a share. |
-| **Node compromise** | Threshold scheme requires 2 nodes to collude. Nodes are in separate availability zones with independent attestation. |
+| **Node compromise** | Threshold scheme requires 2 nodes to collude. Each node has independent attestation and hardware-sealed key shares. |
 | **Node rotation** | Reshare protocol replaces a node's share without changing the master key. New share is sealed to fresh hardware, verified via SNP attestation before any key material is transmitted. |
 | **Passport verification** | Passive authentication: RSA/ECDSA signature on chip data verified against ICAO CSCA master list. Detects cloned/forged passports. |
 | **Biometric** | ArcFace face embedding (ONNX, on-device). Passport photo vs live camera. 5-point landmark alignment, CLAHE preprocessing. Embedding never leaves the device. |
