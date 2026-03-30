@@ -128,9 +128,10 @@ WIFI_PASS=<hotspot password>
 | 5 | Deploy key shares to TEE nodes (init-seal via S3 + ECIES) | Online |
 | 6 | Verify all nodes healthy + correct group public key + e2e /evaluate | Online |
 | 7 | Shred node shares from disk | Online |
-| 8 | Reconstruct master key from admin shares, re-split into fresh admin shares | Online |
-| 9 | OPRF simulation with national ID + 240s window for mobile app verification | Online |
-| 10 | Encrypt master key with age keypair, display private key for 120s, shred all plaintext | Online |
+| 8 | Disconnect from network (turn off hotspot) | Manual |
+| 9 | Reconstruct master key from admin shares, re-split into fresh admin shares | Offline |
+| 10 | OPRF simulation with national ID + 240s window for mobile app verification | Offline |
+| 11 | Encrypt master key with age keypair, display private key for 120s, shred all plaintext | Offline |
 
 ### Step 5 detail: init-seal
 
