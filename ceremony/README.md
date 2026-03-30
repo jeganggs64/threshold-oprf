@@ -226,8 +226,10 @@ aws cloudwatch enable-alarm-actions --alarm-names \
 If a node was unhealthy during the ceremony or its rotation was triggered, you may need to manually fix it or invoke a rotation after SSM is updated:
 
 ```bash
-aws lambda invoke --function-name toprf-rotation --payload '{"node_id": N}' out.json
+aws lambda invoke --function-name toprf-rotation --payload '{"node_id": N}' --invocation-type Event --cli-binary-format raw-in-base64-out out.json
 ```
+
+Use `--invocation-type Event` (async) to avoid the CLI retrying on timeout, which would trigger a duplicate invocation. The rotation lock prevents double execution, but async invoke avoids the noisy "skipping" notification.
 
 The rotation Lambda will reshare the key from the 2 healthy donor nodes — the new node gets a mathematically equivalent share sealed to its own hardware.
 
