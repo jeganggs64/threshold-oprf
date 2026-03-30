@@ -41,7 +41,7 @@ Same passport → same `ruonId` every time (sybil resistance). Different apps re
 
 ## What integrators receive
 
-A developer registers and gets a secp256k1 keypair. To verify a user:
+A developer generates their own secp256k1 keypair and registers their public key. To verify a user:
 
 1. Generate a signed QR code or deeplink containing a session ID, callback URL, and signature.
 2. User scans it in RuonID → sees a consent screen → authenticates with biometrics.
@@ -69,29 +69,25 @@ Deterministic sybil resistance requires that the same person always produces the
 
 **Proof by cases:**
 
-*Case 1: Client-only, no secret.* The function is `ID = f(passport_data)`. Since `f` is public and `passport_data` is readable from any passport, anyone with access to a passport can compute the ID for its holder — including the passport holder's employer, border agent, or an attacker who momentarily holds the document. The ID has no authentication; it's just a hash of public data. Sybil resistance fails because there is no proof that the person computing the ID is the person on the passport.
+*Case 1: Client-only, no secret.* The function is `ID = f(passport_data)` where `f` is public. This is deterministic, but it is trivially reversible via glossary attack. Passport numbers are structured, short, and enumerable — there are roughly 10^9 possible values per country. An attacker who observes a pseudonymous `ID` on-chain or in a database can compute `f(candidate)` for every plausible passport number until they find a match, deanonymizing the user. Without a secret key gating the evaluation of `f`, there is no way to rate-limit or prevent this offline enumeration.
 
 *Case 2: Client-only, with a client secret.* The function is `ID = f(passport_data, client_secret)`. This authenticates the computation, but the `client_secret` is device-bound. If the user loses their phone, gets a new device, or reinstalls the app, `client_secret` changes. The ID is no longer deterministic — the same person produces different IDs on different devices. Sybil resistance fails because there is no way to link the old and new IDs.
 
-*Case 3: Server-side secret.* The function is `ID = f(passport_data, server_key)`. The `server_key` is persistent and independent of the user's device. The same `passport_data` always produces the same ID regardless of which device the user uses. The computation is authenticated because only the server can evaluate `f` with its key. **This is the only case that satisfies both determinism and authentication.**
+*Case 3: Server-side secret.* The function is `ID = f(passport_data, server_key)`. The `server_key` is persistent and independent of the user's device, so the same person always produces the same ID (deterministic). The secret is held server-side behind device attestation and rate limiting, so an attacker cannot freely evaluate `f` to mount a glossary attack. Additionally, the actual passport must be NFC-scanned to initiate the flow, adding a physical possession requirement. **This is the only case that satisfies determinism, glossary-attack resistance, and sybil resistance simultaneously.**
 
 **The privacy problem with Case 3:** If the server sees `passport_data` in the clear, it learns the user's identity. This is where the OPRF comes in. The client blinds the input before sending it, the server evaluates the function on the blinded input, and the client unblinds the result. The server never sees the raw input; the client never sees the key. The output is identical to Case 3 but with no privacy loss.
 
 **The trust problem with Case 3:** A single server holding the key is a central point of failure. This is where threshold cryptography comes in. The key is split across multiple independent nodes (2-of-3), each sealed to hardware (AMD SEV-SNP). No single node — and no operator — can extract the key or compute IDs independently.
 
-**Summary:** Determinism requires a persistent secret. Device-bound secrets break determinism. Therefore the secret must live server-side. OPRF eliminates the privacy cost. Threshold splitting eliminates the trust cost. The result is a scheme that is deterministic, privacy-preserving, and trust-minimized — but not fully decentralized, because the server-side key is fundamental to the construction.
+**Summary:** Determinism requires a persistent secret. Device-bound secrets break determinism. A public function with no secret is vulnerable to glossary attacks that deanonymize users by brute-forcing the small input space of passport numbers. Therefore the secret must live server-side, protected by device attestation and rate limiting. OPRF eliminates the privacy cost. Threshold splitting eliminates the trust cost. The result is a scheme that is deterministic, privacy-preserving, and trust-minimized — but not fully decentralized, because the server-side key is fundamental to the construction.
 
-## Why not just use World ID / other solutions?
+## Why not existing solutions?
 
-| | RuonID | World ID | Government eID |
-|---|--------|----------|-----------------|
-| **Hardware required** | Any NFC phone + existing passport | Orb (custom iris scanner) | Country-specific readers |
-| **Biometric storage** | None (on-device only) | Iris hash stored on-chain | Varies by country |
-| **Trusted operator** | None (threshold OPRF in TEEs) | Worldcoin Foundation | Government |
-| **Coverage** | 150+ countries (ICAO ePassports) | Orb locations only | Single country |
-| **Credential type** | ePassport (NFC chip, PKI-signed) | Iris biometric | National ID card |
-| **Sybil resistance** | Deterministic OPRF output | Iris uniqueness | Government-issued uniqueness |
-| **Cross-app linkability** | Unlinkable (app-specific IDs) | Unlinkable | Typically linkable |
+**World ID** requires custom iris-scanning hardware (the Orb) and has been [banned or restricted in multiple countries](https://www.bbc.com/news/technology-66488314) over biometric data concerns. Its coverage is limited to physical Orb locations.
+
+**ZK passport solutions** like [Rarimo](https://rarimo.medium.com/building-zk-passport-based-voting-3f6f97ebb445) and [Self (formerly OpenPassport)](https://docs.self.xyz/) use ZK-SNARKs to prove passport validity without revealing personal data. However, they rely on a device-bound secret to generate the nullifier (the unique identifier that prevents double-registration). This means the user's identity is tied to a specific device — if they lose their phone, switch devices, or reinstall the app, the secret changes and they produce a different nullifier. The identity is not deterministic across devices, which breaks sybil resistance unless the user goes through a migration or re-registration process.
+
+**RuonID's approach** avoids both problems. No custom hardware — any NFC phone works with any ICAO ePassport (150+ countries). No device-bound secret — the deterministic output comes from the server-side OPRF key, so the same passport produces the same ID regardless of which device the user is on. No biometric database — face matching is purely on-device. And the OPRF key is threshold-split across hardware-sealed TEE nodes, with each node's share independently attested.
 
 ## Integration
 

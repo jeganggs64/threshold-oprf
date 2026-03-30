@@ -36,3 +36,20 @@ docker/coordinator-node-*.json
 
 # SSH keys
 deploy/*.pem
+deploy/*.pub
+
+# SAM build artifacts
+lambda/rotation/.aws-sam/
+lambda/rotation/samconfig.toml
+
+# GCP config
+lambda/gcp-wif-config.json
+
+# Test key shares
+test-admin-shares/
+
+# Generated docs (PDFs from LaTeX)
+docs/*.pdf
+docs/*.tex
+docs/*.aux
+docs/*.log
