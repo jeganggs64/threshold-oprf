@@ -83,7 +83,7 @@ Deterministic sybil resistance requires that the same person always produces the
 
 ## Why not existing solutions?
 
-**World ID** requires custom iris-scanning hardware (the Orb) and has been [banned or restricted in multiple countries](https://www.bbc.com/news/technology-66488314) over biometric data concerns. Its coverage is limited to physical Orb locations.
+**World ID** requires custom iris-scanning hardware (the Orb) and has been [banned or restricted in multiple countries](https://en.tempo.co/read/2004666/these-are-8-countries-banning-worldcoin-from-spain-to-indonesia) over biometric data concerns — including Spain, Kenya, Brazil, Indonesia, Thailand, Hong Kong, and the Philippines. Its coverage is limited to physical Orb locations.
 
 **ZK passport solutions** like [Rarimo](https://rarimo.medium.com/building-zk-passport-based-voting-3f6f97ebb445) and [Self (formerly OpenPassport)](https://docs.self.xyz/) use ZK-SNARKs to prove passport validity without revealing personal data. However, they rely on a device-bound secret to generate the nullifier (the unique identifier that prevents double-registration). This means the user's identity is tied to a specific device — if they lose their phone, switch devices, or reinstall the app, the secret changes and they produce a different nullifier. The identity is not deterministic across devices, which breaks sybil resistance unless the user goes through a migration or re-registration process.
 
